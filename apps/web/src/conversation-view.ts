@@ -301,16 +301,23 @@ function renderUtterancePart(
   if (line.speaker === opts.selfActorId) return part.text;
   const name = opts.nameOf(line.speaker);
   if (!name || part.text.trim() === "") return part.text;
-  const body = part.text.startsWith(name)
-    ? part.text.slice(name.length).replace(/^[。，、：:！？；;\s]+/, "")
-    : part.text;
+  const rest = part.text.startsWith(name) ? part.text.slice(name.length) : undefined;
+  const stripped = rest?.replace(/^[。，、：:！？；;\s]+/, "");
   if (part.channel === "action") {
     // 同一句已有台词时，动作是台词的延续，不再重复主语
     const hasContentBefore = line.parts.some(
       (p, i) => i < index && p.channel === "content" && p.text.trim() !== "",
     );
-    return hasContentBefore ? body : `${name}${body}`;
+    if (rest !== undefined) {
+      // 动作句以名字开头时名字就是主语：有台词前置时作为延续剥掉主语，否则原句已完整、直接用
+      return hasContentBefore ? stripped! : part.text;
+    }
+    return hasContentBefore ? part.text : `${name}${part.text}`;
   }
+  // 台词：只有「名字 + 分隔符/结尾」才算说话人标签；名字恰好是句子开头的一部分（"林雨来了"）
+  // 时不剥，否则会把语义削掉（"来了"）。
+  const isSpeakerLabel = rest !== undefined && (rest === "" || /^[。，、：:！？；;\s]/.test(rest));
+  const body = isSpeakerLabel ? stripped! : part.text;
   return `${name}：${body}`;
 }
 

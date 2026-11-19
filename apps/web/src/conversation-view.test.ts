@@ -212,6 +212,18 @@ describe("linesFromView：通道摊平为 UI 行", () => {
     expect(lines[1]!.text).toBe("把文件夹往腋下一夹");
   });
 
+  it("名字后没有分隔符时不剥，避免把语义削掉", () => {
+    let s = initialConversationView();
+    s = reduceConversationView(
+      s,
+      { type: "conversation.utterance", delivery: delivery({ channels: ["content"], content: "林雨来了，你们先坐" }) },
+      ctx(),
+    );
+    const lines = linesFromView(s, { selfActorId: ME, nameOf: () => "林雨" });
+    // 「林雨来了」不是说话人标签，剥掉会变成「来了，你们先坐」
+    expect(lines[0]!.text).toBe("林雨：林雨来了，你们先坐");
+  });
+
   it("同一句既有台词又有动作时，动作不再重复主语", () => {
     let s = initialConversationView();
     s = reduceConversationView(s, { type: "conversation.utterance", delivery: delivery({ channels: ["content", "action"], action: "抬眼打量对方" }) }, ctx());

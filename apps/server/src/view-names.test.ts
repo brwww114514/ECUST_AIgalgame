@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Entity, WorldState } from "../../../packages/shared/src/contract/types.ts";
-import { UNKNOWN_NPC_NAME, maskNamesDeep, maskNamesInText, unknownPlaceholders } from "./view-names.ts";
+import { UNKNOWN_NPC_NAME, maskNamesDeep, maskNamesInText, unmaskTargetPlaceholder, unknownPlaceholders } from "./view-names.ts";
 
 function npc(id: string, name: string, known: boolean): Entity {
   return {
@@ -74,6 +74,21 @@ describe("文本脱敏", () => {
     expect(out).not.toContain("白晓");
     // 短名字不会被长名字的替换结果破坏
     expect(out).toContain("另一位陌生的同学");
+  });
+
+
+  it("喂模型前把目标展示名换回真名，且不误伤其他陌生人", () => {
+    const appearance = new Map([["npc_a", "拿着文件夹、站姿笔直的中年人"]]);
+    const p = unknownPlaceholders(stateOf(npc("npc_a", "严守一", false), npc("npc_b", "周明远", false)), appearance);
+    const placeholder = p.get("严守一");
+    const input = "对拿着文件夹、站姿笔直的中年人说：你叫什么";
+    expect(unmaskTargetPlaceholder(input, placeholder, "严守一")).toBe("对严守一说：你叫什么");
+    // 顺带提到的另一个陌生人保持占位名，不会被当成目标实名化
+    expect(unmaskTargetPlaceholder("对一位陌生的同学说：周明远在哪", placeholder, "严守一")).toBe(
+      "对一位陌生的同学说：周明远在哪",
+    );
+    // 没给展示名时原样返回（已认识/无状态）
+    expect(unmaskTargetPlaceholder(input, undefined, "严守一")).toBe(input);
   });
 
   it("没有未认识的人时原样返回", () => {

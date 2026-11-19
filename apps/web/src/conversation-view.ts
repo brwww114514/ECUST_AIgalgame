@@ -317,6 +317,8 @@ function renderUtterancePart(
   // 台词：只有「名字 + 分隔符/结尾」才算说话人标签；名字恰好是句子开头的一部分（"林雨来了"）
   // 时不剥，否则会把语义削掉（"来了"）。
   const isSpeakerLabel = rest !== undefined && (rest === "" || /^[。，、：:！？；;\s]/.test(rest));
+  // 名字已出现在句首但不是说话人标签（"林雨来了"）：名字只出现一次，原样展示、不再拼前缀
+  if (rest !== undefined && !isSpeakerLabel) return part.text;
   const body = isSpeakerLabel ? stripped! : part.text;
   return `${name}：${body}`;
 }

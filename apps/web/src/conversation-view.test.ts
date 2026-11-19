@@ -220,8 +220,8 @@ describe("linesFromView：通道摊平为 UI 行", () => {
       ctx(),
     );
     const lines = linesFromView(s, { selfActorId: ME, nameOf: () => "林雨" });
-    // 「林雨来了」不是说话人标签，剥掉会变成「来了，你们先坐」
-    expect(lines[0]!.text).toBe("林雨：林雨来了，你们先坐");
+    // 「林雨来了」不是说话人标签：名字已出现一次，原样展示，不再拼前缀
+    expect(lines[0]!.text).toBe("林雨来了，你们先坐");
   });
 
   it("同一句既有台词又有动作时，动作不再重复主语", () => {

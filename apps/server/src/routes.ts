@@ -572,7 +572,10 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       const utteranceTargetId =
         utterance?.target && typeof utterance.target === "string" ? utterance.target : undefined;
       const utteranceTarget = utteranceTargetId ? access.state.entities[utteranceTargetId] : undefined;
-      if (utterance?.content && utteranceTarget && utteranceTarget.kind === "npc") {
+      // 与 v1 /turns 同口径：只有目标此刻在场才实名化，缺席的人不能被第三方客户端借这个字段点名
+      const utteranceTargetPresent =
+        utteranceTarget !== undefined && access.state.room.scene.presentIds.includes(utteranceTarget.id);
+      if (utterance?.content && utteranceTarget && utteranceTargetPresent && utteranceTarget.kind === "npc") {
         const placeholder = unknownPlaceholders(access.state, deps.appearance).get(utteranceTarget.name);
         utterance.content = unmaskTargetPlaceholder(utterance.content, placeholder, utteranceTarget.name);
       }

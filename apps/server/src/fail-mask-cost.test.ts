@@ -191,3 +191,22 @@ describe("MapService · 早期失败脱敏成本（issue #62）", () => {
     expect(counter.snapshots).toBe(1); // 第二种早期失败同样命中缓存
   });
 });
+
+describe("MapService · 对话早期失败脱敏成本（issue #66）", () => {
+  it("连续两次 dialogue E_SCENE_NOT_FOUND 早期失败只有第一次触发 snapshot", async () => {
+    const { service, counter } = await setup();
+    const first = await service.openDialogue(ROOM, "plr_self", "loc_missing_dialogue", "d1");
+    expect(first.ok).toBe(false);
+    if (first.ok) return;
+    expect(first.code).toBe("E_SCENE_NOT_FOUND");
+    expect(first.message).toContain("loc_missing_dialogue");
+    expect(counter.snapshots).toBe(1); // 未命中缓存：回退一次快照
+
+    const second = await service.openDialogue(ROOM, "plr_self", "loc_missing_dialogue", "d1");
+    expect(second.ok).toBe(false);
+    if (second.ok) return;
+    expect(second.code).toBe("E_SCENE_NOT_FOUND");
+    expect(second.message).toContain("loc_missing_dialogue");
+    expect(counter.snapshots).toBe(1); // 命中缓存：第二次零快照，不再回放事件日志
+  });
+});

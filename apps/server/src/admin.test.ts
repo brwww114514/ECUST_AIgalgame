@@ -9,6 +9,8 @@ import Fastify from "fastify";
 import { tempDir } from "@galgame/testkit";
 import { createApp } from "./bootstrap.ts";
 import { registerRoutes } from "./routes.ts";
+import { registerAdminRoutes } from "./admin.routes.ts";
+import type { AdminDeps } from "./admin.routes.ts";
 import { AdminTokenGate } from "./admin-token.ts";
 import type { ServerConfig } from "./config.ts";
 
@@ -170,6 +172,39 @@ describe("管理端点鉴权", () => {
     expect(second.statusCode).toBe(429);
     expect((second.json() as { code: string }).code).toBe("E_RATE_LIMITED");
     await app.close();
+  });
+
+  it("AdminDeps.gate / verdictOf 必填（编译期强制，杜绝静默退回普通比较）", () => {
+    type IsRequired<T, K extends keyof T> = {} extends Pick<T, K> ? false : true;
+    const gateRequired: IsRequired<AdminDeps, "gate"> = true;
+    const verdictRequired: IsRequired<AdminDeps, "verdictOf"> = true;
+    expect(gateRequired).toBe(true);
+    expect(verdictRequired).toBe(true);
+  });
+
+  it("漏注 gate 的装配（绕过类型检查）仍走恒定时间门：错误令牌被限流", async () => {
+    const deps = await createApp(testConfig());
+    const app = Fastify();
+    // 模拟未来有人直接构造 AdminDeps 且漏掉 gate/verdictOf：比较必须仍由 AdminTokenGate
+    // 的 sha256 + timingSafeEqual 完成，不能退回与配置令牌的 === 直接比较（前缀可测且无限流）。
+    registerAdminRoutes(app, {
+      auth: deps.auth, ledger: deps.ledger, log: deps.adminLog, adminToken: "dev-admin",
+    } as unknown as AdminDeps);
+    try {
+      const ok = await app.inject({ method: "GET", url: "/api/v1/admin/users", headers: ADMIN });
+      expect(ok.statusCode).toBe(200);
+      for (let i = 0; i < 10; i += 1) {
+        const res = await app.inject({ method: "GET", url: "/api/v1/admin/users", headers: { "x-admin-token": `wrong-${i}` } });
+        expect(res.statusCode, `attempt ${i}`).toBe(401);
+      }
+      // 兜底门同样带失败限流：这是 "=== 兜底" 绝不会有的行为，证明走的是恒定时间路径
+      const blocked = await app.inject({ method: "GET", url: "/api/v1/admin/users", headers: ADMIN });
+      expect(blocked.statusCode).toBe(429);
+      expect((blocked.json() as { code: string }).code).toBe("E_RATE_LIMITED");
+      expect(blocked.headers["retry-after"]).toBeDefined();
+    } finally {
+      await app.close();
+    }
   });
 });
 

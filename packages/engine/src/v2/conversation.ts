@@ -15,6 +15,7 @@ import type {
   UtteranceModeDef,
   ConversationPolicy,
   Registry,
+  Delivery,
 } from "../../../shared/src/index.ts";
 import type { EventLog } from "../store.ts";
 import type { DefaultArbiter } from "../arbiter.ts";
@@ -22,7 +23,7 @@ import type { EventSourcedMemory } from "../memory.ts";
 import type { SceneManager } from "./scene.ts";
 import type { NpcAgent } from "./npc-agent.ts";
 import type { ConversationAudit } from "./audit.ts";
-import { StoreFlushError, runStep } from "./conversation.step.ts";
+import { StoreFlushError, rememberRecent, runStep, type StoreRetry } from "./conversation.step.ts";
 
 export interface ConversationDeps {
   store: EventLog;
@@ -46,6 +47,10 @@ interface PendingFlush {
   s: ConversationSessionV2;
   applied: ApplyResult;
   out: ConversationEvent[];
+  /** 本轮已审核的投递；只有重放提交成功才进入下一轮上下文 */
+  fresh: Delivery[];
+  /** 仅 arbiter 写盘失败时存在：提案从未落库，要用同一 cause/expectedSeq 重新裁决 */
+  retry?: StoreRetry;
   /** flush 失败前的 lastLocId；仅当期间未被别的回合推进时才用当前快照前移 */
   beforeLocId?: string;
 }
@@ -104,10 +109,14 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     return this.resumeExpiredEvents(now).flatMap((e) => (e.type === "conversation.phase" ? [e.sessionId] : []));
   }
 
-  /** 与 resumeExpired 同源，但带回可下发给前端的 phase 事件 */
-  resumeExpiredEvents(now = this.deps.now?.() ?? Date.now()): ConversationEvent[] {
+  /**
+   * 与 resumeExpired 同源，但带回可下发给前端的 phase 事件。
+   * ④ 带 sessionId 时只恢复该会话：全局 tick 仍可扫全部，但某会话的回合流不能混入别人的超时事件。
+   */
+  resumeExpiredEvents(now = this.deps.now?.() ?? Date.now(), sessionId?: Id): ConversationEvent[] {
     const out: ConversationEvent[] = [];
     for (const s of this.sessions.values()) {
+      if (sessionId !== undefined && s.id !== sessionId) continue;
       if (s.phase === "listening" && s.listenSince !== undefined && now - s.listenSince >= this.deps.policy.listenTimeoutMs) {
         s.phase = "speaking";
         s.listenSince = undefined;
@@ -147,9 +156,24 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     // 放在幂等命中与会话校验之后：重放旧回合不应清空另一个 host 正在用的波次预算
     this.deps.budget?.beginTick(s.roomId);
 
-    // 落盘重试：apply 已完成、记忆已 ingest，这次只重试 flush，绝不重复发 Proposal
+    // 落盘重试：flush 失败时只重试 flush；arbiter 写盘失败时提案从未落库，用同一 cause 重新裁决
     const pending = this.pendingFlush.get(key);
     if (pending) {
+      let applied = pending.applied;
+      if (pending.retry) {
+        applied = await this.deps.arbiter.apply(pending.roomId, pending.retry.ops, pending.retry.cause, { expectedSeq: pending.retry.expectedSeq });
+        if (!applied.ok) {
+          const retryable = applied.error?.code === "E_STORE_FAULT";
+          if (!retryable) this.pendingFlush.delete(key);
+          return [{
+            type: "conversation.error", sessionId,
+            code: applied.error?.code ?? "E_STORE_FAULT",
+            message: applied.error?.message ?? this.deps.policy.messages.storeUnavailable,
+            retryable,
+          }];
+        }
+        for (const ev of applied.events) this.deps.memory.ingest(ev);
+      }
       try {
         await this.deps.store.flush(pending.roomId);
       } catch {
@@ -159,21 +183,29 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       if (pending.beforeLocId !== undefined && pending.s.lastLocId === pending.beforeLocId) {
         pending.s.lastLocId = (await this.deps.store.snapshot(pending.roomId)).room.scene.locId;
       }
-      const done = await this.commitWithState(pending.s, pending.applied);
+      const done = await this.commitWithState(pending.s, applied);
       const all = [...pending.out, done];
+      rememberRecent(pending.s, pending.fresh);
       this.remember(key, all);
       this.pendingFlush.delete(key);
       return all;
     }
 
-    const out: ConversationEvent[] = [...this.resumeExpiredEvents()];
+    const now = this.deps.now?.() ?? Date.now();
+    // ④ 只把本会话到期的 phase 事件塞进本回合返回流
+    const out: ConversationEvent[] = [...this.resumeExpiredEvents(now, sessionId)];
     try {
-      await runStep(this.deps, s, input, out, this.deps.now?.() ?? Date.now(), (ss, a) => this.commitWithState(ss, a));
+      await runStep(this.deps, s, input, out, now, (ss, a) => this.commitWithState(ss, a));
     } catch (e) {
       if (e instanceof StoreFlushError) {
         // 先冻结 out 再追加错误，重试时才不会重复 yield 上一轮的 E_STORE_FAULT
-        this.pendingFlush.set(key, { roomId: e.roomId, s, applied: e.applied, out: [...out], beforeLocId: s.lastLocId });
+        this.pendingFlush.set(key, {
+          roomId: e.roomId, s, applied: e.applied, out: [...out], fresh: e.fresh,
+          beforeLocId: s.lastLocId, retry: e.retry,
+        });
         this.trim(this.pendingFlush, MAX_PENDING);
+        // ③ 外部事件只在提交成功后发布：失败时只回可重试错误
+        out.length = 0;
         out.push({ type: "conversation.error", sessionId, code: "E_STORE_FAULT", message: e.message, retryable: true });
       } else {
         out.push({

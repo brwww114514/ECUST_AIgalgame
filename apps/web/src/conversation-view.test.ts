@@ -186,8 +186,49 @@ describe("linesFromView：通道摊平为 UI 行", () => {
     s = reduceConversationView(s, { type: "conversation.utterance", delivery: delivery({ channels: ["content", "action", "notice"] }) }, ctx());
     const lines = linesFromView(s, { selfActorId: ME, nameOf: (id) => (id === ME ? "我" : "林雨") });
     expect(lines.map((l) => l.kind)).toEqual(["npc", "narrative", "system"]);
-    expect(lines[0]!.text).toBe("林雨大家好");
+    // 台词用「名字：台词」分句；动作句名字即主语，不再重复
+    expect(lines[0]!.text).toBe("林雨：大家好");
+    // 同一句已有台词，动作是台词的延续，不重复主语
+    expect(lines[1]!.text).toBe("环顾四周");
     const own = reduceConversationView(initialConversationView(), { type: "conversation.utterance", delivery: delivery({ speaker: ME, channels: ["content"] }) }, ctx());
-    expect(linesFromView(own, { selfActorId: ME, nameOf: () => "我" })[0]!.kind).toBe("player");
+    const ownLines = linesFromView(own, { selfActorId: ME, nameOf: () => "我" });
+    expect(ownLines[0]!.kind).toBe("player");
+    // 自己说的话不加"你"前缀（行动文本本身已是完整句）
+    expect(ownLines[0]!.text).toBe("大家好");
+  });
+
+  it("模型台词已以展示名开头时不再重复（#101 回归）", () => {
+    let s = initialConversationView();
+    s = reduceConversationView(
+      s,
+      {
+        type: "conversation.utterance",
+        delivery: delivery({ channels: ["content", "action"], content: "林雨：你是哪个班的？", action: "林雨把文件夹往腋下一夹" }),
+      },
+      ctx(),
+    );
+    const lines = linesFromView(s, { selfActorId: ME, nameOf: () => "林雨" });
+    expect(lines[0]!.text).toBe("林雨：你是哪个班的？");
+    expect(lines[1]!.text).toBe("把文件夹往腋下一夹");
+  });
+
+  it("名字后没有分隔符时不剥，避免把语义削掉", () => {
+    let s = initialConversationView();
+    s = reduceConversationView(
+      s,
+      { type: "conversation.utterance", delivery: delivery({ channels: ["content"], content: "林雨来了，你们先坐" }) },
+      ctx(),
+    );
+    const lines = linesFromView(s, { selfActorId: ME, nameOf: () => "林雨" });
+    // 「林雨来了」不是说话人标签：名字已出现一次，原样展示，不再拼前缀
+    expect(lines[0]!.text).toBe("林雨来了，你们先坐");
+  });
+
+  it("同一句既有台词又有动作时，动作不再重复主语", () => {
+    let s = initialConversationView();
+    s = reduceConversationView(s, { type: "conversation.utterance", delivery: delivery({ channels: ["content", "action"], action: "抬眼打量对方" }) }, ctx());
+    const lines = linesFromView(s, { selfActorId: ME, nameOf: () => "林雨" });
+    expect(lines[0]!.text).toBe("林雨：大家好");
+    expect(lines[1]!.text).toBe("抬眼打量对方");
   });
 });

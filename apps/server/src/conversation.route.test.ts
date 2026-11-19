@@ -402,4 +402,97 @@ describe("dev/v2 群聊端点（issue #85/#89 契约对齐）", () => {
     expect(res.json()).toMatchObject({ ok: false, code: "E_FORBIDDEN" });
     await app.close();
   });
+  it("行动文本里的目标展示名在喂给引擎前换回真名（截图 bug）", async () => {
+    const { app, deps, roomId, actorId, llm } = await appWith();
+    const npcId = "npc_yan";
+    const cause = {
+      v: 1 as const,
+      id: "evt_seed_yan",
+      roomId,
+      seq: 1,
+      ts: 1,
+      actorId: "system",
+      type: "room.bootstrap",
+      payload: {},
+    };
+    // 房间自带 npc_yan（未认识）；只把它放进当前场景，确保 targetPresent。
+    const seeded = await deps.arbiter.apply(roomId, [{ op: "scene.set", args: { presentIds: [actorId, npcId] } }], cause);
+    expect(seeded.rejected).toEqual([]);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation/turns`,
+      headers: { "x-user-id": "u_owner" },
+      payload: {
+        actorId,
+        clientTurnId: "name-1",
+        targetNpcId: npcId,
+        input: "对拿着文件夹、站姿笔直的中年人说：你叫什么",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    // NPC 提示词里应看到真名（模型才知道在跟谁说话），不应看到外貌占位名
+    const prompt = (llm.requests.at(-1)?.messages ?? []).map((m) => m.content).join("\n");
+    expect(prompt).toContain("严守一");
+    expect(prompt).not.toContain("拿着文件夹、站姿笔直的中年人");
+    await app.close();
+  });
+
+  it("canonical POST /conversation 同样把目标展示名换回真名（目标在场）", async () => {
+    const { app, deps, roomId, actorId, llm } = await appWith();
+    const npcId = "npc_yan";
+    const seeded = await deps.arbiter.apply(
+      roomId,
+      [{ op: "scene.set", args: { presentIds: [actorId, npcId] } }],
+      { v: 1, id: "evt_canon_present", roomId, seq: 1, ts: 1, actorId: "system", type: "room.bootstrap", payload: {} },
+    );
+    expect(seeded.rejected).toEqual([]);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation`,
+      headers: { "x-user-id": "u_owner" },
+      payload: {
+        actorId,
+        clientTurnId: "canon-1",
+        utterance: { mode: "addressed", target: npcId, content: "对拿着文件夹、站姿笔直的中年人说：你叫什么" },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const prompt = (llm.requests.at(-1)?.messages ?? []).map((m) => m.content).join("\n");
+    expect(prompt).toContain("严守一");
+    expect(prompt).not.toContain("拿着文件夹、站姿笔直的中年人");
+    await app.close();
+  });
+
+  it("目标不在场时 canonical 路径不做实名化（不会把真名塞进提示词）", async () => {
+    const { app, deps, roomId, actorId, llm } = await appWith();
+    const npcId = "npc_yan";
+    const seeded = await deps.arbiter.apply(
+      roomId,
+      [{ op: "scene.set", args: { presentIds: [actorId] } }],
+      { v: 1, id: "evt_canon_absent", roomId, seq: 1, ts: 1, actorId: "system", type: "room.bootstrap", payload: {} },
+    );
+    expect(seeded.rejected).toEqual([]);
+    const before = llm.requests.length;
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation`,
+      headers: { "x-user-id": "u_owner" },
+      payload: {
+        actorId,
+        clientTurnId: "canon-absent",
+        utterance: { mode: "addressed", target: npcId, content: "对拿着文件夹、站姿笔直的中年人说：你叫什么" },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const events = sse(res.body);
+    expect(events.some((e) => e.type === "conversation.error")).toBe(true);
+    // 引擎在 utterance 校验阶段就拒绝，NPC 提示词根本不会产生 → 真名无从泄漏
+    expect(llm.requests.length).toBe(before);
+    expect(JSON.stringify(events)).not.toContain("严守一");
+    await app.close();
+  });
+
 });

@@ -2,9 +2,11 @@
  * 文本脱敏（认识口径）：未认识 NPC 的真名不得出现在下发文本里，且多个陌生人要能区分
  * （一位 / 另一位 / 第三位陌生的同学），否则一次对话里两个陌生人的台词会混成同一个人。
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { Entity, WorldState } from "../../../packages/shared/src/contract/types.ts";
-import { UNKNOWN_NPC_NAME, maskNamesDeep, maskNamesInText, unknownPlaceholders } from "./view-names.ts";
+import { UNKNOWN_NPC_NAME, maskNamesDeep, maskNamesInText, unmaskTargetPlaceholder, unknownPlaceholders } from "./view-names.ts";
 
 function npc(id: string, name: string, known: boolean): Entity {
   return {
@@ -76,8 +78,36 @@ describe("文本脱敏", () => {
     expect(out).toContain("另一位陌生的同学");
   });
 
+
+  it("喂模型前把目标展示名换回真名，且不误伤其他陌生人", () => {
+    const appearance = new Map([["npc_a", "拿着文件夹、站姿笔直的中年人"]]);
+    const p = unknownPlaceholders(stateOf(npc("npc_a", "严守一", false), npc("npc_b", "周明远", false)), appearance);
+    const placeholder = p.get("严守一");
+    const input = "对拿着文件夹、站姿笔直的中年人说：你叫什么";
+    expect(unmaskTargetPlaceholder(input, placeholder, "严守一")).toBe("对严守一说：你叫什么");
+    // 顺带提到的另一个陌生人保持占位名，不会被当成目标实名化
+    expect(unmaskTargetPlaceholder("对一位陌生的同学说：周明远在哪", placeholder, "严守一")).toBe(
+      "对一位陌生的同学说：周明远在哪",
+    );
+    // 没给展示名时原样返回（已认识/无状态）
+    expect(unmaskTargetPlaceholder(input, undefined, "严守一")).toBe(input);
+  });
+
   it("没有未认识的人时原样返回", () => {
     const value = { a: "严守一：你好" };
     expect(maskNamesDeep(value, new Map())).toBe(value);
   });
+  it("NPC appearance 两两不是前缀（否则 unmaskTargetPlaceholder 会误伤）", () => {
+    const file = fileURLToPath(new URL("../../../content/scenarios/npcs.json", import.meta.url));
+    const rows = JSON.parse(readFileSync(file, "utf-8")) as { id: string; appearance?: string }[];
+    const looks = rows.map((r) => r.appearance?.trim()).filter((v): v is string => Boolean(v));
+    for (const a of looks) {
+      for (const b of looks) {
+        if (a !== b && b.startsWith(a)) {
+          throw new Error(`appearance 前缀冲突：${a} ⊂ ${b}；unmask 会误伤，需保证唯一且互不为前缀`);
+        }
+      }
+    }
+  });
+
 });

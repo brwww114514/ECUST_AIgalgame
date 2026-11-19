@@ -92,6 +92,7 @@ export function buildNpcPrompt(args: NpcPromptArgs, modes: Map<string, Utterance
     `{"kind":"speak|think|silent","utterance":{"id":"utt_...","speaker":"${args.npcId}","mode":"...","target":"可选","content":"...","action":"...","coverAction":"可选"},"mental":{"thought":"...","plan":"可选","salience":1,"about":[]},"reason":"沉默原因"}`,
     `可选说话方式：\n${modeList}`,
     "规则：一次只能选一种 kind。speak 时 utterance.mode 必须是上面的 id，且遵守上面列出的该模式条件。",
+    "content 只写台词本身：不要以自己或对方的名字/称呼开头（不要写「某某老师：…」或「某同学，你…」），名字由界面显示；也不要复述自己刚说过的话。",
     mentalFraming(),
     `字数：content≤${policy.maxContent}，action≤${policy.maxAction}，thought≤${policy.maxThought}，plan≤${policy.maxPlan}。`,
   ].join("\n");

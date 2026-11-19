@@ -10,7 +10,7 @@ import { projectConversationEvents, type ConversationHostV2 } from "../../../pac
 import { DialogueBodySchema, TickBodySchema, TravelBodySchema, zodMessage } from "./map.data.ts";
 import type { MapService } from "./map.ts";
 import type { LlmSettings } from "./settings.ts";
-import { maskNamesDeep, unknownPlaceholders } from "./view-names.ts";
+import { maskNamesDeep, unmaskTargetPlaceholder, unknownPlaceholders } from "./view-names.ts";
 import { isAskNameInput, namesIntroducedIn } from "./name-unlock.ts";
 import type { SaveIndex } from "./saves.ts";
 import type { TurnHistory } from "./turn-history.ts";
@@ -567,6 +567,18 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       const utterance = body.utterance
         ? { ...body.utterance, id: body.utterance.id ?? `utt_${body.clientTurnId}`, speaker: actorId }
         : undefined;
+      // v2 别名路由的 input 与 v1 来自同一个前端拼法：「对<展示名>说：…」。同样在喂给
+      // 引擎前把目标展示名换回真名（引擎按 content 原样进 NPC 提示词）。
+      const utteranceTargetId =
+        utterance?.target && typeof utterance.target === "string" ? utterance.target : undefined;
+      const utteranceTarget = utteranceTargetId ? access.state.entities[utteranceTargetId] : undefined;
+      // 与 v1 /turns 同口径：只有目标此刻在场才实名化，缺席的人不能被第三方客户端借这个字段点名
+      const utteranceTargetPresent =
+        utteranceTarget !== undefined && access.state.room.scene.presentIds.includes(utteranceTarget.id);
+      if (utterance?.content && utteranceTarget && utteranceTargetPresent && utteranceTarget.kind === "npc") {
+        const placeholder = unknownPlaceholders(access.state, deps.appearance).get(utteranceTarget.name);
+        utterance.content = unmaskTargetPlaceholder(utterance.content, placeholder, utteranceTarget.name);
+      }
       reply.raw.writeHead(200, SSE_HEADERS);
       let sessionId = "";
       let opened: ConversationEvent | undefined;
@@ -729,17 +741,22 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     let committed = false;
     let errored = false;
     try {
-// 玩家点的是某个 NPC：前端会把"对一位陌生的同学说：…"写进行动语义，
-      // 服务端在这里把占位名换成真名（只影响喂给模型的 input，不影响下发给玩家的显示），
-      // 否则模型看到"一位陌生的同学"根本不知道在跟谁说话，回答必然驴唇不对马嘴。
+      // 玩家点的是某个 NPC：前端会把「对<展示名>说：…」写进行动语义。未认识时展示名是
+      // 外貌占位名（appearance）或「第N位陌生的同学」，这里换回真名只影响喂给模型的 input，
+      // 不影响下发给玩家的显示；否则模型看到一段外貌描述，根本不知道在跟谁说话。
       const snapshotForInput = await deps.store.snapshot(roomId);
       const target = body.targetNpcId ? snapshotForInput.entities[body.targetNpcId] : undefined;
       // 只有"目标此刻就在玩家所在场景"才允许实名化：不在场的人不能借这次行动被解锁/点名（P1-4）
       const targetPresent = target !== undefined && snapshotForInput.room.scene.presentIds.includes(target.id);
-      // 前端写进来的目标名可能是外貌占位名，统一换成真名再喂模型
+      // 占位名用与 /state 出站同一套算法（外貌优先、缺省序号），只替换目标那一个，
+      // 不会把玩家顺带提到的其他陌生人也实名化。
+      const targetPlaceholder =
+        target && target.kind === "npc" && targetPresent
+          ? unknownPlaceholders(snapshotForInput, deps.appearance).get(target.name)
+          : undefined;
       const promptInput =
         target && target.kind === "npc" && targetPresent
-          ? body.input.replace(/(?:一位|另一位|第[三四五六七八九十]位)?陌生的同学/gu, target.name)
+          ? unmaskTargetPlaceholder(body.input, targetPlaceholder, target.name)
           : body.input;
       const it = deps.turn.run({
         roomId,

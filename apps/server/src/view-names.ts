@@ -57,6 +57,18 @@ export function maskNamesInText(text: string, placeholders: Map<string, string>)
 }
 
 /**
+ * 入站方向：把玩家行动文本里的目标**展示名**换回真名（`maskNamesInText` 的逆操作）。
+ *
+ * 前端点击某个 NPC 后会把「对<展示名>说：…」写进行动语义；未认识时展示名是外貌占位名
+ * （appearance）或「第N位陌生的同学」。原样喂给模型，模型会把外观描述当成对方的称呼，
+ * 答非所问。这里只替换**目标那一个**占位名，不会顺带把别的陌生人也实名化。
+ */
+export function unmaskTargetPlaceholder(input: string, placeholder: string | undefined, realName: string): string {
+  const look = placeholder?.trim();
+  return look ? input.split(look).join(realName) : input;
+}
+
+/**
  * 递归脱敏一个事件 payload：turn.patch / turn.delta / turn.facts 里任何字符串都可能带真名
  * （"严守一：嗯？…"、"【世界印象】严守一记住了你"）。只替换字符串，结构不动。
  */

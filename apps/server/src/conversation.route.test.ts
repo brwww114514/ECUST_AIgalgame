@@ -8,7 +8,8 @@ import Fastify from "fastify";
 import type { FastifyInstance } from "fastify";
 import { afterAll, describe, expect, it } from "vitest";
 import { tempDir } from "@galgame/testkit";
-import type { ConversationEvent } from "../../../packages/shared/src/contract/v2.ts";
+import type { Proposal, WorldState } from "../../../packages/shared/src/contract/types.ts";
+import type { ConversationEvent, ConversationSessionV2 } from "../../../packages/shared/src/contract/v2.ts";
 import { MockLlm } from "../../../packages/llm/src/mock.ts";
 import {
   AuditGate,
@@ -101,6 +102,68 @@ const payload = (actorId: string, clientTurnId: string) => ({
   clientTurnId,
   utterance: { id: `utt_${clientTurnId}`, mode: "broadcast", content: "大家好" },
 });
+
+/** 可控假 host：只实现路由用到的 open/get/run，让 SSE 断言不依赖 LLM/NPC 数量与文案 */
+function fakeConversationHost(opts: {
+  events: ConversationEvent[];
+  openDelayMs?: number;
+  runDelayMs?: number;
+}): { host: ConversationHostV2; openCalls: () => number } {
+  let opens = 0;
+  const sessions = new Map<string, ConversationSessionV2>();
+  const host = {
+    async open(spec: { roomId: string; participants: string[] }): Promise<ConversationSessionV2> {
+      opens += 1;
+      if (opts.openDelayMs) await new Promise<void>((resolve) => setTimeout(resolve, opts.openDelayMs));
+      const session: ConversationSessionV2 = {
+        id: `conv_${opens}`,
+        roomId: spec.roomId,
+        participants: [...spec.participants],
+        phase: "speaking", turn: 0, maxTurns: 10, status: "open",
+        queue: [], injected: [], sceneBeats: [], npcSpeechStreak: 0, visibility: "scene",
+      };
+      sessions.set(session.id, session);
+      return session;
+    },
+    get(id: string): ConversationSessionV2 | undefined { return sessions.get(id); },
+    async *run(_sessionId: string): AsyncIterable<ConversationEvent> {
+      if (opts.runDelayMs) await new Promise<void>((resolve) => setTimeout(resolve, opts.runDelayMs));
+      for (const ev of opts.events) yield ev;
+    },
+  } as unknown as ConversationHostV2;
+  return { host, openCalls: () => opens };
+}
+
+/** 换掉 host 但不换房间/账号：房间仍由 createApp 真建，guardRoom/roomGate 照常生效 */
+async function appWithHost(makeHost: (roomId: string, actorId: string) => ConversationHostV2) {
+  process.env.GALGAME_GOSSIP_SCAN_MS = "0";
+  const deps = await createApp(testConfig());
+  const { roomId, actorId } = await deps.createRoom("solo", "u_owner");
+  deps.conversation = { host: makeHost(roomId, actorId) };
+  const app = Fastify();
+  registerRoutes(app, deps);
+  return { app, roomId, actorId };
+}
+
+/** 一个已认识、一个未认识的 NPC + 带私忆/GM 字段的 committed 状态（只断言结构，不断言文案） */
+function viewState(roomId: string, known: string, unknown: string): WorldState {
+  const npc = (id: string, name: string, knows: boolean) => ({
+    id, kind: "npc" as const, name, attrs: { knows_name: knows }, tags: [],
+    origin: "seed" as const, canon: true, status: "active" as const, createdAt: 0, updatedAt: 0,
+  });
+  return {
+    schemaVersion: 1,
+    room: {
+      id: roomId, mode: "solo", worldId: "w1", members: [],
+      scene: { locId: "loc", presentIds: [known, unknown] }, createdAt: 0, lastActiveAt: 0,
+    },
+    entities: { [known]: npc(known, "白晓通", true), [unknown]: npc(unknown, "严守一", false) },
+    links: [],
+    clock: { day: 1, phase: "morning", tick: 0 },
+    plots: [{ id: "p1", goal: "g", actors: [known], forbidReveal: "GM_SECRET", status: "active" }],
+    moduleState: { m1: { hidden: "HIDDEN_MODULE" } },
+  };
+}
 
 describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
   it("正常回合：SSE 推 opened/utterance/committed，speaker 绑定为调用者", async () => {
@@ -199,6 +262,75 @@ describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
     expect(typeof data.sessionId).toBe("string");
     expect(typeof data.turn).toBe("number");
     expect(data.state.room.id).toBe(roomId);
+    await app.close();
+  });
+
+  it("BLOCKER-1：玩家 SSE 按观察者投影——无他人 mental/私聊，committed 私忆与 GM 字段裁掉，已认识名不回归", async () => {
+    const KNOWN = "npc_known";
+    const UNKNOWN = "npc_unknown";
+    const { app, roomId, actorId } = await appWithHost((rid, viewer) => {
+      const proposals: Proposal[] = [
+        { op: "memory.write", args: { ownerId: KNOWN, content: "PUBLIC_MEMO", visibility: "public", tags: ["dialogue"], salience: 60 } },
+        { op: "memory.write", args: { ownerId: KNOWN, content: "SECRET_THOUGHT_A", visibility: "secret", tags: ["mental"], salience: 80 } },
+        { op: "plot.upsert", args: { id: "p1", goal: "g", forbidReveal: "GM_SECRET", status: "active" } },
+      ];
+      const events: ConversationEvent[] = [
+        // 给别人的 whisper：正文里带标记，玩家侧连事件都不该收到
+        { type: "conversation.utterance", delivery: { to: KNOWN, speaker: UNKNOWN, utteranceId: "u1", mode: "whisper", channels: ["content"], content: "SECRET_WHISPER" } },
+        // 给玩家自己的广播：两个 NPC 名字都在正文里，只有未认识的应被遮掉
+        { type: "conversation.utterance", delivery: { to: viewer, speaker: KNOWN, utteranceId: "u2", mode: "broadcast", channels: ["content"], content: "你好，白晓通和严守一" } },
+        { type: "conversation.mental", actorId: KNOWN, mental: { actorId: KNOWN, thought: "SECRET_THOUGHT_B", salience: 4 } },
+        { type: "conversation.committed", sessionId: "conv_1", turn: 1, proposals, state: viewState(rid, KNOWN, UNKNOWN) },
+      ];
+      return fakeConversationHost({ events }).host;
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation`,
+      headers: { "x-user-id": "u_owner" },
+      payload: payload(actorId, "project-1"),
+    });
+    expect(res.statusCode).toBe(200);
+    const events = sse(res.body);
+    expect(events.some((e) => e.type === "conversation.mental")).toBe(false);
+    expect(res.body).not.toContain("SECRET_THOUGHT_A");
+    expect(res.body).not.toContain("SECRET_THOUGHT_B");
+    expect(res.body).not.toContain("SECRET_WHISPER");
+    expect(res.body).not.toContain("HIDDEN_MODULE");
+
+    const utterances = events.filter((e) => e.type === "conversation.utterance");
+    expect(utterances).toHaveLength(1);
+    const delivery = (utterances[0]!.data as unknown as Extract<ConversationEvent, { type: "conversation.utterance" }>).delivery;
+    expect(delivery.to).toBe(actorId);
+
+    const committed = events.find((e) => e.type === "conversation.committed");
+    expect(committed).toBeTruthy();
+    const data = committed!.data as unknown as Extract<ConversationEvent, { type: "conversation.committed" }>;
+    expect(data.proposals).toHaveLength(2); // 私忆 proposal 被裁掉，public 记忆与 plot 保留
+    expect(data.proposals.some((p) => JSON.stringify(p).includes("SECRET_THOUGHT_A"))).toBe(false);
+    expect(data.proposals.some((p) => p.op === "plot.upsert" && "forbidReveal" in p.args)).toBe(false);
+    expect(data.state.plots[0]).not.toHaveProperty("forbidReveal");
+    expect(Object.keys(data.state.moduleState)).toHaveLength(0);
+
+    // 已认识的人名不回归；未认识的仍被遮成占位名（maskNamesDeep 在投影之后执行）
+    expect(res.body).toContain("白晓通");
+    expect(res.body).not.toContain("严守一");
+    await app.close();
+  });
+
+  it("MAJOR-2：并发首回合只 open 一个会话（openOrReuse 纳入房间串行）", async () => {
+    const fake = fakeConversationHost({ events: [], openDelayMs: 20, runDelayMs: 20 });
+    const { app, roomId, actorId } = await appWithHost(() => fake.host);
+    const url = `/api/v1/rooms/${roomId}/conversation`;
+    const [a, b] = await Promise.all([
+      app.inject({ method: "POST", url, headers: { "x-user-id": "u_owner" }, payload: payload(actorId, "race-1") }),
+      app.inject({ method: "POST", url, headers: { "x-user-id": "u_owner" }, payload: payload(actorId, "race-2") }),
+    ]);
+    expect(a.statusCode).toBe(200);
+    expect(b.statusCode).toBe(200);
+    expect(fake.openCalls()).toBe(1);
+    const opened = [a, b].flatMap((r) => sse(r.body)).filter((e) => e.type === "conversation.opened");
+    expect(opened).toHaveLength(1);
     await app.close();
   });
 });

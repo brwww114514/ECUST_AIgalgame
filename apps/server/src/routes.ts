@@ -6,7 +6,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { ActorId, Memory, MemoryRecord, Registry, RoomId, Store, Turn, TurnEvent, WorldState } from "../../../packages/shared/src/contract/types.ts";
 import type { ConversationEvent, GossipEvent, MessageDigest } from "../../../packages/shared/src/contract/v2.ts";
-import type { ConversationHostV2 } from "../../../packages/engine/src/v2/index.ts";
+import { projectConversationEvents, type ConversationHostV2 } from "../../../packages/engine/src/v2/index.ts";
 import { DialogueBodySchema, TickBodySchema, TravelBodySchema, zodMessage } from "./map.data.ts";
 import type { MapService } from "./map.ts";
 import type { LlmSettings } from "./settings.ts";
@@ -516,6 +516,23 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     const sessions = new Map<string, string>();
     const MAX_SESSIONS = 256;
 
+    /**
+     * 房间级串行（MAJOR-2）：openOrReuse 的 get/open/insert 必须与本轮 host.run 共用一把锁，
+     * 否则并发首回合会各自 open（实测 openCalls=2）。host.exclusive 是私有方法且只覆盖 runInner，
+     * 这里另起一条 Promise 链把 open+run 整体包住，两层锁不同、不嵌套，不会自锁。
+     */
+    const turnChains = new Map<string, Promise<void>>();
+    const serializeTurn = <T>(roomId: string, fn: () => Promise<T>): Promise<T> => {
+      const prev = turnChains.get(roomId) ?? Promise.resolve();
+      const next = prev.then(fn, fn);
+      const tail = next.then(() => undefined, () => undefined);
+      turnChains.set(roomId, tail);
+      void tail.finally(() => {
+        if (turnChains.get(roomId) === tail) turnChains.delete(roomId);
+      });
+      return next;
+    };
+
     const openOrReuse = async (roomId: string, actorId: string, state: WorldState) => {
       const cached = sessions.get(roomId);
       const session = cached ? host.get(cached) : undefined;
@@ -547,22 +564,33 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       const utterance = body.utterance
         ? { ...body.utterance, id: body.utterance.id ?? `utt_${body.clientTurnId}`, speaker: actorId }
         : undefined;
-      const { sessionId, opened } = await openOrReuse(roomId, actorId, access.state);
       reply.raw.writeHead(200, SSE_HEADERS);
+      let sessionId = "";
+      let opened: ConversationEvent | undefined;
+      const out: ConversationEvent[] = [];
       try {
+        // open/insert 与 host.run 在同一房间锁内：并发首回合第二次进来时直接复用已 open 的会话。
+        await serializeTurn(roomId, async () => {
+          const r = await openOrReuse(roomId, actorId, access.state);
+          sessionId = r.sessionId;
+          opened = r.opened;
+          for await (const ev of host.run(r.sessionId, {
+            clientTurnId: body.clientTurnId,
+            ...(utterance ? { utterance } : {}),
+            ...(body.interject ? { interject: body.interject } : {}),
+            ...(access.userId ? { userId: access.userId } : {}),
+          })) out.push(ev);
+        });
         if (opened) sseWrite(reply.raw, opened.type, opened);
-        const out: ConversationEvent[] = [];
-        for await (const ev of host.run(sessionId, {
-          clientTurnId: body.clientTurnId,
-          ...(utterance ? { utterance } : {}),
-          ...(body.interject ? { interject: body.interject } : {}),
-          ...(access.userId ? { userId: access.userId } : {}),
-        })) out.push(ev);
         // 与 /turns 同一口径：收齐后按最终状态脱敏再一次性写出（模型可能把真名写进台词）
         const committed = out.find((e) => e.type === "conversation.committed");
         const finalState = committed?.type === "conversation.committed" ? committed.state : access.state;
         const placeholders = unknownPlaceholders(finalState, deps.appearance);
-        for (const ev of out) sseWrite(reply.raw, ev.type, maskNamesDeep(ev, placeholders));
+        // BLOCKER-1：host.run 的事件是全量内部视图，下发前必须按已鉴权 viewer + 会话成员投影：
+        // mental 永不下发，私聊只给目标本人，committed 的私忆/私有关系/GM 字段按可见性裁剪，最后再遮真名。
+        const members = host.get(sessionId)?.participants ?? [actorId];
+        const visible = projectConversationEvents(out, actorId, members, deps.registry);
+        for (const ev of visible) sseWrite(reply.raw, ev.type, maskNamesDeep(ev, placeholders));
       } catch (e) {
         const err: ConversationEvent = {
           type: "conversation.error", sessionId, code: "E_MODULE_FAULT",

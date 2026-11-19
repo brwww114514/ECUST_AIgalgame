@@ -3,8 +3,10 @@
  * 不含业务规则；游戏层拒绝一律 HTTP 200 + {ok:false,code,message}，500 只表示未预期异常。
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { z } from "zod";
 import type { ActorId, Memory, MemoryRecord, Registry, RoomId, Store, Turn, TurnEvent, WorldState } from "../../../packages/shared/src/contract/types.ts";
-import type { GossipEvent, MessageDigest } from "../../../packages/shared/src/contract/v2.ts";
+import type { ConversationEvent, GossipEvent, MessageDigest } from "../../../packages/shared/src/contract/v2.ts";
+import { projectConversationEvents, type ConversationHostV2 } from "../../../packages/engine/src/v2/index.ts";
 import { DialogueBodySchema, TickBodySchema, TravelBodySchema, zodMessage } from "./map.data.ts";
 import type { MapService } from "./map.ts";
 import type { LlmSettings } from "./settings.ts";
@@ -79,6 +81,8 @@ export interface AppDeps {
     inbox(roomId: RoomId, to: ActorId): MessageDigest[];
     subscribe(roomId: RoomId, viewer: ActorId, cb: (ev: GossipEvent) => void): () => void;
   };
+  /** dev/v2：群聊会话宿主（未接线时不注册端点；会话/幂等缓存全在进程内，重启即新会话） */
+  conversation?: { host: ConversationHostV2 };
   /** 管理操作日志 */
   adminLog?: AdminLog;
   /** Cookie 写请求 CSRF 允许的 Origin（authRequired=1 时用） */
@@ -95,6 +99,48 @@ interface GameError {
 function sseWrite(raw: NodeJS.WritableStream, event: string, data: unknown): void {
   raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
+
+/** dev/v2 群聊回合请求：speaker 由 guardRoom 绑定后的 actorId 决定，客户端不能代别人发言 */
+const ConversationBodySchema = z
+  .object({
+    actorId: z.string().min(1).optional(),
+    clientTurnId: z.string().min(1).max(120),
+    userId: z.string().optional(),
+    interject: z.string().min(1).optional(),
+    utterance: z
+      .object({
+        id: z.string().min(1).optional(),
+        speaker: z.string().min(1).optional(),
+        mode: z.string().min(1),
+        target: z.union([z.string().min(1), z.array(z.string().min(1))]).optional(),
+        content: z.string().max(2000).optional(),
+        action: z.string().max(2000).optional(),
+        coverAction: z.string().max(2000).optional(),
+        notice: z.string().max(2000).optional(),
+      })
+      .optional(),
+  })
+  .strict();
+
+/** 前端（#85）兼容别名：自然语言 input + 可选 targetNpcId → utterance，复用同一 SSE 回合 */
+const ConversationTurnAliasSchema = z
+  .object({
+    actorId: z.string().min(1),
+    input: z.string().min(1).max(2000),
+    clientTurnId: z.string().min(1).max(120),
+    targetNpcId: z.string().min(1).optional(),
+    userId: z.string().optional(),
+  })
+  .strict();
+
+type ConversationBody = z.infer<typeof ConversationBodySchema>;
+
+const SSE_HEADERS = {
+  "content-type": "text/event-stream; charset=utf-8",
+  "cache-control": "no-cache, no-transform",
+  connection: "keep-alive",
+  "x-accel-buffering": "no",
+};
 
 function schemaError(message: string): GameError {
   return { ok: false, code: "E_SCHEMA_INVALID", message };
@@ -351,6 +397,9 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       return reply.code(401).send({ ok: false, code: "E_UNAUTHORIZED", message: "请先登录" });
     }
     const room = await deps.createRoom(body.mode === "coop" ? "coop" : "solo", userId);
+    // 新房间已经落盘，丢掉存在性缓存（issue #78）：紧接着的 /state /turns 必须能看到它，
+    // 否则缓存会把刚建的房间当不存在而回 404。
+    roomExists.invalidate();
     // 建房即登记存档索引（issue #7）：lastCommittedSeq 从建房种子事件之后算起。
     // 登记失败不回滚房间——房间本体是权威的，索引只是"我玩过哪些"的投影。
     if (userId && deps.saves) {
@@ -460,6 +509,138 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       const ping = setInterval(() => reply.raw.write(": ping\n\n"), 15_000);
       ping.unref?.();
       req.raw.on("close", () => { clearInterval(ping); off(); });
+    });
+  }
+
+  // ---------------------------------------------------------------- dev/v2 群聊回合（issue #89）
+  if (deps.conversation) {
+    const host = deps.conversation.host;
+    /** roomId → sessionId：进程内映射；会话本体/幂等缓存也在 host 内存里，重启即新会话 */
+    const sessions = new Map<string, string>();
+    const MAX_SESSIONS = 256;
+
+    /**
+     * 房间级串行（MAJOR-2）：openOrReuse 的 get/open/insert 必须与本轮 host.run 共用一把锁，
+     * 否则并发首回合会各自 open（实测 openCalls=2）。host.exclusive 是私有方法且只覆盖 runInner，
+     * 这里另起一条 Promise 链把 open+run 整体包住，两层锁不同、不嵌套，不会自锁。
+     */
+    const turnChains = new Map<string, Promise<void>>();
+    const serializeTurn = <T>(roomId: string, fn: () => Promise<T>): Promise<T> => {
+      const prev = turnChains.get(roomId) ?? Promise.resolve();
+      const next = prev.then(fn, fn);
+      const tail = next.then(() => undefined, () => undefined);
+      turnChains.set(roomId, tail);
+      void tail.finally(() => {
+        if (turnChains.get(roomId) === tail) turnChains.delete(roomId);
+      });
+      return next;
+    };
+
+    const openOrReuse = async (roomId: string, actorId: string, state: WorldState) => {
+      const cached = sessions.get(roomId);
+      const session = cached ? host.get(cached) : undefined;
+      if (session && session.roomId === roomId && session.status === "open") {
+        return { sessionId: session.id, opened: undefined as ConversationEvent | undefined };
+      }
+      const present = [...state.room.scene.presentIds];
+      if (!present.includes(actorId)) present.unshift(actorId);
+      const fresh = await host.open({ roomId, participants: present });
+      if (sessions.size >= MAX_SESSIONS) {
+        const oldest = sessions.keys().next().value;
+        if (oldest) sessions.delete(oldest);
+      }
+      sessions.set(roomId, fresh.id);
+      const opened: ConversationEvent = { type: "conversation.opened", sessionId: fresh.id, participants: [...fresh.participants] };
+      return { sessionId: fresh.id, opened };
+    };
+
+    /** 一回合 SSE 的共用实现；两种入参形状都归一到 ConversationBody 后走这里 */
+    const runConversationTurn = async (req: FastifyRequest, reply: FastifyReply, roomId: string, body: ConversationBody) => {
+      if (!(await roomGate(roomId, reply))) return reply;
+      // interject 是"被插话的 NPC"，不是调用者本人：不能拿它推 actorId（否则可冒充 NPC）
+      const actorId = body.actorId ?? body.utterance?.speaker;
+      if (!actorId) return reply.code(400).send(schemaError("actorId / utterance.speaker 至少一个必填"));
+      const access = await guardRoom(req, reply, deps, roomId, userIdOf, { actorId, body: { userId: body.userId } });
+      if (!access) return reply;
+      if (actionsPaused(reply)) return reply;
+
+      const utterance = body.utterance
+        ? { ...body.utterance, id: body.utterance.id ?? `utt_${body.clientTurnId}`, speaker: actorId }
+        : undefined;
+      reply.raw.writeHead(200, SSE_HEADERS);
+      let sessionId = "";
+      let opened: ConversationEvent | undefined;
+      const out: ConversationEvent[] = [];
+      try {
+        // open/insert 与 host.run 在同一房间锁内：并发首回合第二次进来时直接复用已 open 的会话。
+        await serializeTurn(roomId, async () => {
+          const r = await openOrReuse(roomId, actorId, access.state);
+          sessionId = r.sessionId;
+          opened = r.opened;
+          for await (const ev of host.run(r.sessionId, {
+            clientTurnId: body.clientTurnId,
+            ...(utterance ? { utterance } : {}),
+            ...(body.interject ? { interject: body.interject } : {}),
+            ...(access.userId ? { userId: access.userId } : {}),
+          })) out.push(ev);
+        });
+        if (opened) sseWrite(reply.raw, opened.type, opened);
+        // 与 /turns 同一口径：收齐后按最终状态脱敏再一次性写出（模型可能把真名写进台词）
+        const committed = out.find((e) => e.type === "conversation.committed");
+        const finalState = committed?.type === "conversation.committed" ? committed.state : access.state;
+        const placeholders = unknownPlaceholders(finalState, deps.appearance);
+        // BLOCKER-1：host.run 的事件是全量内部视图，下发前必须按已鉴权 viewer + 会话成员投影：
+        // mental 永不下发，私聊只给目标本人，committed 的私忆/私有关系/GM 字段按可见性裁剪，最后再遮真名。
+        const members = host.get(sessionId)?.participants ?? [actorId];
+        const visible = projectConversationEvents(out, actorId, members, deps.registry);
+        for (const ev of visible) sseWrite(reply.raw, ev.type, maskNamesDeep(ev, placeholders));
+      } catch (e) {
+        const err: ConversationEvent = {
+          type: "conversation.error", sessionId, code: "E_MODULE_FAULT",
+          message: e instanceof Error ? e.message : String(e),
+        };
+        sseWrite(reply.raw, err.type, err);
+      } finally {
+        reply.raw.end();
+      }
+    };
+
+    // 前端（#85）用 GET 做 feature detect：有 host 装配时返回 200，老服务端 404 → 退回 v1 /turns。
+    app.get("/api/v1/rooms/:roomId/conversation", async (req, reply) => {
+      const { roomId } = req.params as { roomId: string };
+      if (!(await roomGate(roomId, reply))) return reply;
+      // 与另外两条 conversation 路由同口径（docs/03 §5.2.11）：探测也不能让非成员确认房间存在。
+      if (!(await guardRoom(req, reply, deps, roomId, userIdOf))) return reply;
+      return reply.code(200).send({ ok: true, v2: true });
+    });
+
+    // 规范端点（docs/03 §5.2.11）：body 是 utterance 形状
+    app.post("/api/v1/rooms/:roomId/conversation", async (req, reply) => {
+      const { roomId } = req.params as { roomId: string };
+      const parsed = ConversationBodySchema.safeParse(req.body ?? {});
+      if (!parsed.success) return reply.code(400).send(schemaError(zodMessage(parsed.error)));
+      return runConversationTurn(req, reply, roomId, parsed.data);
+    });
+
+    // 前端（#85）兼容别名：{actorId, input, clientTurnId, targetNpcId?} → utterance。
+    // input 是玩家自然语言，归到 broadcast（有 target 则 addressed）；speaker 仍由 guardRoom 绑定后覆盖。
+    app.post("/api/v1/rooms/:roomId/conversation/turns", async (req, reply) => {
+      const { roomId } = req.params as { roomId: string };
+      const parsed = ConversationTurnAliasSchema.safeParse(req.body ?? {});
+      if (!parsed.success) return reply.code(400).send(schemaError(zodMessage(parsed.error)));
+      const b = parsed.data;
+      return runConversationTurn(req, reply, roomId, {
+        actorId: b.actorId,
+        clientTurnId: b.clientTurnId,
+        ...(b.userId ? { userId: b.userId } : {}),
+        utterance: {
+          id: `utt_${b.clientTurnId}`,
+          speaker: b.actorId,
+          mode: b.targetNpcId ? "addressed" : "broadcast",
+          ...(b.targetNpcId ? { target: b.targetNpcId } : {}),
+          content: b.input,
+        },
+      });
     });
   }
 

@@ -2,7 +2,25 @@
  * 会话编排的纯函数（dev/v2）：审核字段拼接 + 私忆 Proposal 生成。
  * 从 conversation.ts 拆出，让编排保持在 300 行以内（AGENTS §6）。
  */
-import type { Id, Proposal, RoomId, Utterance, UtteranceModeDef, ActorId } from "../../../shared/src/index.ts";
+import type { Delivery, Id, Proposal, RoomId, Utterance, UtteranceModeDef, ActorId } from "../../../shared/src/index.ts";
+
+/** 与 Arbiter 的 limits.memoryContentMax 对齐：组合后的记忆正文必须落在这个闭区间内 */
+const MEMORY_CONTENT_MAX = 500;
+
+/** 组合文本统一收口到 memory.write 的内容上限，避免字段各自合法、拼接后整批被拒 */
+function fitMemoryContent(text: string): string {
+  return text.slice(0, MEMORY_CONTENT_MAX);
+}
+
+/** 共享场景总结只能读 public 模式投出的通道；私聊/暗号的正文绝不进群像总结 */
+export function publicSceneText(
+  deliveries: readonly Delivery[],
+  modes: Map<string, UtteranceModeDef>,
+): string[] {
+  return deliveries
+    .filter((d) => modes.get(d.mode)?.visibility === "public")
+    .map((d) => [d.speaker, d.content ?? "", d.action ?? ""].filter(Boolean).join(" / "));
+}
 
 export interface AuditText {
   label: string;
@@ -36,7 +54,7 @@ export function memoryProposals(u: Utterance, roomId: RoomId, modes: Map<string,
   const visibility: "public" | "private" | "secret" = modes.get(u.mode)?.visibility ?? "private";
   const args: Record<string, unknown> = {
     ownerId: u.speaker,
-    content: text.slice(0, 500),
+    content: fitMemoryContent(text),
     tags: ["dialogue", u.mode],
     salience: 60,
     visibility,
@@ -51,7 +69,8 @@ export function mentalProposal(actorId: ActorId, m: { thought: string; plan?: st
     op: "memory.write",
     args: {
       ownerId: actorId,
-      content: [m.thought, m.plan ? `plan: ${m.plan}` : ""].filter(Boolean).join("\n"),
+      // thought(≤300) + "plan: "(6) + plan(≤200) 可达 507 > 500；先拼接再统一截断，字段各自合法也不会打回整批
+      content: fitMemoryContent([m.thought, m.plan ? `plan: ${m.plan}` : ""].filter(Boolean).join("\n")),
       tags: ["mental", ...(m.about ?? [])],
       salience: m.salience * 20,
       visibility: "secret",

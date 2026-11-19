@@ -5,22 +5,45 @@
  */
 import type {
   ActorId, ApplyResult, ConversationEvent, ConversationSessionV2, ConversationTurnInput,
-  Proposal, Utterance, WorldState,
+  Delivery, Envelope, Proposal, Utterance, WorldState,
 } from "../../../shared/src/index.ts";
 import { deliver, validateUtterance } from "./delivery.ts";
 import { shouldWake, type SceneManager } from "./scene.ts";
-import { mentalFields, mentalProposal, memoryProposals, utteranceFields } from "./conversation.helpers.ts";
+import { mentalFields, mentalProposal, memoryProposals, publicSceneText, utteranceFields } from "./conversation.helpers.ts";
 import type { ConversationDeps } from "./conversation.ts";
 import type { NpcDecisionResult } from "./npc-agent.ts";
+
+/** 重放一次落盘失败所需的全部输入；宿主重试时用同一 cause + expectedSeq 重新裁决 */
+export interface StoreRetry {
+  ops: Proposal[];
+  cause: Envelope;
+  expectedSeq: number;
+}
 
 export class StoreFlushError extends Error {
   constructor(
     readonly roomId: string,
     readonly applied: ApplyResult,
     message = "store.flush failed",
+    readonly retry?: StoreRetry,
+    readonly fresh: Delivery[] = [],
   ) {
     super(message);
   }
+}
+
+/**
+ * ① 每个会话记住"已经成功提交的投递"，给下轮 NPC 做上下文。
+ * Delivery 自带逐接收方 channels，原文里没有的通道不会出现在这里，可见性天然保持。
+ * 用 WeakMap 挂 session：会话被宿主淘汰时条目自动回收，不污染冻结契约。
+ */
+const recentBySession = new WeakMap<ConversationSessionV2, Delivery[]>();
+const MAX_RECENT_DELIVERIES = 64;
+
+export function rememberRecent(s: ConversationSessionV2, fresh: readonly Delivery[]): void {
+  if (!fresh.length) return;
+  const merged = [...(recentBySession.get(s) ?? []), ...fresh].slice(-MAX_RECENT_DELIVERIES);
+  recentBySession.set(s, merged);
 }
 
 type CommitFn = (s: ConversationSessionV2, applied: ApplyResult) => Promise<ConversationEvent>;
@@ -43,6 +66,8 @@ interface StepCtx {
   seq: number;
   commit: CommitFn;
   proposals: Proposal[];
+  /** 本轮通过审核的投递，提交成功后才写入 recentBySession */
+  fresh: Delivery[];
 }
 
 /** ① 插话：只切 phase，等玩家真正说话才推进 NPC */
@@ -100,7 +125,9 @@ async function wakeStep(ctx: StepCtx, utterance: Utterance | undefined, deliveri
     wakeOnLocationChange: deps.wakeOnLocationChange ?? deps.policy.wakeOnLocationChange,
   });
   if (!wake) return [];
-  const recent = deliveries.flatMap((e) => (e.type === "conversation.utterance" ? [e.delivery.content ?? e.delivery.action ?? ""] : []));
+  // 共享场景总结只读 public 通道：悄悄话/暗号的正文不进 SceneAgent 的 recent
+  const received = deliveries.flatMap((e) => (e.type === "conversation.utterance" ? [e.delivery] : []));
+  const recent = publicSceneText(received, deps.modes);
   const beat = await deps.scene.wake(s.id, s.roomId, wake, recent, state.room.scene.locId);
   s.sceneBeats.push(beat);
   return [{ type: "conversation.scene", beat }];
@@ -132,7 +159,12 @@ async function decideStep(ctx: StepCtx, utterance?: Utterance): Promise<NpcResul
     return ok;
   });
   return Promise.all(eligible.map(async (npcId) => {
-    const hits = utterance ? deliver(utterance, { recipients: [npcId], modes: deps.modes, noticeFor: nameOf }) : [];
+    // ① 其他 NPC 上一轮（及更早）实际投给自己的发言，按原 Delivery 通道进本轮 prompt
+    const prior = (recentBySession.get(s) ?? []).filter((d) => d.to === npcId && d.speaker !== npcId);
+    const hits = [
+      ...prior,
+      ...(utterance ? deliver(utterance, { recipients: [npcId], modes: deps.modes, noticeFor: nameOf }) : []),
+    ];
     const own = await deps.memory.recall({ roomId: s.roomId, ownerId: npcId, budgetTokens: 300, nowTurn: state.clock.tick });
     const r = await deps.npc.decide({
       npcId, npcName: nameOf(npcId), turnKey: s.turn, state, deliveries: hits,
@@ -156,9 +188,9 @@ async function auditStep(ctx: StepCtx, decisions: NpcResult[], utterance?: Utter
       if (d.decision.kind === "speak") {
         deps.budget?.recordSent(s.roomId, d.npcId);
         const u = d.decision.utterance;
-        for (const delivery of deliver(u, { recipients: present, modes: deps.modes, noticeFor: nameOf })) {
-          out.push({ type: "conversation.utterance", delivery });
-        }
+        const spoken = deliver(u, { recipients: present, modes: deps.modes, noticeFor: nameOf });
+        for (const delivery of spoken) out.push({ type: "conversation.utterance", delivery });
+        ctx.fresh.push(...spoken);
         ctx.proposals.push(...memoryProposals(u, s.roomId, deps.modes));
       } else if (d.decision.kind === "think") {
         out.push({ type: "conversation.mental", actorId: d.npcId, mental: d.decision.mental });
@@ -178,7 +210,7 @@ function restorePhase(ctx: StepCtx, utterance?: Utterance, listening = false): v
 }
 
 /** ⑧ 唯一写入口：整批 Proposal 一次裁决；无提案也发 committed 让对端收口 */
-async function commitStep(ctx: StepCtx, utterance?: Utterance): Promise<void> {
+async function commitStep(ctx: StepCtx, utterance?: Utterance): Promise<boolean> {
   const { deps, s, input, out, now, seq, commit } = ctx;
   const { store, arbiter, memory, policy } = deps;
   const cause = {
@@ -192,24 +224,31 @@ async function commitStep(ctx: StepCtx, utterance?: Utterance): Promise<void> {
   };
   if (!ctx.proposals.length) {
     await finish({ ok: true, mode: "atomic", seq: seq + 1, applied: [], rejected: [], events: [] });
-    return;
+    return true;
   }
   const applied = await arbiter.apply(s.roomId, ctx.proposals, cause, { expectedSeq: seq });
   if (!applied.ok) {
+    // ③ 写盘失败是暂时故障：必须走 retryable 分支，绝不能进 seen 缓存
+    if (applied.error?.code === "E_STORE_FAULT") {
+      throw new StoreFlushError(s.roomId, applied, deps.policy.messages.storeFlushFailed, {
+        ops: ctx.proposals, cause, expectedSeq: seq,
+      }, ctx.fresh);
+    }
     out.push({
       type: "conversation.error", sessionId: s.id,
       code: applied.error?.code ?? applied.rejected[0]?.code ?? "E_MODULE_FAULT",
       message: applied.error?.message ?? policy.messages.memoryRejected,
     });
-    return;
+    return false;
   }
   for (const ev of applied.events) memory.ingest(ev); // PR#4 P0-1：写了必须能读到
   try {
     await store.flush(s.roomId);
   } catch {
-    throw new StoreFlushError(s.roomId, applied, deps.policy.messages.storeFlushFailed);
+    throw new StoreFlushError(s.roomId, applied, deps.policy.messages.storeFlushFailed, undefined, ctx.fresh);
   }
   await finish(applied);
+  return true;
 }
 
 export async function runStep(
@@ -230,6 +269,7 @@ export async function runStep(
     seq: await deps.store.load(s.roomId),
     commit,
     proposals: [],
+    fresh: [],
   };
   if (interject(ctx)) return;
   const player = await playerStep(ctx);
@@ -239,9 +279,10 @@ export async function runStep(
   out.push(...(first?.type === "conversation.scene" && first.beat.order === "before"
     ? [...sceneEvents, ...player.deliveries] : [...player.deliveries, ...sceneEvents]));
   playerMemory(ctx, player.utterance);
+  ctx.fresh.push(...player.deliveries.flatMap((e) => (e.type === "conversation.utterance" ? [e.delivery] : [])));
   const listening = s.phase === "listening";
   const decisions = await decideStep(ctx, player.utterance);
   await auditStep(ctx, decisions, player.utterance);
   restorePhase(ctx, player.utterance, listening);
-  await commitStep(ctx, player.utterance);
+  if (await commitStep(ctx, player.utterance)) rememberRecent(s, ctx.fresh);
 }

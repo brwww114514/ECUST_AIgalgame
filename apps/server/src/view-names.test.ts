@@ -2,6 +2,8 @@
  * 文本脱敏（认识口径）：未认识 NPC 的真名不得出现在下发文本里，且多个陌生人要能区分
  * （一位 / 另一位 / 第三位陌生的同学），否则一次对话里两个陌生人的台词会混成同一个人。
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { Entity, WorldState } from "../../../packages/shared/src/contract/types.ts";
 import { UNKNOWN_NPC_NAME, maskNamesDeep, maskNamesInText, unmaskTargetPlaceholder, unknownPlaceholders } from "./view-names.ts";
@@ -95,4 +97,17 @@ describe("文本脱敏", () => {
     const value = { a: "严守一：你好" };
     expect(maskNamesDeep(value, new Map())).toBe(value);
   });
+  it("NPC appearance 两两不是前缀（否则 unmaskTargetPlaceholder 会误伤）", () => {
+    const file = fileURLToPath(new URL("../../../content/scenarios/npcs.json", import.meta.url));
+    const rows = JSON.parse(readFileSync(file, "utf-8")) as { id: string; appearance?: string }[];
+    const looks = rows.map((r) => r.appearance?.trim()).filter((v): v is string => Boolean(v));
+    for (const a of looks) {
+      for (const b of looks) {
+        if (a !== b && b.startsWith(a)) {
+          throw new Error(`appearance 前缀冲突：${a} ⊂ ${b}；unmask 会误伤，需保证唯一且互不为前缀`);
+        }
+      }
+    }
+  });
+
 });

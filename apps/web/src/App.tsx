@@ -24,6 +24,16 @@ import { shouldDropRetryOnMove } from "./turn-error.ts";
 import { npcLocIdFromLinks, targetStillInScene } from "./npc-presence.ts";
 import { phaseLabel } from "./ui.ts";
 import type { Line, LineKind } from "./ui.ts";
+import type { ConversationEvent } from "../../../packages/shared/src/contract/v2.ts";
+import { detectConversation, runConversationTurn } from "./conversation-api.ts";
+import {
+  DEFAULT_LISTEN_TIMEOUT_MS,
+  initialConversationView,
+  isListeningExpired,
+  linesFromView,
+  reduceConversationView,
+} from "./conversation-view.ts";
+import type { ConversationView } from "./conversation-view.ts";
 
 type Tab = "chat" | "gallery" | "drafts";
 type Screen = "title" | "game";
@@ -64,6 +74,18 @@ export default function App() {
   const [state, setState] = useState<WorldState | null>(null);
   const [view, setView] = useState<ViewPatch>({});
   const [lines, setLines] = useState<Line[]>([]);
+  /**
+   * v2 群聊会话（issue #85）。默认 v1：进房探测 /conversation 成功才切 v2。
+   * v2 事件行单独存在 convLines，渲染时接在 v1 历史之后——老流程一行不改。
+   */
+  const [convMode, setConvMode] = useState<"v1" | "v2">("v1");
+  const [convLines, setConvLines] = useState<Line[]>([]);
+  const convView = useRef<ConversationView>(initialConversationView());
+  const [waitingInterjection, setWaitingInterjection] = useState(false);
+  const listenTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 渲染 v2 行时取名字用；每次渲染同步，避免 SSE 回调闭包读到旧 state */
+  const stateRef = useRef<WorldState | null>(null);
+  stateRef.current = state;
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string>("");
@@ -118,6 +140,46 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
     setLines((prev) => [...prev, { id: ++lineId, kind, text }]);
   }, []);
 
+  // ---- v2 会话视图辅助：渲染、插话等待态定时器（纯决策在 conversation-view.ts） ----
+  const renderConv = useCallback((view: ConversationView, forActor: string) => {
+    setConvLines(linesFromView(view, {
+      selfActorId: forActor,
+      nameOf: (id) => stateRef.current?.entities[id]?.name ?? id,
+    }));
+  }, []);
+
+  const disarmListenTimer = useCallback(() => {
+    if (listenTimer.current !== null) {
+      clearTimeout(listenTimer.current);
+      listenTimer.current = null;
+    }
+    setWaitingInterjection(false);
+  }, []);
+
+  const armListenTimer = useCallback((forActor: string) => {
+    disarmListenTimer();
+    setWaitingInterjection(true);
+    listenTimer.current = setTimeout(() => {
+      listenTimer.current = null;
+      // 服务端 listenTimeoutMs(30s) 到期自动恢复 speaking：期间没来 phase 事件时前端也清掉
+      const view = convView.current;
+      if (isListeningExpired(view, Date.now())) {
+        convView.current = reduceConversationView(view, {
+          type: "conversation.phase",
+          sessionId: "",
+          phase: "speaking",
+        }, { selfActorId: forActor, now: Date.now(), lineId: () => ++lineId });
+        renderConv(convView.current, forActor);
+      }
+      setWaitingInterjection(false);
+    }, DEFAULT_LISTEN_TIMEOUT_MS);
+  }, [disarmListenTimer, renderConv]);
+
+  // 切账号/卸载时别把插话定时器带到下一局
+  useEffect(() => () => {
+    if (listenTimer.current !== null) clearTimeout(listenTimer.current);
+  }, []);
+
   /** 统一失败出口：401 一律回登录页（多标签页改密/被吊销），其余给人话 */
   const fail = useCallback(
     (e: unknown): string => {
@@ -135,6 +197,10 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
     getTw().reset();
     lastFacts.current = "";
     lastTurn.current = null;
+    disarmListenTimer();
+    setConvMode("v1");
+    setConvLines([]);
+    convView.current = initialConversationView();
     setView({});
     setLines([]);
     setInput("");
@@ -147,7 +213,7 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
     setState(null);
     setRoomId("");
     setActorId("");
-  }, []);
+  }, [disarmListenTimer]);
 
   // 会话失效/退出：中止在途请求并清局内状态，绝不渲染坏掉的游戏画面
   useEffect(() => {
@@ -257,6 +323,12 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
       setRoomId(id);
       setTab("chat");
       setScreen("game");
+      // v2 服务端（issue #89）尚未挂载：探不到 /conversation 就保持 v1 /turns，老流程零回归。
+      // 探测放在 UI 呈现之后，不阻塞进房；失败/切房都会由 current() 拦掉。
+      void detectConversation(id, token.signal).then((v2) => {
+        if (!current()) return;
+        setConvMode(v2 ? "v2" : "v1");
+      });
     },
     [roomKey, scenarios, resetRoomUi],
   );
@@ -392,6 +464,112 @@ const token = scopeRef.current.current();
   );
 
   /**
+   * v2 群聊回合（ConversationHostV2 的 SSE）。事件先过纯 reducer 算出渲染行，
+   * 只有 conversation.committed 才把服务端 state 写回权威状态；错误按 retryable 给重试入口。
+   * 与 v1 完全并行：convMode 不是 v2 时根本不会走到这里。
+   */
+  const dispatchConversationTurn = useCallback(
+    async (raw: string, targetNpc: { id: string; name: string } | null, echo: boolean, reuseId?: string) => {
+      const base = raw.trim();
+      if (!base || busy || !roomId || !actorId) return;
+      const token = scopeRef.current.current();
+      const current = () => scopeRef.current.isCurrent(token.version);
+      const text = targetNpc ? `对${targetNpc.name}说：${base}` : base;
+      lastTurn.current = { text: base, target: targetNpc };
+      const tw = getTw();
+      if (tw.typing) tw.skip();
+      setBusy(true);
+      setErr("");
+      setErrRetryable(false);
+      setUnconfirmed(null);
+      if (echo) {
+        setInput("");
+        // v2 的玩家行放进 convView（而不是 v1 lines），scene beat 才能按 order 锚定它
+        convView.current = {
+          ...convView.current,
+          lines: [
+            ...convView.current.lines,
+            {
+              id: ++lineId,
+              kind: "utterance",
+              speaker: actorId,
+              parts: [{ channel: "content", text }],
+              turn: convView.current.committedTurn,
+            },
+          ],
+        };
+        renderConv(convView.current, actorId);
+      }
+      const clientTurnId = reuseId ?? `${Date.now()}_${++turnSeq.current}`;
+
+      const apply = (ev: ConversationEvent) => {
+        if (!current()) return;
+        if (ev.type === "conversation.committed") {
+          setState(ev.state);
+          setStateRev((v) => v + 1);
+        }
+        convView.current = reduceConversationView(convView.current, ev, {
+          selfActorId: actorId,
+          now: Date.now(),
+          lineId: () => ++lineId,
+        });
+        renderConv(convView.current, actorId);
+        if (ev.type === "conversation.phase") {
+          if (ev.phase === "listening") armListenTimer(actorId);
+          else disarmListenTimer();
+        }
+        if (ev.type === "conversation.error") {
+          setErr(ev.message || ev.code);
+          setErrRetryable(ev.retryable === true);
+        }
+      };
+
+      try {
+        await runConversationTurn(
+          roomId,
+          actorId,
+          text,
+          clientTurnId,
+          {
+            onEvent: apply,
+            onError: (code, message, retryable) => {
+              if (!current()) return;
+              setErr(message || code);
+              setErrRetryable(retryable === true);
+            },
+            onUnconfirmed: () => {
+              if (!current()) return;
+              setUnconfirmed({ clientTurnId });
+              setErr("会话结果未确认，重试会以同一 ID 重发（服务端按 ID 去重）。");
+              setErrRetryable(true);
+            },
+          },
+          token.signal,
+          targetNpc?.id,
+        );
+      } catch (e) {
+        if (!current() || token.signal.aborted) return;
+        if (isUnauthorized(e)) {
+          expireSession();
+          return;
+        }
+        setUnconfirmed({ clientTurnId });
+        setErr(`${httpFailMessage(e)}：本回合结果未确认，重试会以同一 ID 重发。`);
+        setErrRetryable(true);
+      } finally {
+        if (current()) {
+          // 流结束时仍在 listening：保留等待态，让 30s 定时器按服务端节奏清掉
+          if (convView.current.phase !== "listening") disarmListenTimer();
+          setBusy(false);
+          refreshState();
+          void refreshSaves();
+        }
+      }
+    },
+    [actorId, armListenTimer, busy, disarmListenTimer, expireSession, refreshSaves, refreshState, renderConv, roomId],
+  );
+
+  /**
    * 发一回合。`echo=false` 用于「重试」：不重复打印玩家行、不清输入框。
    * `reuseId` 用于未确认回合的重发：服务端按 clientTurnId 去重，不会重复执行。
    */
@@ -401,6 +579,11 @@ const token = scopeRef.current.current();
       if (!base || busy || !roomId || !actorId) return;
       const token = scopeRef.current.current();
       const current = () => scopeRef.current.isCurrent(token.version);
+      // 探测到 v2 端点才走群聊 SSE；否则一切照旧（v1 /turns 完全不动）
+      if (convMode === "v2") {
+        await dispatchConversationTurn(raw, targetNpc, echo, reuseId);
+        return;
+      }
       // 选了对话对象就把目标写进行动语义：契约里 TurnRequest 没有 target 字段
       const text = targetNpc ? `对${targetNpc.name}说：${base}` : base;
       lastTurn.current = { text: base, target: targetNpc };
@@ -465,7 +648,7 @@ await runTurn(
         }
       }
     },
-    [actorId, busy, push, roomId, refreshSaves, refreshState, expireSession],
+    [actorId, busy, convMode, dispatchConversationTurn, push, roomId, refreshSaves, refreshState, expireSession],
   );
   /** 发新回合（快捷建议把 `raw` 传进来就等于说出这句话，不必先填输入框） */
   const send = useCallback(
@@ -554,6 +737,11 @@ await runTurn(
   const retry = useCallback(() => {
     const last = lastTurn.current;
     if (!last) return;
+    if (convMode === "v2") {
+      // v2 按 clientTurnId 去重；未确认回合复用同一 ID，服务端已提交就直接回放结果
+      void dispatchConversationTurn(last.text, last.target, false, unconfirmed?.clientTurnId);
+      return;
+    }
     // NPC 可能在回合之间换场景；重发前用当前状态再核一次在场，
     // 不在就禁用重试，绝不构造「对 X 说：…」绕过场景隔离。
     if (last.target) {
@@ -572,7 +760,7 @@ await runTurn(
       return;
     }
     void dispatchTurn(last.text, last.target, false);
-  }, [dispatchTurn, reconcileThenRetry, unconfirmed, state, view.position?.locId]);
+  }, [convMode, dispatchConversationTurn, dispatchTurn, reconcileThenRetry, unconfirmed, state, view.position?.locId]);
 
   /** 使用服务端页首游标加载更早的历史，前插到对话流顶部。 */
   const loadEarlier = useCallback(async () => {
@@ -729,7 +917,7 @@ await runTurn(
             state={state}
             panels={panels}
             pos={pos}
-            lines={lines}
+            lines={convMode === "v2" ? [...lines, ...convLines] : lines}
             typing={typing}
             busy={busy}
             err={err}
@@ -741,6 +929,7 @@ await runTurn(
             onPick={(text, target) => void send(text, target)}
             onRetry={retry}
             retryable={errRetryable}
+            waitingForInterjection={convMode === "v2" && waitingInterjection}
             roomId={roomId}
             version={stateRev}
             onOpenMap={() => setMapOpen(true)}

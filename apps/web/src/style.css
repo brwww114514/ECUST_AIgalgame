@@ -66,6 +66,8 @@ dl { margin:0; } .row { display:flex; justify-content:space-between; font-size:1
 .line { margin:0 0 14px; white-space:pre-wrap; }
 .line.player { color:var(--accent); font-weight:600; }
 .line.system { color:var(--muted); font-size:13px; }
+/* v2 插话等待态：与普通的 … 忙碌提示区分开 */
+.line.interjection-wait { color:var(--accent); font-style:italic; }
 .line.narrative { color:var(--fg); }
 .line.npc { color:#ffd48a; }
 .err { margin:10px 18px; padding:8px 12px; border:1px solid #7a2b34; background:#2a1418; color:#ff9aa8; border-radius:8px; font-size:13px; }

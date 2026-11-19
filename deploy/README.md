@@ -38,6 +38,8 @@ GALGAME_TRUST_PROXY=1
 # CSRF Origin 白名单，必须等于浏览器地址栏的源（IP 部署写 https://<公网IP>）；AUTH_REQUIRED=1 必填
 GALGAME_PUBLIC_ORIGIN=https://<公网IP>
 GALGAME_RESET_TTL_MIN=15
+# dev/v2 八卦后台波次间隔（毫秒）：默认 30000；设 0 关闭定时器（详见 §7）
+GALGAME_GOSSIP_SCAN_MS=30000
 # 可选：模型/审核；不配则离线叙述、NoopAudit
 # GALGAME_LLM_BASE_URL=...
 # GALGAME_LLM_MODEL=...
@@ -138,7 +140,55 @@ curl -k -X POST https://<公网IP>/api/v1/rooms \
 - **旧 localStorage 不自动迁移（建议12）**：3.4 之前前端把管理员令牌存在 `localStorage["galgame.adminToken"]`、把身份存在本地 userId。新版已移除玩家侧的管理/模型入口与本地令牌，登录态只在 HttpOnly Cookie 里。旧浏览器里残留的 `galgame.adminToken`/userId **不会被自动清理或迁移**——它们已不再被读取，用户清一次 localStorage（或换浏览器）即可；账号数据在服务端 `data/auth/`，与本地存储无关。
 - **公开 health 已脱敏（建议11）**：`GET /api/v1/health` 只回 `{ok, contract}`；canonize 的启用/judge 等运维细节移到鉴权后的 `GET /api/v1/admin/stats`（`canonizeEnabled`/`canonizeJudge`），fail-closed 状态仍对运维可见。
 
-## 7. 本地开发 / 邀请注册（P1-2）
+## 7. gossip 后台波次与策略文件（dev/v2 微信私信）
+
+单进程启动时会拉起一个八卦波次定时器，让 NPC 在玩家离线时也能互相回私信（接线见 `apps/server/src/bootstrap.ts:334-365`）。运维需要知道以下事实：
+
+### 7.1 环境变量 `GALGAME_GOSSIP_SCAN_MS`
+
+- `apps/server/src/bootstrap.ts:350` 读 `Number(process.env.GALGAME_GOSSIP_SCAN_MS ?? 30_000)`：**默认 30000ms**；仅当值 `> 0` 才创建 `setInterval`（`:351`）。
+- **设 `GALGAME_GOSSIP_SCAN_MS=0` 即关闭后台波次**：不再自动跑 `gossip.step()`；玩家主动发私信的 HTTP/SSE 路由不受影响。
+- 定时器 `unref()`（`:364`），每轮遍历 `store.listRooms()`、跳过 world 房间、逐房 `await gossip.step(roomId)`（`:355-358`）。单轮抛错只打 `[gossip] 定时波次失败：...`（`:360`），下一轮继续，不会退出进程。
+
+### 7.2 策略文件位置与坏 JSON 的 fail-closed 行为
+
+| 文件（相对 `contentDir`） | 加载函数 | 作用 |
+|---|---|---|
+| `v2/gossip-policy.json` | `loadGossipPolicy()`（`packages/engine/src/v2/gossip.ts:41`） | 波次调用上限、跳数、置信衰减、提示词文案 |
+| `v2/conversation-policy.json` | `loadConversationPolicy()`（`packages/engine/src/v2/delivery.ts:61`） | 群聊策略 + `autonomy` 段（预算、超时、宽限期） |
+
+`contentDir` 由 `GALGAME_CONTENT_DIR` 指定，默认 `content`（`apps/server/src/config.ts:82`），即默认路径为 `content/v2/gossip-policy.json` 与 `content/v2/conversation-policy.json`；两份文件必须随 content 一起部署。
+
+**fail-closed**：`loadGossipPolicy()` 对文件缺失/不可读、非法 JSON、schema 校验失败都直接抛错（`gossip.ts:44-55`）；`loadConversationPolicy()` 对非法 JSON / schema 失败同样抛错（`delivery.ts:62-63`）。两者都在 bootstrap 启动时 `await`（`bootstrap.ts:340-341`），因此任一份坏掉就是**服务启动失败**，不会回退默认值、不会静默放行。注意 `loadConversationPolicy()` 的 `autonomy` 是 `partial()` 解析并与默认值深合并（`delivery.ts:69`）：整块合法但缺某个键时该键取默认值；旧键名（如 `playerAbsentGraceMs`）会被**静默忽略**、不报错也不生效，现名是 `playerPresentGraceMs`。
+
+### 7.3 波次成本上限 `maxNpcCallsPerTick`
+
+- 每房每轮的 NPC LLM 调用上限取 `min(gossip-policy.json 的 maxNpcCallsPerTick, conversation-policy.json 的 autonomy.maxTurnsPerTick)`（`gossip.ts:245`）。当前两值分别为 **4 与 2**，即实际每房每轮最多 2 次调用。
+- `TalkBudget` 在调 LLM **之前**逐项拦截（`packages/engine/src/v2/talk-budget.ts:38-43`，配置取自 `conversation-policy.json` 的 `autonomy`）：`minReplyIntervalMs`（当前 30000ms）、`maxMessagesPerNpcPerHour`（12）、`maxNpcCallsPerTick`（4）；`beginTick()` 每波清空调用计数（`talk-budget.ts:47-49`）。
+- 降本只改这两个 JSON 的数值，不改代码。`gossip-policy.json` 里也有 `minReplyIntervalMs`（120000）/ `maxMessagesPerNpcPerHour`（12）字段，但当前波次预算闸门用的是 `autonomy` 的值，别混。
+
+### 7.4 观测：`gossip.dropped` 原因分布
+
+每次丢弃产生 `{type:"gossip.dropped", id, reason, nextAt?}`（`packages/shared/src/contract/v2.ts:322`），经 `gossip.subscribe()` 以 SSE `event: gossip.dropped` 推给房间订阅者（`apps/server/src/routes.ts:455-459`）。**当前定时循环只记录波次级失败，不把 dropped 明细写进日志**；建议部署侧订阅 SSE 或加日志聚合，按 `reason` 统计分布，用来判断"NPC 为什么没说话"。reason 取值（见 `gossip.ts:235-293`、`talk-budget.ts:9`）：
+
+| reason | 触发条件（括号为当前配置值） |
+|---|---|
+| `player-grace` | 玩家在场且最近发言距现在 < `playerPresentGraceMs`（60000ms），整房本轮跳过（`gossip.ts:235-241`） |
+| `idle-timeout` | 收件箱消息早于 `idleTimeoutMs`（300000ms）（`gossip.ts:249-250`） |
+| `min-interval` | 该 NPC 距上次发言不足 `minReplyIntervalMs`（30000ms，`autonomy` 值） |
+| `hour-cap` | 该 NPC 近一小时发言已达 `maxMessagesPerNpcPerHour`（12） |
+| `call-cap` | 本轮 `maxNpcCallsPerTick`（4）调用额度已用尽 |
+| `invalid-decision` | LLM 返回无效格式，或 `ignore` 未给 reason（`gossip.ts:267-268`） |
+| `audit-blocked` / `audit-unavailable` | 审核拒绝 / 审核器不可用（`gossip.ts:280-286`，fail-closed：不发布） |
+| `max-hops` | 转发跳数超过 `maxHops`（6）（`gossip.ts:292-293`） |
+
+### 7.5 单进程假设（与 §6 一致）
+
+会话是进程内存态，波次定时器也只活在启动它的那个进程里。`GALGAME_GOSSIP_SCAN_MS>0` 的每个实例都会各自 `setInterval` 扫描全部房间并调用 `gossip.step()`：**多实例 = 重复波次**，同一房间被多个进程推进（重复 LLM 调用与 `msg.send`），叠加 §6 的单写者/内存会话约束，结果是账单翻倍与状态竞争。**不要水平扩容或双跑**；升级按 §6 的停写窗口"停旧起新"。临时停波次用 `=0`，不要靠起第二个实例。
+
+---
+
+## 8. 本地开发 / 邀请注册（P1-2）
 
 - **访客进入**：`GALGAME_AUTH_REQUIRED=0` 时，前端标题页提供「以访客身份进入（本地开发）」，无需登录/邀请码；旧 `X-User-Id` 兜底仍可用。`GET /api/v1/auth/status` 公开返回 `{required, registrationOpen}`，前端据此决定是否显示登录/注册。
 - **完整注册流程**：本地强制登录时设置 `GALGAME_AUTH_REQUIRED=1`、`GALGAME_INVITE_CODE=<邀请码>` 和 `GALGAME_PUBLIC_ORIGIN=http://127.0.0.1:5173`。Origin 须与地址栏一致；环境变量邀请码可重复使用。

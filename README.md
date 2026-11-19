@@ -124,6 +124,7 @@ npm run replay -- --file data/rooms/<room>.jsonl   # 回放事件日志，查 se
 | [docs/07-记忆模块方案.md](docs/07-记忆模块方案.md) · [docs/08-引擎改动要求-记忆模块.md](docs/08-引擎改动要求-记忆模块.md) | 记忆子系统设计稿与引擎改动交接单（已落地，现状以代码为准） |
 | [docs/09-存档与会话恢复方案.md](docs/09-存档与会话恢复方案.md) | 存档索引、回合历史、会话恢复 MVP：数据格式、恢复流程、已知限制 |
 | [docs/10-部署与一致性边界.md](docs/10-部署与一致性边界.md) | **部署/运维必读**：仅支持单实例、多实例禁止共写 `data/`、备份与升级停写窗口、运维检查清单（issue #40） |
+| [docs/11-幂等跨重启方案.md](docs/11-幂等跨重启方案.md) | Turn 幂等跨重启持久化方案（issue #76）：EventLog 回合标记、失败/重排队语义与契约影响；**仅方案、待所有者确认**（未实现、未 bump） |
 | [docs/schemas/v2/](docs/schemas/v2/) | JSON Schema（机器可校验副本，与 `docs/03` 严格对应） |
 | [docs/prompts/](docs/prompts/) | 提示词模板（带 `PROMPT_VERSION`） |
 | [CHANGELOG.md](CHANGELOG.md) | 按合并日期记录版本变化；当前操作手册不在这里 |

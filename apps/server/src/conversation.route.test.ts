@@ -349,6 +349,18 @@ describe("dev/v2 群聊端点（issue #85/#89 契约对齐）", () => {
     await app.close();
   });
 
+  it("MAJOR-1：GET /conversation 探测同样过 guardRoom——非本房账号 403，不能探测房间存在", async () => {
+    const { app, roomId } = await appWith();
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/rooms/${roomId}/conversation`,
+      headers: { "x-user-id": "u_other" },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toMatchObject({ ok: false, code: "E_FORBIDDEN" });
+    await app.close();
+  });
+
   it("POST /conversation/turns 别名接受 {actorId,input,clientTurnId}，推同样 SSE 且 speaker 绑定", async () => {
     const { app, roomId, actorId } = await appWith();
     const res = await app.inject({

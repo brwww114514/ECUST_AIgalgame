@@ -606,6 +606,8 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     app.get("/api/v1/rooms/:roomId/conversation", async (req, reply) => {
       const { roomId } = req.params as { roomId: string };
       if (!(await roomGate(roomId, reply))) return reply;
+      // 与另外两条 conversation 路由同口径（docs/03 §5.2.11）：探测也不能让非成员确认房间存在。
+      if (!(await guardRoom(req, reply, deps, roomId, userIdOf))) return reply;
       return reply.code(200).send({ ok: true, v2: true });
     });
 

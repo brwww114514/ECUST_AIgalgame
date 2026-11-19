@@ -351,6 +351,9 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       return reply.code(401).send({ ok: false, code: "E_UNAUTHORIZED", message: "请先登录" });
     }
     const room = await deps.createRoom(body.mode === "coop" ? "coop" : "solo", userId);
+    // 新房间已经落盘，丢掉存在性缓存（issue #78）：紧接着的 /state /turns 必须能看到它，
+    // 否则缓存会把刚建的房间当不存在而回 404。
+    roomExists.invalidate();
     // 建房即登记存档索引（issue #7）：lastCommittedSeq 从建房种子事件之后算起。
     // 登记失败不回滚房间——房间本体是权威的，索引只是"我玩过哪些"的投影。
     if (userId && deps.saves) {

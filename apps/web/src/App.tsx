@@ -22,6 +22,7 @@ import { turnSuggestions } from "./suggestions.ts";
 import { installClickSound, setSoundOn, soundOn } from "./sfx.ts";
 import { Typewriter } from "./typewriter.ts";
 import { shouldDropRetryOnMove } from "./turn-error.ts";
+import { fetchRoomEvents } from "./events-replay.ts";
 import { npcLocIdFromLinks, targetStillInScene } from "./npc-presence.ts";
 import { phaseLabel } from "./ui.ts";
 import type { Line, LineKind } from "./ui.ts";
@@ -95,6 +96,8 @@ export default function App() {
   const [errRetryable, setErrRetryable] = useState(false);
   /** 流结束但没有 commit/error：重试前必须先向服务端核对（不盲目重发） */
   const [unconfirmed, setUnconfirmed] = useState<{ clientTurnId: string } | null>(null);
+  /** #87：/events 回放降级提示（actorId 传错 → 不渲染私信）；空字符串 = 不显示 */
+  const [eventsNotice, setEventsNotice] = useState<string>("");
   /** 最近一次玩家行动：重试时原样再发，不重复打印玩家行 */
   const lastTurn = useRef<{ text: string; target: { id: string; name: string } | null } | null>(null);
   /** 断流前已收到的叙事/facts：核对到 committed 后只补历史里的差集，避免重复刷屏 */
@@ -209,6 +212,7 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
     setBusy(false);
     setErr("");
     setErrRetryable(false);
+    setEventsNotice("");
     setUnconfirmed(null);
     setEarlier(NO_EARLIER);
     setMapOpen(false);
@@ -325,12 +329,22 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
       setRoomId(id);
       setTab("chat");
       setScreen("game");
-      // v2 服务端（issue #89）尚未挂载：探不到 /conversation 就保持 v1 /turns，老流程零回归。
+      // v2 服务端（issue #89）探测：探不到 /conversation 就保持 v1 /turns，老流程零回归。
       // 探测放在 UI 呈现之后，不阻塞进房；失败/切房都会由 current() 拦掉。
       void detectConversation(id, token.signal).then((v2) => {
         if (!current()) return;
         setConvMode(v2 ? "v2" : "v1");
       });
+
+      // #87：历史事件回放不阻塞进房。带本人 actorId 请求；若被 403 判为传错，
+      // fetchRoomEvents 会无 actorId 重拉一次，只关私信并把提示带回来（不判死事件流）。
+      void fetchRoomEvents(id, { actorId: resolvedActorId })
+        .then((outcome) => {
+          if (current()) setEventsNotice(outcome.notice ?? "");
+        })
+        .catch(() => {
+          // 纯函数决策不抛；这里只兜意外，绝不让一次回放失败影响进房
+        });
     },
     [roomKey, scenarios, resetRoomUi],
   );
@@ -910,6 +924,11 @@ await runTurn(
       </header>
 
       <div className="app-body">
+        {eventsNotice && (
+          <div className="err events-degrade-notice" role="status">
+            {eventsNotice}
+          </div>
+        )}
         <div className="tab-pane" key={tab}>
         {tab === "gallery" &&
           (roomId ? <GalleryPanel roomId={roomId} version={stateRev} /> : <div className="panel-note">连接房间中…</div>)}

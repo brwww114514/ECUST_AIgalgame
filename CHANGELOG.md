@@ -2,13 +2,46 @@
 
 按合并到 `main` 的日期记录。提交 sha 可在 `git log` 中查；跨系统协议版本以 `CONTRACT_VERSION` 为准（产品版本见 `package.json`，当前 0.0.1）。
 
-版本与 tag 对应：`v0.1.0` M0 骨架 → `v0.1.1` 引擎 3.0.0 → `v0.1.2` 审核/锚定 → `v0.2.0` 地图 v0.2 → `v0.3.0` 前端体验与运行时模型接入（PR #2）→ `v0.4.0` 记忆子系统 3.1.0 + 地图交互/图鉴 registry 收口（PR #4/#5）→ `v0.5.0` issue #1/#3/#7/#8 批量落地（PR #9–#13）→ `v0.5.1` 三条 issue 修复（PR #22–#24）→ `v0.5.2` 记忆可信边界 / 404 守卫 / tick 原子 / 部署边界（PR #43–#45，CONTRACT 3.3.0）→ `v0.5.3` Turn 幂等（PR #50）→ `v0.5.4` NPC 认识与名字解锁 + 地图出站脱敏/档案收窄（PR #52/#55/#56，CONTRACT 3.4.1）→ `dev/v2` 群聊/微信八卦（PR #51，merge 02a3318）与用户系统（PR #72，merge 840e9c5）已合入 main（CONTRACT 3.6.0，13 op）。
+版本与 tag 对应：`v0.1.0` M0 骨架 → `v0.1.1` 引擎 3.0.0 → `v0.1.2` 审核/锚定 → `v0.2.0` 地图 v0.2 → `v0.3.0` 前端体验与运行时模型接入（PR #2）→ `v0.4.0` 记忆子系统 3.1.0 + 地图交互/图鉴 registry 收口（PR #4/#5）→ `v0.5.0` issue #1/#3/#7/#8 批量落地（PR #9–#13）→ `v0.5.1` 三条 issue 修复（PR #22–#24）→ `v0.5.2` 记忆可信边界 / 404 守卫 / tick 原子 / 部署边界（PR #43–#45，CONTRACT 3.3.0）→ `v0.5.3` Turn 幂等（PR #50）→ `v0.5.4` NPC 认识与名字解锁 + 地图出站脱敏/档案收窄（PR #52/#55/#56，CONTRACT 3.4.1）→ `v0.5.5` 简易用户系统 + 房间授权/行动额度（PR #72，merge 840e9c5，CONTRACT 3.5.0）→ `dev/v2` 群聊/微信八卦（PR #51，merge 02a3318）已合入 main（CONTRACT 3.6.0，13 op）。
 
 ## 3.6.0（dev/v2，2026-11-19）
 
 - 第 13 个 op `msg.send`：NPC 之间/玩家给 NPC 的模拟私信（只有目标+内容），`Envelope.audience` 在 Transport 前过滤；模块 `apiVersion 2→3`。
 - 新增 `MessageIndex`、`TalkBudget`、`GossipHost/GossipAgent`、dm 模式、gossip 私忆可信通道；微信内容入库前审核。
 - 群聊引擎（v2）与群聊对话模型、前端影响清单、模块适配度检查随 dev/v2 一并交付。
+
+## v0.5.5 — 2026-11-19 简易用户系统 + 房间授权/行动额度（PR #72，合入 main `840e9c5`；CONTRACT 3.4.1 → 3.5.0）
+
+> 3.5.0 是 **minor**：新增 HTTP 端点、`E_UNAUTHORIZED`（错误码 34 → 35）与会话配置键；不新增 op 原语，不改 `apiVersion` / `PROMPT_VERSION`，模块与导演接口不变（详见 docs/03 §5.2.8/§5.2.9/§5.2.10/§10.20）。本 PR 是已回滚的 PR #19（回滚 PR #71 / merge `35e0c57`）的重提版，基线为回滚后的 main 并合入地图脱敏/气泡刷新修复（#57/#58）。
+
+### 新增
+
+- **简易用户系统**：邀请注册 + 用户名密码 + HttpOnly Cookie 会话；`userId` 由服务端签发；`/api/v1/auth/{register,login,logout,me,status,reset-password,password}` 与 `me.role/state/nickname?`；`authRequired=1` 时除公开端点外一律 401 `E_UNAUTHORIZED`。前端新增 `AuthScreen` / `use-auth` / `api-auth`，移除 localStorage 身份。
+- **房间授权 gate（#33）**：state/events/turns/map 系列/gallery/history 等房间端点先过存在性守卫（§10.15，#37）再校验成员资格，写操作绑定 `actorId` 与会话用户；有归属房间非成员 403，旧档在 `authRequired=1` 下默认不开放，admin-token 为运维例外。
+- **额度与行动核对（§5.2.10）**：额度状态机与行动核对、邀请码/角色/状态/重置凭证/会话撤销/总开关；额度账本追加 `fsync` + 坏行跳过计数（`skippedLines`）；管理员结案仅限 `unconfirmed` 且并发结案串行化；`defaultDailyTurns=null` = 不限。
+- **管理端点与审计日志（§5.2.9）**：`apps/server/src/admin-log.ts` 操作日志；`/api/v1/admin/*` 管理员令牌统一 sha256 + `timingSafeEqual`，显式令牌 <16 字符或熵 <96 bit 拒绝启动，带令牌失败按 IP 10 次/60s → 429 `E_RATE_LIMITED` + `Retry-After`；CSRF Origin 覆盖全部 auth 写路由；公开 `/health` 脱敏为 `{ok, contract}`，canonize 运维细节移入鉴权后的 `/admin/stats`。
+- **部署资产**：`Dockerfile`、`docker-compose.yml`、`.dockerignore`、`.env.example`、`deploy/README.md`、`deploy/nginx-ecust-galgame.conf`（IP 直连 + 自签证书 + 404 catch-all 域名隔离）、`scripts/admin-init.ts`；账号库损坏 fail-fast（#35），旧 `users.json` 自动迁移为 `auth.json` v2（写盘前整体校验）。
+
+### 修复 / 变更
+
+- 已提交回合不被旁路异常改写：收到 `turn.commit` 后姓名解锁/脱敏快照异常只记日志，账本保持 `committed`，事件照常下发，兜底错误不再标记 `retryable`。
+- 地图写入口遵守全局暂停：`actionsEnabled=false` 时 `map/travel`、`map/tick`、`map/dialogue` 返回 429，暂停期间不推进时段、不写回合历史。
+- 存储故障统一 503 `E_STORE_FAULT`：房间已确认存在后 `snapshot` 失败不再折叠成 404；历史追加前先写换行，避免半截尾行吞掉下一条记录。
+- 历史分页：默认最近 `limit` 条 + `before` 向后游标 + `hasEarlier`；`TurnHistoryLine.clientTurnId?` 仅落盘。
+- 身份来源改为 HttpOnly Cookie；`X-User-Id` / body `userId` 仅在 `authRequired=false` 时兜底；旧 localStorage 身份不迁移。
+
+### 验证（PR #72 合并时真实输出）
+
+- `npm run typecheck` → 0 错；`npm test` → 63 文件 / 467 用例全过；`npm run check:contract` → 8/8（CONTRACT 3.5.0，35/35 错误码）；`npm run build:web` → 295.03 kB / gzip 94.37 kB。
+
+### 已知边界（沿用 PR #72 描述与 deploy/README.md §6）
+
+- 会话是进程内存态：重启/重新部署后所有人需重新登录；会话过期项靠访问时清理，只在一台进程内。
+- 单进程单写者：`data/` 同一时刻只能有一个 server 进程写（额度账本、账号库、事件日志均无跨进程锁）；扩容/滚动发布须停旧起新，不能双跑。
+- 额度 `defaultDailyTurns=null` = 不限；要控成本须在 `PUT /api/v1/admin/settings` 显式给数值。
+- 跨重启 Turn 幂等未做：PR #50（v0.5.3 / CONTRACT 3.3.0）只提供进程内幂等，重启后同一 `clientTurnId` 仍会重新结算；跨重启恢复需 EventLog 持久化回合标记 + 契约变更（未做）。
+- 旧 localStorage 身份不迁移：残留的 `galgame.adminToken` / 本地 `userId` 已不再被读取、不自动清理；用户清一次 localStorage（或换浏览器）即可，账号数据在服务端 `data/auth/`。
+- `unconfirmed` 额度仍需人工对账（等上游 #34 类持久提交事实）；admin token 不自动轮换；`GALGAME_PUBLIC_ORIGIN` 须与浏览器地址栏的源逐字一致；`GALGAME_TRUST_PROXY=1` 仅在反代后开启。
 
 ## v0.5.4 — 2026-11-18 NPC 认识与名字解锁 + 地图脱敏/档案收窄（PR #52/#55/#56，合入 main `2547d73`；CONTRACT 3.3.0 → 3.4.1）
 

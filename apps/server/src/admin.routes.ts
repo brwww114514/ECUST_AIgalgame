@@ -8,7 +8,8 @@ import type { AuthService } from "./auth.ts";
 import { dailyLimitFor } from "./auth-store.ts";
 import type { TurnLedger } from "./quota.ts";
 import type { AdminAction, AdminLog } from "./admin-log.ts";
-import type { AdminTokenGate, TokenVerdict } from "./admin-token.ts";
+import { AdminTokenGate } from "./admin-token.ts";
+import type { TokenVerdict } from "./admin-token.ts";
 import { adminTokenOf } from "./room-guard.ts";
 
 export interface AdminDeps {
@@ -16,10 +17,10 @@ export interface AdminDeps {
   ledger: TurnLedger;
   log: AdminLog;
   adminToken: string;
-  /** 与主路由共用同一实例：令牌失败计数要在所有管理入口间累计，否则限制形同虚设 */
-  gate?: AdminTokenGate;
-  /** 与主路由共用请求级缓存：同一请求的登录门/CSRF/管理路由只计一次失败 */
-  verdictOf?: (req: FastifyRequest) => TokenVerdict;
+  /** 与主路由共用同一实例：令牌失败计数要在所有管理入口间累计，否则限制形同虚设。必填（编译期强制） */
+  gate: AdminTokenGate;
+  /** 与主路由共用请求级缓存：同一请求的登录门/CSRF/管理路由只计一次失败。必填（编译期强制） */
+  verdictOf: (req: FastifyRequest) => TokenVerdict;
 }
 
 const StateBody = z.object({ state: z.enum(["active", "suspended", "archived"]), reason: z.string().default("") });
@@ -41,22 +42,24 @@ const ResolveBody = z.object({
   roomId: z.string().optional(),
 });
 
-function operatorOf(req: FastifyRequest, deps: AdminDeps): { operator: string | null; verdict?: TokenVerdict } {
+function operatorOf(req: FastifyRequest, deps: AdminDeps, fallbackGate: AdminTokenGate): { operator: string | null; verdict?: TokenVerdict } {
   const user = deps.auth.resolve(req);
   const fromSession = user?.role === "admin" ? user.userId : null;
   const token = adminTokenOf(req.headers);
   if (!token) return { operator: fromSession };
-  const verdict = deps.verdictOf
-    ? deps.verdictOf(req)
-    : deps.gate
-      ? deps.gate.check(token, req.ip)
-      : { ok: !!deps.adminToken && token === deps.adminToken };
+  // gate/verdictOf 在类型上必填；下面的降级只服务绕过类型检查的 JS/测试装配，
+  // 且必须走 AdminTokenGate 的 sha256 + timingSafeEqual，绝不用 === 比较（会泄露前缀且无失败限流）。
+  const gate: AdminTokenGate | undefined = deps.gate;
+  const verdictOf: ((req: FastifyRequest) => TokenVerdict) | undefined = deps.verdictOf;
+  const verdict = verdictOf ? verdictOf(req) : (gate ?? fallbackGate).check(token, req.ip);
   if (verdict.ok) return { operator: "token" };
   // 令牌失败仍可退回管理员会话；但被限流时一律 429（fail closed），不给猜令牌留窗口
   return { operator: fromSession, verdict };
 }
 
 export function registerAdminRoutes(app: FastifyInstance, deps: AdminDeps): void {
+  // 仅当调用方绕过类型检查、漏注入 gate 时使用；整次装配共用一个实例，失败计数才不会每次请求清零。
+  const fallbackGate = new AdminTokenGate(deps.adminToken);
   const audit = async (action: Omit<AdminAction, "at">) => {
     try {
       await deps.log.record(action);
@@ -66,7 +69,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminDeps): void
     }
   };
   const guard = (req: FastifyRequest, reply: FastifyReply): string | null => {
-    const { operator, verdict } = operatorOf(req, deps);
+    const { operator, verdict } = operatorOf(req, deps, fallbackGate);
     if (verdict?.blocked) {
       if (verdict.retryAfterMs) reply.header("retry-after", Math.max(1, Math.ceil(verdict.retryAfterMs / 1000)));
       reply.code(429).send({ ok: false, code: "E_RATE_LIMITED", message: "管理员鉴权失败次数过多，请稍后再试" });

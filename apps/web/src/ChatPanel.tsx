@@ -50,6 +50,8 @@ export interface ChatPanelProps {
   /** 上一回合失败且服务端标记可重试：重发最后一次玩家输入 */
   onRetry: () => void;
   retryable: boolean;
+  /** v2 conversation.phase=listening：等待插话态（服务端 30s 自动恢复 speaking 后前端清掉） */
+  waitingForInterjection?: boolean;
   /** 还有更早的已提交历史（服务端 hasEarlier）：显示"加载更早" */
   hasEarlier: boolean;
   loadingEarlier: boolean;
@@ -77,6 +79,7 @@ export default function ChatPanel({
   onSkipLog,
   onRetry,
   retryable,
+  waitingForInterjection = false,
   hasEarlier,
   loadingEarlier,
   onLoadEarlier,
@@ -305,6 +308,9 @@ export default function ChatPanel({
             </p>
           )}
           {busy && !typing && <p className="line system">…</p>}
+          {waitingForInterjection && (
+            <p className="line system interjection-wait">对方说完了，等你插话…</p>
+          )}
         </div>
 
         {blocked && (

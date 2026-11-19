@@ -9,6 +9,7 @@ import { pathToFileURL } from "node:url";
 import type { DialogueDirector, Entity, Envelope, Proposal, Registry } from "../../../packages/shared/src/index.ts";
 import { CONTRACT_VERSION } from "../../../packages/shared/src/index.ts";
 import {
+  AuditGate,
   DefaultArbiter,
   DefaultTurn,
   DialogueHost,
@@ -24,7 +25,20 @@ import {
 } from "../../../packages/engine/src/index.ts";
 import { MockLlm, OpenAiCompatClient } from "../../../packages/llm/src/index.ts";
 import { CanonizeJob, worldRoomId } from "../../../packages/engine/src/index.ts";
-import { GossipAgent, GossipHost, MessageIndex, TalkBudget, loadGossipPolicy, loadConversationPolicy } from "../../../packages/engine/src/v2/index.ts";
+import {
+  ConversationAudit,
+  ConversationHostV2,
+  GossipAgent,
+  GossipHost,
+  MessageIndex,
+  NpcAgent,
+  SceneManager,
+  TalkBudget,
+  type SceneAgentPort,
+  loadGossipPolicy,
+  loadConversationPolicy,
+  loadModes,
+} from "../../../packages/engine/src/v2/index.ts";
 import { DEFAULT_CONVERSATION_POLICY } from "../../../packages/shared/src/index.ts";
 import type { ServerConfig } from "./config.ts";
 import { hasAudit, hasCanonize, hasLlm } from "./config.ts";
@@ -346,6 +360,32 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
     policy: gossipPolicy, conversation: conversationPolicy, now,
     audit, auditPolicy, memory,
   });
+  // ---------------------------------------------------------------- dev/v2 群聊会话宿主（issue #89）
+  // 场景文案来自 content/ 的地图数据 + 最近台词，不为氛围再开一次 LLM 调用；
+  // 真正的说话/心理由 NpcAgent 各自调 LLM。会话与幂等缓存都在 host 进程内（重启即新会话，见 docs/03 §5.2.11）。
+  const conversationModes = await loadModes(path.join(contentRoot, "v2", "utterance-modes.json"));
+  const conversationScene: SceneAgentPort = {
+    async describe({ locName }) {
+      return locName ? (sceneDescs.get(locName) ?? "") : "";
+    },
+    async summarize({ recent }) {
+      return recent.slice(-3).join(" / ");
+    },
+  };
+  const conversation = new ConversationHostV2({
+    store,
+    arbiter,
+    registry,
+    memory,
+    modes: conversationModes,
+    policy: conversationPolicy,
+    scene: new SceneManager(conversationScene, now),
+    npc: new NpcAgent({ llm, modes: conversationModes, policy: conversationPolicy }),
+    audit: new ConversationAudit(audit, auditPolicy, new AuditGate({ arbiter, store, registry, audit, policy: auditPolicy })),
+    budget: talkBudget,
+    now,
+  });
+
   // 后台波次：玩家离线也能互相回消息。unref + try/catch，失败等下一轮（仿 canonize 补扫）
   const gossipScanMs = Number(process.env.GALGAME_GOSSIP_SCAN_MS ?? 30_000);
   if (gossipScanMs > 0) {
@@ -396,6 +436,8 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
       inbox: (roomId, to) => messageIndex.inbox(roomId, to),
       subscribe: (roomId, viewer, cb) => gossip.subscribe(roomId, viewer, cb),
     },
+    /** dev/v2 群聊回合宿主（HTTP 接线见 routes.ts；缺省 = 不注册端点） */
+    conversation: { host: conversation },
     turn,
     map,
     settings,

@@ -3,8 +3,10 @@
  * 不含业务规则；游戏层拒绝一律 HTTP 200 + {ok:false,code,message}，500 只表示未预期异常。
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { z } from "zod";
 import type { ActorId, Memory, MemoryRecord, Registry, RoomId, Store, Turn, TurnEvent, WorldState } from "../../../packages/shared/src/contract/types.ts";
-import type { GossipEvent, MessageDigest } from "../../../packages/shared/src/contract/v2.ts";
+import type { ConversationEvent, GossipEvent, MessageDigest } from "../../../packages/shared/src/contract/v2.ts";
+import type { ConversationHostV2 } from "../../../packages/engine/src/v2/index.ts";
 import { DialogueBodySchema, TickBodySchema, TravelBodySchema, zodMessage } from "./map.data.ts";
 import type { MapService } from "./map.ts";
 import type { LlmSettings } from "./settings.ts";
@@ -79,6 +81,8 @@ export interface AppDeps {
     inbox(roomId: RoomId, to: ActorId): MessageDigest[];
     subscribe(roomId: RoomId, viewer: ActorId, cb: (ev: GossipEvent) => void): () => void;
   };
+  /** dev/v2：群聊会话宿主（未接线时不注册端点；会话/幂等缓存全在进程内，重启即新会话） */
+  conversation?: { host: ConversationHostV2 };
   /** 管理操作日志 */
   adminLog?: AdminLog;
   /** Cookie 写请求 CSRF 允许的 Origin（authRequired=1 时用） */
@@ -95,6 +99,35 @@ interface GameError {
 function sseWrite(raw: NodeJS.WritableStream, event: string, data: unknown): void {
   raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
+
+/** dev/v2 群聊回合请求：speaker 由 guardRoom 绑定后的 actorId 决定，客户端不能代别人发言 */
+const ConversationBodySchema = z
+  .object({
+    actorId: z.string().min(1).optional(),
+    clientTurnId: z.string().min(1).max(120),
+    userId: z.string().optional(),
+    interject: z.string().min(1).optional(),
+    utterance: z
+      .object({
+        id: z.string().min(1).optional(),
+        speaker: z.string().min(1).optional(),
+        mode: z.string().min(1),
+        target: z.union([z.string().min(1), z.array(z.string().min(1))]).optional(),
+        content: z.string().max(2000).optional(),
+        action: z.string().max(2000).optional(),
+        coverAction: z.string().max(2000).optional(),
+        notice: z.string().max(2000).optional(),
+      })
+      .optional(),
+  })
+  .strict();
+
+const SSE_HEADERS = {
+  "content-type": "text/event-stream; charset=utf-8",
+  "cache-control": "no-cache, no-transform",
+  connection: "keep-alive",
+  "x-accel-buffering": "no",
+};
 
 function schemaError(message: string): GameError {
   return { ok: false, code: "E_SCHEMA_INVALID", message };
@@ -460,6 +493,75 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       const ping = setInterval(() => reply.raw.write(": ping\n\n"), 15_000);
       ping.unref?.();
       req.raw.on("close", () => { clearInterval(ping); off(); });
+    });
+  }
+
+  // ---------------------------------------------------------------- dev/v2 群聊回合（issue #89）
+  if (deps.conversation) {
+    const host = deps.conversation.host;
+    /** roomId → sessionId：进程内映射；会话本体/幂等缓存也在 host 内存里，重启即新会话 */
+    const sessions = new Map<string, string>();
+    const MAX_SESSIONS = 256;
+
+    const openOrReuse = async (roomId: string, actorId: string, state: WorldState) => {
+      const cached = sessions.get(roomId);
+      const session = cached ? host.get(cached) : undefined;
+      if (session && session.roomId === roomId && session.status === "open") {
+        return { sessionId: session.id, opened: undefined as ConversationEvent | undefined };
+      }
+      const present = [...state.room.scene.presentIds];
+      if (!present.includes(actorId)) present.unshift(actorId);
+      const fresh = await host.open({ roomId, participants: present });
+      if (sessions.size >= MAX_SESSIONS) {
+        const oldest = sessions.keys().next().value;
+        if (oldest) sessions.delete(oldest);
+      }
+      sessions.set(roomId, fresh.id);
+      const opened: ConversationEvent = { type: "conversation.opened", sessionId: fresh.id, participants: [...fresh.participants] };
+      return { sessionId: fresh.id, opened };
+    };
+
+    app.post("/api/v1/rooms/:roomId/conversation", async (req, reply) => {
+      const { roomId } = req.params as { roomId: string };
+      if (!(await roomGate(roomId, reply))) return reply;
+      const parsed = ConversationBodySchema.safeParse(req.body ?? {});
+      if (!parsed.success) return reply.code(400).send(schemaError(zodMessage(parsed.error)));
+      const body = parsed.data;
+      // interject 是"被插话的 NPC"，不是调用者本人：不能拿它推 actorId（否则可冒充 NPC）
+      const actorId = body.actorId ?? body.utterance?.speaker;
+      if (!actorId) return reply.code(400).send(schemaError("actorId / utterance.speaker 至少一个必填"));
+      const access = await guardRoom(req, reply, deps, roomId, userIdOf, { actorId, body: { userId: body.userId } });
+      if (!access) return reply;
+      if (actionsPaused(reply)) return reply;
+
+      const utterance = body.utterance
+        ? { ...body.utterance, id: body.utterance.id ?? `utt_${body.clientTurnId}`, speaker: actorId }
+        : undefined;
+      const { sessionId, opened } = await openOrReuse(roomId, actorId, access.state);
+      reply.raw.writeHead(200, SSE_HEADERS);
+      try {
+        if (opened) sseWrite(reply.raw, opened.type, opened);
+        const out: ConversationEvent[] = [];
+        for await (const ev of host.run(sessionId, {
+          clientTurnId: body.clientTurnId,
+          ...(utterance ? { utterance } : {}),
+          ...(body.interject ? { interject: body.interject } : {}),
+          ...(access.userId ? { userId: access.userId } : {}),
+        })) out.push(ev);
+        // 与 /turns 同一口径：收齐后按最终状态脱敏再一次性写出（模型可能把真名写进台词）
+        const committed = out.find((e) => e.type === "conversation.committed");
+        const finalState = committed?.type === "conversation.committed" ? committed.state : access.state;
+        const placeholders = unknownPlaceholders(finalState, deps.appearance);
+        for (const ev of out) sseWrite(reply.raw, ev.type, maskNamesDeep(ev, placeholders));
+      } catch (e) {
+        const err: ConversationEvent = {
+          type: "conversation.error", sessionId, code: "E_MODULE_FAULT",
+          message: e instanceof Error ? e.message : String(e),
+        };
+        sseWrite(reply.raw, err.type, err);
+      } finally {
+        reply.raw.end();
+      }
     });
   }
 

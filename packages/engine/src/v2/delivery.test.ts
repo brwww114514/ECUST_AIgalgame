@@ -1,6 +1,8 @@
+import { writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import { tempDir } from "@galgame/testkit";
 import { deliver, loadConversationPolicy, loadModes, validateUtterance } from "./delivery.ts";
-import type { Utterance } from "../../../shared/src/index.ts";
+import { DEFAULT_CONVERSATION_POLICY, type Utterance } from "../../../shared/src/index.ts";
 
 const ROOT = new URL("../../../../", import.meta.url).pathname;
 const MODES = `${ROOT}content/v2/utterance-modes.json`;
@@ -105,6 +107,28 @@ describe("v2 投递解释器", () => {
     expect(policy.messages.invalidUtterance).toBeTruthy();
     expect(policy.messages.targetRequired).toBeTruthy();
     expect(policy.llm.maxTokens).toBe(600);
+  });
+
+  it("issue #92：旧键 autonomy.playerAbsentGraceMs 被静默 strip，回落到默认 playerPresentGraceMs", async () => {
+    const file = `${tempDir("v2-legacy-policy-")}/policy.json`;
+    // 旧配置只有改名前的键：zod .partial() 不认识它，静默 strip 且不抛错
+    await writeFile(file, JSON.stringify({
+      schemaVersion: 1,
+      autonomy: { minReplyIntervalMs: 1234, playerAbsentGraceMs: 999 },
+    }));
+    const policy = await loadConversationPolicy(file);
+    expect(policy.autonomy.minReplyIntervalMs).toBe(1234);
+    // 旧键的值不会映射到新键；新键走 DEFAULT_CONVERSATION_POLICY
+    expect(policy.autonomy).not.toHaveProperty("playerAbsentGraceMs");
+    expect(policy.autonomy.playerPresentGraceMs).toBe(DEFAULT_CONVERSATION_POLICY.autonomy.playerPresentGraceMs);
+    // 新旧键同时出现时新键生效，旧键仍被 strip
+    await writeFile(file, JSON.stringify({
+      schemaVersion: 1,
+      autonomy: { playerAbsentGraceMs: 999, playerPresentGraceMs: 7 },
+    }));
+    const both = await loadConversationPolicy(file);
+    expect(both.autonomy.playerPresentGraceMs).toBe(7);
+    expect(both.autonomy).not.toHaveProperty("playerAbsentGraceMs");
   });
 
   it("四审 P3：单目标模式拒绝数组目标；requiresTarget 模式拒绝 @all（@all 走 broadcast）", async () => {

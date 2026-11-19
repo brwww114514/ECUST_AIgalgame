@@ -2,7 +2,7 @@
 
 按合并到 `main` 的日期记录。提交 sha 可在 `git log` 中查；跨系统协议版本以 `CONTRACT_VERSION` 为准（产品版本见 `package.json`，当前 0.0.1）。
 
-版本与 tag 对应：`v0.1.0` M0 骨架 → `v0.1.1` 引擎 3.0.0 → `v0.1.2` 审核/锚定 → `v0.2.0` 地图 v0.2 → `v0.3.0` 前端体验与运行时模型接入（PR #2）→ `v0.4.0` 记忆子系统 3.1.0 + 地图交互/图鉴 registry 收口（PR #4/#5）→ `v0.5.0` issue #1/#3/#7/#8 批量落地（PR #9–#13）→ `v0.5.1` 三条 issue 修复（PR #22–#24）→ `v0.5.2` 记忆可信边界 / 404 守卫 / tick 原子 / 部署边界（PR #43–#45，CONTRACT 3.3.0）→ `v0.5.3` Turn 幂等（PR #50）→ `v0.5.4` NPC 认识与名字解锁 + 地图出站脱敏/档案收窄（PR #52/#55/#56，CONTRACT 3.4.1）→ `v0.5.5` 简易用户系统 + 房间授权/行动额度（PR #72，merge 840e9c5，CONTRACT 3.5.0）→ `dev/v2` 群聊/微信八卦（PR #51，merge 02a3318）已合入 main（CONTRACT 3.6.0，13 op）。
+版本与 tag 对应：`v0.1.0` M0 骨架 → `v0.1.1` 引擎 3.0.0 → `v0.1.2` 审核/锚定 → `v0.2.0` 地图 v0.2 → `v0.3.0` 前端体验与运行时模型接入（PR #2）→ `v0.4.0` 记忆子系统 3.1.0 + 地图交互/图鉴 registry 收口（PR #4/#5）→ `v0.5.0` issue #1/#3/#7/#8 批量落地（PR #9–#13）→ `v0.5.1` 三条 issue 修复（PR #22–#24）→ `v0.5.2` 记忆可信边界 / 404 守卫 / tick 原子 / 部署边界（PR #43–#45，CONTRACT 3.3.0）→ `v0.5.3` Turn 幂等（PR #50）→ `v0.5.4` NPC 认识与名字解锁 + 地图出站脱敏/档案收窄（PR #52/#55/#56，CONTRACT 3.4.1）→ `v0.5.5`（候选版本号，尚未打 tag；发版时决定）简易用户系统 + 房间授权/行动额度（PR #72，merge 840e9c5，CONTRACT 3.5.0）→ `dev/v2` 群聊/微信八卦（PR #51，merge 02a3318）已合入 main（CONTRACT 3.6.0，13 op）。
 
 ## 3.6.0（dev/v2，2026-11-19）
 
@@ -10,7 +10,7 @@
 - 新增 `MessageIndex`、`TalkBudget`、`GossipHost/GossipAgent`、dm 模式、gossip 私忆可信通道；微信内容入库前审核。
 - 群聊引擎（v2）与群聊对话模型、前端影响清单、模块适配度检查随 dev/v2 一并交付。
 
-## v0.5.5 — 2026-11-19 简易用户系统 + 房间授权/行动额度（PR #72，合入 main `840e9c5`；CONTRACT 3.4.1 → 3.5.0）
+## v0.5.5（候选 tag，尚未打；发版时决定）— 2026-11-19 简易用户系统 + 房间授权/行动额度（PR #72，合入 main `840e9c5`；CONTRACT 3.4.1 → 3.5.0）
 
 > 3.5.0 是 **minor**：新增 HTTP 端点、`E_UNAUTHORIZED`（错误码 34 → 35）与会话配置键；不新增 op 原语，不改 `apiVersion` / `PROMPT_VERSION`，模块与导演接口不变（详见 docs/03 §5.2.8/§5.2.9/§5.2.10/§10.20）。本 PR 是已回滚的 PR #19（回滚 PR #71 / merge `35e0c57`）的重提版，基线为回滚后的 main 并合入地图脱敏/气泡刷新修复（#57/#58）。
 
@@ -30,9 +30,9 @@
 - 历史分页：默认最近 `limit` 条 + `before` 向后游标 + `hasEarlier`；`TurnHistoryLine.clientTurnId?` 仅落盘。
 - 身份来源改为 HttpOnly Cookie；`X-User-Id` / body `userId` 仅在 `authRequired=false` 时兜底；旧 localStorage 身份不迁移。
 
-### 验证（PR #72 合并时真实输出）
+### 验证（PR #72 / commit `840e9c5` 复跑输出）
 
-- `npm run typecheck` → 0 错；`npm test` → 63 文件 / 467 用例全过；`npm run check:contract` → 8/8（CONTRACT 3.5.0，35/35 错误码）；`npm run build:web` → 295.03 kB / gzip 94.37 kB。
+- `npm run typecheck` → 0 错；`npm test` → 64 文件 / 478 用例全过；`npm run check:contract` → 8/8（CONTRACT 3.5.0，35/35 错误码）；`npm run build:web` → 295.53 kB / gzip 94.57 kB。（在 `840e9c5` 独立 worktree 实跑确认；旧稿「63 文件 / 467 用例、295.03/94.37」来自 PR #72 未复跑声明，已按复跑结果更正。）
 
 ### 已知边界（沿用 PR #72 描述与 deploy/README.md §6）
 

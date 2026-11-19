@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import type { Entity, Registry, WorldState } from "../../../packages/shared/src/contract/types.ts";
 import { buildGalleryView } from "./gallery.ts";
-import { displayNameOf, UNKNOWN_NPC_NAME } from "./view-names.ts";
+import { displayNameOf, knowsNameOf, UNKNOWN_NPC_NAME } from "./view-names.ts";
 
 function npcEntity(knowsName: boolean): Entity {
   return {
@@ -73,5 +73,48 @@ describe("displayNameOf", () => {
   it("未认识时给占位名，不外泄真名", () => {
     expect(displayNameOf(npcEntity(false))).toBe(UNKNOWN_NPC_NAME);
     expect(displayNameOf(npcEntity(true))).toBe("林静");
+  });
+});
+
+/**
+ * 旧房间（issue #79）：存档在 knows_name 引入前创建，实体没有该属性。
+ * 断言结构（met / stats / 是否等于真名），不断言占位名的具体文案。
+ */
+describe("旧房间缺少 knows_name", () => {
+  function npcWithoutKnowsName(): Entity {
+    return {
+      id: "npc_old",
+      kind: "npc",
+      name: "林静",
+      attrs: { stamina: 100 }, // 刻意不放 knows_name 键，模拟旧存档
+      tags: [],
+      origin: "seed",
+      canon: true,
+      status: "active",
+      createdAt: 0,
+      updatedAt: 0,
+    };
+  }
+
+  it("缺 knows_name 视为未认识：met=false、名字占位、stats 空", () => {
+    const npc = npcWithoutKnowsName();
+    const card = buildGalleryView({ roomId: "room_g", state: stateWith(npc), registry, profiles: [] }).npcs[0]!;
+    expect(knowsNameOf(npc)).toBe(false);
+    expect(card.met).toBe(false);
+    expect(card.name).toBe(UNKNOWN_NPC_NAME); // 占位，不等于真名
+    expect(card.name).not.toBe(npc.name);
+    expect(card.stats).toEqual([]);
+    expect(card.role).toBeUndefined();
+    expect(card.locName).toBeUndefined();
+  });
+
+  it("重新认识写入 knows_name=true 后：met=true、真名可见", () => {
+    const npc = npcWithoutKnowsName();
+    npc.attrs.knows_name = true; // 模拟问名字后置位
+    const card = buildGalleryView({ roomId: "room_g", state: stateWith(npc), registry, profiles: [] }).npcs[0]!;
+    expect(knowsNameOf(npc)).toBe(true);
+    expect(card.met).toBe(true);
+    expect(card.name).toBe(npc.name); // 真名可见
+    expect(card.stats.length).toBeGreaterThan(0);
   });
 });

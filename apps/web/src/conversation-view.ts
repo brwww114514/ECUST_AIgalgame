@@ -283,16 +283,46 @@ export interface LinesFromViewOpts {
 }
 
 /** 把视图里的每段渲染片段摊平成 UI 的 Line[]（组件无需知道 v2 通道细节）。 */
+/**
+ * 给 utterance 片段拼展示名，规则是"名字只出现一次"：
+ * - 自己说的话不加前缀（行动文本本身已是完整的一句话，再加"你"会变成"你你…"）；
+ * - content 是台词，用「名字：台词」把说话人和内容分开；
+ * - action 是叙述句（"X把文件夹往腋下一夹"），名字即主语，不加分隔符；
+ * - 模型偶尔在台词/动作开头自带名字（服务端脱敏后就是同一个展示名），
+ *   先剥掉开头这次名字，避免出现"X：X。你是哪个班的？"或"X X把文件夹…"这种重复。
+ */
+function renderUtterancePart(
+  line: ConversationLine,
+  part: RenderPart,
+  index: number,
+  opts: LinesFromViewOpts,
+): string {
+  if (line.kind !== "utterance" || part.channel === "notice" || !line.speaker) return part.text;
+  if (line.speaker === opts.selfActorId) return part.text;
+  const name = opts.nameOf(line.speaker);
+  if (!name || part.text.trim() === "") return part.text;
+  const body = part.text.startsWith(name)
+    ? part.text.slice(name.length).replace(/^[。，、：:！？；;\s]+/, "")
+    : part.text;
+  if (part.channel === "action") {
+    // 同一句已有台词时，动作是台词的延续，不再重复主语
+    const hasContentBefore = line.parts.some(
+      (p, i) => i < index && p.channel === "content" && p.text.trim() !== "",
+    );
+    return hasContentBefore ? body : `${name}${body}`;
+  }
+  return `${name}：${body}`;
+}
+
 export function linesFromView(view: ConversationView, opts: LinesFromViewOpts): Line[] {
   const out: Line[] = [];
   for (const line of view.lines) {
     line.parts.forEach((part, i) => {
-      const prefix =
-        line.kind === "utterance" && part.channel !== "notice" && line.speaker
-          ? opts.nameOf(line.speaker)
-          : "";
-      const text = prefix ? `${prefix}${part.text}` : part.text;
-      out.push({ id: line.id * 100 + i, kind: lineKindFor(line, part.channel, opts.selfActorId), text });
+      out.push({
+        id: line.id * 100 + i,
+        kind: lineKindFor(line, part.channel, opts.selfActorId),
+        text: renderUtterancePart(line, part, i, opts),
+      });
     });
   }
   return out;

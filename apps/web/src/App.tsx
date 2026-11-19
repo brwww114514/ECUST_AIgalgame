@@ -12,6 +12,7 @@ import AuthScreen from "./AuthScreen.tsx";
 import type { SaveEntry } from "./api.ts";
 import ChatPanel from "./ChatPanel.tsx";
 import DraftsPanel from "./DraftsPanel.tsx";
+import InboxPanel from "./InboxPanel.tsx";
 import GalleryPanel from "./GalleryPanel.tsx";
 import MapOverlay from "./MapOverlay.tsx";
 import TitleScreen from "./TitleScreen.tsx";
@@ -35,13 +36,14 @@ import {
 } from "./conversation-view.ts";
 import type { ConversationView } from "./conversation-view.ts";
 
-type Tab = "chat" | "gallery" | "drafts";
+type Tab = "chat" | "gallery" | "drafts" | "inbox";
 type Screen = "title" | "game";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "chat", label: "对话" },
   { id: "gallery", label: "图鉴" },
   { id: "drafts", label: "审核" },
+  { id: "inbox", label: "微信" },
 ];
 
 /** 只存"上次进了哪个房间 / 选了哪个开局"，不存任何世界状态（权威状态永远在服务端） */
@@ -945,6 +947,13 @@ await runTurn(
         {tab === "drafts" &&
           (roomId ? (
             <DraftsPanel roomId={roomId} push={push} />
+          ) : (
+            <div className="panel-note">连接房间中…</div>
+          ))}
+
+        {tab === "inbox" &&
+          (roomId ? (
+            <InboxPanel roomId={roomId} actorId={actorId} state={state} />
           ) : (
             <div className="panel-note">连接房间中…</div>
           ))}

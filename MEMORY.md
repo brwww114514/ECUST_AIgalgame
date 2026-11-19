@@ -477,6 +477,8 @@
 - 2026-11-18 ｜ `feat/npc-stranger` ｜ `c1a831b`（PR #52 head） ｜ review ｜ 第二轮复审通过：P0 `/state`、`/history` 脱敏；失败回合不解锁；目标必须在场；`speechIntroducesName` 收紧为姓名共现；introduce 不产假 fact；`maskNamesInText` 长度降序；docs 更新。非阻塞项转 issue #53/#54 ｜ 复审确认“commit 后才解锁”与“在场校验”两条边界；SSE 选非流式并记录取舍 ｜ tsc 0；44 文件/312 用例；8 项契约（3.3.0）；build 287.17 kB ｜ 已 squash 合并 `f328bc3`
 - 2026-11-18 ｜ `feat/npc-stranger` ｜ `f328bc3` ｜ merge ｜ squash 合并 PR #52（最终 head `c1a831b`）；合并树与 `c1a831b` 一致；随后 release 提交落 CONTRACT 3.4.0 ｜ 用户要求“不要动 #51、合并 #52、剩余问题开 issue” ｜ 见 main 记录 ｜ #53/#54 已开
 
+- 2026-11-19 ｜ `feat/npc-stranger` ｜ 父 `3e78db8` ｜ feat ｜ 把搁置的 PR #63 内容重贴到 main 3.6.0：开局文案四段化（不点名、身份/环境/目标）、解锁两条来源并行（有目标+问名字 / 台词自报姓名或姓氏）、「姓X」只认本人自述、地图与对话栏标题随 stateRev 即时刷新（MapPanel consumedVersion/reloadSeq） ｜ 3.6.0 引入 auth + v2 群聊（App +484 行、ChatPanel +21），冲突处按 main 现状重贴而不是覆盖：App 的 refreshState/finally 已由 main 提供，只补 position.actors 覆盖与 MapOverlay version；docs 只改对应句子，保留 v2 新增章节 ｜ tsc 0；vitest 全量（v2 用例在 Windows 有 35 个路径失败 + 上游既有 chmod 1 个，均与本次改动无关）；check:contract 8/8（3.6.0）；build:web 通过 ｜ 未处理：World2D 名字仍依赖 turn.ui（上游遗留）
+
 ### 历史分支（已合并 / 已删除，保留记录）
 
 - 2026-11-16 ｜ `feature/map-module @ 362df4a` ｜ 已合并（`95eb27d..362df4a` ff，后随 main 进入 `3112f79`）；远端分支已删

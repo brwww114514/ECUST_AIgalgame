@@ -17,7 +17,7 @@ import type { AttrDef, Entity, Registry, WorldState } from "../../../packages/sh
 import { JsonRegistry } from "../../../packages/engine/src/registry.ts";
 import { buildGalleryView } from "./gallery.ts";
 import type { GalleryStat } from "./gallery.ts";
-import { registerRoutes } from "./routes.ts";
+import { registerRoutes, type AppDeps } from "./routes.ts";
 import { UNKNOWN_NPC_NAME } from "./view-names.ts";
 
 const ROOM = "room_state_view";
@@ -74,7 +74,7 @@ describe("/state 原始 attrs 通道（docs/03 §5.2.5）", () => {
       settings: { view: () => ({ mode: "offline", baseUrl: "", model: "", persisted: false }), apply: async () => ({ ok: false }), clear: async () => undefined },
       createRoom: async () => ({ roomId: ROOM, actorId: PLR }),
       version: "test",
-    } as never);
+    } as unknown as AppDeps);
     await app.ready();
 
     const res = await app.inject({ method: "GET", url: `/api/v1/rooms/${ROOM}/state` });

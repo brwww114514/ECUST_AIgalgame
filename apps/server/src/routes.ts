@@ -122,6 +122,19 @@ const ConversationBodySchema = z
   })
   .strict();
 
+/** 前端（#85）兼容别名：自然语言 input + 可选 targetNpcId → utterance，复用同一 SSE 回合 */
+const ConversationTurnAliasSchema = z
+  .object({
+    actorId: z.string().min(1),
+    input: z.string().min(1).max(2000),
+    clientTurnId: z.string().min(1).max(120),
+    targetNpcId: z.string().min(1).optional(),
+    userId: z.string().optional(),
+  })
+  .strict();
+
+type ConversationBody = z.infer<typeof ConversationBodySchema>;
+
 const SSE_HEADERS = {
   "content-type": "text/event-stream; charset=utf-8",
   "cache-control": "no-cache, no-transform",
@@ -521,12 +534,9 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       return { sessionId: fresh.id, opened };
     };
 
-    app.post("/api/v1/rooms/:roomId/conversation", async (req, reply) => {
-      const { roomId } = req.params as { roomId: string };
+    /** 一回合 SSE 的共用实现；两种入参形状都归一到 ConversationBody 后走这里 */
+    const runConversationTurn = async (req: FastifyRequest, reply: FastifyReply, roomId: string, body: ConversationBody) => {
       if (!(await roomGate(roomId, reply))) return reply;
-      const parsed = ConversationBodySchema.safeParse(req.body ?? {});
-      if (!parsed.success) return reply.code(400).send(schemaError(zodMessage(parsed.error)));
-      const body = parsed.data;
       // interject 是"被插话的 NPC"，不是调用者本人：不能拿它推 actorId（否则可冒充 NPC）
       const actorId = body.actorId ?? body.utterance?.speaker;
       if (!actorId) return reply.code(400).send(schemaError("actorId / utterance.speaker 至少一个必填"));
@@ -562,6 +572,42 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       } finally {
         reply.raw.end();
       }
+    };
+
+    // 前端（#85）用 GET 做 feature detect：有 host 装配时返回 200，老服务端 404 → 退回 v1 /turns。
+    app.get("/api/v1/rooms/:roomId/conversation", async (req, reply) => {
+      const { roomId } = req.params as { roomId: string };
+      if (!(await roomGate(roomId, reply))) return reply;
+      return reply.code(200).send({ ok: true, v2: true });
+    });
+
+    // 规范端点（docs/03 §5.2.11）：body 是 utterance 形状
+    app.post("/api/v1/rooms/:roomId/conversation", async (req, reply) => {
+      const { roomId } = req.params as { roomId: string };
+      const parsed = ConversationBodySchema.safeParse(req.body ?? {});
+      if (!parsed.success) return reply.code(400).send(schemaError(zodMessage(parsed.error)));
+      return runConversationTurn(req, reply, roomId, parsed.data);
+    });
+
+    // 前端（#85）兼容别名：{actorId, input, clientTurnId, targetNpcId?} → utterance。
+    // input 是玩家自然语言，归到 broadcast（有 target 则 addressed）；speaker 仍由 guardRoom 绑定后覆盖。
+    app.post("/api/v1/rooms/:roomId/conversation/turns", async (req, reply) => {
+      const { roomId } = req.params as { roomId: string };
+      const parsed = ConversationTurnAliasSchema.safeParse(req.body ?? {});
+      if (!parsed.success) return reply.code(400).send(schemaError(zodMessage(parsed.error)));
+      const b = parsed.data;
+      return runConversationTurn(req, reply, roomId, {
+        actorId: b.actorId,
+        clientTurnId: b.clientTurnId,
+        ...(b.userId ? { userId: b.userId } : {}),
+        utterance: {
+          id: `utt_${b.clientTurnId}`,
+          speaker: b.actorId,
+          mode: b.targetNpcId ? "addressed" : "broadcast",
+          ...(b.targetNpcId ? { target: b.targetNpcId } : {}),
+          content: b.input,
+        },
+      });
     });
   }
 

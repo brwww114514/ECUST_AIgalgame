@@ -202,3 +202,60 @@ describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
     await app.close();
   });
 });
+
+/** 前端（#85）契约对齐：GET 探测 + POST /conversation/turns 别名，保持与规范端点同一 SSE 形状 */
+describe("dev/v2 群聊端点（issue #85/#89 契约对齐）", () => {
+  it("GET /conversation 探测返回 200（前端据此判定 v2 可用，不再误退回 v1）", async () => {
+    const { app, roomId } = await appWith();
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/rooms/${roomId}/conversation`,
+      headers: { "x-user-id": "u_owner" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ ok: true, v2: true });
+    await app.close();
+  });
+
+  it("POST /conversation/turns 别名接受 {actorId,input,clientTurnId}，推同样 SSE 且 speaker 绑定", async () => {
+    const { app, roomId, actorId } = await appWith();
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation/turns`,
+      headers: { "x-user-id": "u_owner" },
+      payload: { actorId, input: "大家好", clientTurnId: "alias-1" },
+    });
+    expect(res.statusCode).toBe(200);
+    const ev = sse(res.body).find((e) => e.type === "conversation.committed");
+    expect(ev).toBeTruthy();
+    const data = ev!.data as unknown as Extract<ConversationEvent, { type: "conversation.committed" }>;
+    expect(data.state.room.id).toBe(roomId);
+    await app.close();
+  });
+
+  it("别名端点带在场 targetNpcId 时仍能结算（addressed 模式，不因 target 校验失败）", async () => {
+    const { app, roomId, actorId } = await appWith();
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation/turns`,
+      headers: { "x-user-id": "u_owner" },
+      payload: { actorId, input: "你好", clientTurnId: "alias-target-1", targetNpcId: "npc_lin" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(sse(res.body).map((e) => e.type)).toContain("conversation.committed");
+    await app.close();
+  });
+
+  it("别名端点越权 403 与规范端点一致", async () => {
+    const { app, roomId, actorId } = await appWith();
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation/turns`,
+      headers: { "x-user-id": "u_other" },
+      payload: { actorId, input: "hi", clientTurnId: "alias-denied-1" },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toMatchObject({ ok: false, code: "E_FORBIDDEN" });
+    await app.close();
+  });
+});

@@ -20,6 +20,7 @@ import type {
 import type { EventLog } from "../store.ts";
 import type { DefaultArbiter } from "../arbiter.ts";
 import type { EventSourcedMemory } from "../memory.ts";
+import { conversationSnapshotSchema, type ConversationSnapshot, type RestoreResult } from "./conversation-snapshot.ts";
 import type { SceneManager } from "./scene.ts";
 import type { NpcAgent } from "./npc-agent.ts";
 import type { ConversationAudit } from "./audit.ts";
@@ -102,6 +103,44 @@ export class ConversationHostV2 implements ConversationTurnV2 {
 
   get(sessionId: Id): ConversationSessionV2 | undefined {
     return this.sessions.get(sessionId);
+  }
+
+  /** 重启后"继续同房间群聊"：取该房间最后一个仍 open 的会话 */
+  getByRoom(roomId: RoomId): ConversationSessionV2 | undefined {
+    let found: ConversationSessionV2 | undefined;
+    for (const s of this.sessions.values()) if (s.roomId === roomId && s.status === "open") found = s;
+    return found;
+  }
+
+  /** 导出会话快照（深拷贝，不写文件；落盘由调用方负责，见 conversation-snapshot.ts） */
+  exportSessions(roomId?: RoomId): ConversationSnapshot {
+    const sessions = [...this.sessions.values()]
+      .filter((s) => !roomId || s.roomId === roomId)
+      .map((s) => structuredClone(s));
+    return { version: 1, savedAt: this.deps.now?.() ?? Date.now(), sessions };
+  }
+
+  /**
+   * 导入快照（重启恢复）。坏档/版本不符 → 降级：当前会话全部 closed，调用方须 open() 新会话。
+   * 同 id 已存在则跳过（重复导入幂等）；turn 达上限的会话强制 closed。
+   */
+  restoreSessions(raw: unknown, roomId?: RoomId): RestoreResult {
+    const parsed = conversationSnapshotSchema.safeParse(raw);
+    if (!parsed.success) {
+      for (const s of this.sessions.values()) s.status = "closed";
+      return { restored: 0, degraded: true, sessions: [] };
+    }
+    const restored: string[] = [];
+    for (const s of parsed.data.sessions) {
+      if (roomId && s.roomId !== roomId) continue;
+      if (this.sessions.has(s.id)) continue;
+      if (s.turn >= s.maxTurns) s.status = "closed";
+      this.sessions.set(s.id, s);
+      const n = Number(s.id.replace(/^conv_/, ""));
+      if (Number.isFinite(n) && n > this.nextId) this.nextId = n;
+      restored.push(s.id);
+    }
+    return { restored: restored.length, degraded: false, sessions: restored };
   }
 
   /** 插话超时恢复；返回被恢复的会话 id（保留旧签名供 server tick 使用） */

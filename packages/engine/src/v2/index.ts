@@ -7,6 +7,7 @@ export * from "./scene.ts";
 export * from "./npc-agent.ts";
 export * from "./audit.ts";
 export * from "./conversation.ts";
+export * from "./conversation-snapshot.ts";
 export * from "./conversation.step.ts";
 export * from "./conversation.view.ts";
 export { mentalFields, memoryProposals, mentalProposal, publicSceneText, utteranceFields } from "./conversation.helpers.ts";

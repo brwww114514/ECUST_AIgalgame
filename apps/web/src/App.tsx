@@ -496,6 +496,8 @@ const token = scopeRef.current.current();
       if ((!base && !utterance) || busy || !roomId || !actorId) return;
       const token = scopeRef.current.current();
       const current = () => scopeRef.current.isCurrent(token.version);
+      // 没有完整 utterance 时退回 #85 别名端点：它只收自然语言 input，目标靠 targetNpcId 传，
+      // 所以这里保留「对<展示名>说：」的兜底拼法（服务端会先换回真名再喂模型）。
       const text = targetNpc ? `对${targetNpc.name}说：${base}` : base;
       lastTurn.current = { text: base, target: targetNpc, ...(utterance ? { utterance } : {}) };
       const tw = getTw();
@@ -506,25 +508,9 @@ const token = scopeRef.current.current();
       setUnconfirmed(null);
       if (echo) {
         setInput("");
-        // contentless（如 signal）的正文被服务端丢弃，玩家行只该显示动作，不能拼成"对X说：<动作>"
-        const isContentless = utterance ? v2Modes.some((m) => m.id === utterance.mode && m.contentless) : false;
-        const echoChannel = isContentless ? "action" : "content";
-        const echoText = isContentless ? (utterance?.action ?? base) : text;
-        // v2 的玩家行放进 convView（而不是 v1 lines），scene beat 才能按 order 锚定它
-        convView.current = {
-          ...convView.current,
-          lines: [
-            ...convView.current.lines,
-            {
-              id: ++lineId,
-              kind: "utterance",
-              speaker: actorId,
-              parts: [{ channel: echoChannel, text: echoText }],
-              turn: convView.current.committedTurn,
-            },
-          ],
-        };
-        renderConv(convView.current, actorId);
+        // 玩家行不回显：引擎本就会把玩家自己的 utterance 作为 Delivery 投回给本人
+        // （deliver() 的 isTarget 含 speaker），由 SSE 的 conversation.utterance 渲染。
+        // 再本地回显同一句就会出现两行（且旧的「对<展示名>说：」前缀会把外貌占位名写进对话）。
       }
       const clientTurnId = reuseId ?? `${Date.now()}_${++turnSeq.current}`;
 

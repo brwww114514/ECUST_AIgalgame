@@ -574,4 +574,52 @@ describe("dev/v2 群聊端点（issue #85/#89 契约对齐）", () => {
     expect(res.body).toContain("严守一");
     await app.close();
   });
+
+  it("NPC 对别的 NPC 耳语自报姓名不算玩家认识（只统计玩家收到的 delivery）", async () => {
+    const npcId = "npc_yan";
+    const { app, deps, roomId, actorId } = await appWithHost((rid, aid) => {
+      const events: ConversationEvent[] = [
+        {
+          type: "conversation.utterance",
+          // to 是另一个 NPC：玩家只收到 coverAction，没听见内容
+          delivery: { to: "npc_zhou", speaker: npcId, utteranceId: "utt_whisper_1", mode: "whisper", channels: ["content"], content: "我是严守一" },
+        },
+        { type: "conversation.committed", sessionId: "conv_1", turn: 1, proposals: [], state: unknownNpcState(rid, aid, npcId) },
+      ];
+      return fakeConversationHost({ events }).host;
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation`,
+      headers: { "x-user-id": "u_owner" },
+      payload: { actorId, clientTurnId: "whisper-1", utterance: { id: "utt_w_1", mode: "broadcast", content: "嗯。" } },
+    });
+    expect(res.statusCode).toBe(200);
+    const after = await deps.store.snapshot(roomId);
+    expect(after.entities[npcId]!.attrs.knows_name ?? false).toBe(false);
+    await app.close();
+  });
+
+  it("alias 路径（input + targetNpcId）问名字同样解锁", async () => {
+    const npcId = "npc_yan";
+    const { app, deps, roomId, actorId } = await appWithHost((rid, aid) => {
+      const events: ConversationEvent[] = [
+        {
+          type: "conversation.utterance",
+          delivery: { to: aid, speaker: npcId, utteranceId: "utt_alias_1", mode: "addressed", channels: ["content"], content: "严守一，记一下" },
+        },
+        { type: "conversation.committed", sessionId: "conv_1", turn: 1, proposals: [], state: unknownNpcState(rid, aid, npcId) },
+      ];
+      return fakeConversationHost({ events }).host;
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation/turns`,
+      headers: { "x-user-id": "u_owner" },
+      payload: { actorId, clientTurnId: "alias-unlock-1", targetNpcId: npcId, input: "你叫什么" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((await deps.store.snapshot(roomId)).entities[npcId]!.attrs.knows_name).toBe(true);
+    await app.close();
+  });
 });

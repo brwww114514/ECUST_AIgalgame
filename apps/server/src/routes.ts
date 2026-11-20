@@ -614,15 +614,18 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
               if (target && target.kind === "npc" && presentIds.has(target.id)) learnedIds.add(target.id);
             }
             // 台词判定：交付里没有说话人标签，按「真名：内容」还原后复用 v1 的自报姓名规则。
-            // 只取 NPC 的台词——玩家自己的话不算解锁来源。
+            // 只统计**玩家实际收到**的那条 delivery：`to` 不是玩家（耳语给别的 NPC、私信别人）
+            // 说明玩家没听见，不能据此解锁；玩家自己的话也不算解锁来源。
             const speech = out
               .flatMap((ev) => {
-                if (ev.type !== "conversation.utterance" || ev.delivery.speaker === actorId) return [];
-                const speaker = snapshot.entities[ev.delivery.speaker];
-                const text = [ev.delivery.content, ev.delivery.action]
-                  .filter((s): s is string => typeof s === "string" && s.trim() !== "")
-                  .join(" ");
-                return speaker && text ? [`${speaker.name}：${text}`] : [];
+                if (ev.type !== "conversation.utterance") return [];
+                const d = ev.delivery;
+                if (d.to !== actorId || d.speaker === actorId) return [];
+                const speaker = snapshot.entities[d.speaker];
+                const parts: string[] = [];
+                if (d.channels.includes("content") && typeof d.content === "string" && d.content.trim() !== "") parts.push(d.content);
+                if (d.channels.includes("action") && typeof d.action === "string" && d.action.trim() !== "") parts.push(d.action);
+                return speaker && parts.length > 0 ? [`${speaker.name}：${parts.join(" ")}`] : [];
               })
               .join("\n");
             for (const npc of namesIntroducedIn(speech, npcs)) {

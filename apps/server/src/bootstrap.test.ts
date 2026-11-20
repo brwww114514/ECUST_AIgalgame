@@ -55,6 +55,35 @@ describe("bootstrap", () => {
     }
   });
 
+  it("跨房间私信坏档不会污染健康房间的收件箱", async () => {
+    const cfg = testConfig();
+    const deps = await createApp(cfg);
+    const good = await deps.createRoom("solo");
+    const bad = await deps.createRoom("solo");
+    const valid = await deps.gossip!.send(good.roomId, good.actorId, "npc_lin", "你好");
+    expect(valid.some((event) => event.type === "gossip.message")).toBe(true);
+    const file = path.join(cfg.dataDir, "rooms", `${bad.roomId}.jsonl`);
+    const seq = (await deps.store.events(bad.roomId, 1)).at(-1)!.seq + 1;
+    const crossRoomEvent = {
+      v: 1, id: "evt_bad_message", roomId: bad.roomId, seq, ts: 1, actorId: "npc_lin", type: "msg.sent",
+      payload: {
+        message: {
+          id: "msg_bad_room", roomId: good.roomId, from: "npc_lin", to: good.actorId,
+          kind: "gossip", content: "invalid cross-room data", hop: 1, confidence: 1, createdAt: 1, seq,
+        },
+      },
+    };
+    const broken = (await readFile(file, "utf8")) + JSON.stringify(crossRoomEvent) + "\n";
+    await writeFile(file, broken);
+
+    const restarted = await createApp(cfg);
+    await expect(restarted.store.snapshot(bad.roomId)).rejects.toMatchObject({ code: "E_STORE_FAULT" });
+    expect(await restarted.store.snapshot(good.roomId)).toEqual(await deps.store.snapshot(good.roomId));
+    expect(restarted.gossip!.inbox(good.roomId, good.actorId)).toEqual([]);
+    expect(restarted.gossip!.inbox(good.roomId, "npc_lin")).toHaveLength(1);
+    expect(await readFile(file, "utf8")).toBe(broken);
+  });
+
   it("成功提交的长回合 ID 重启后仍能读取", async () => {
     const cfg = testConfig();
     const deps = await createApp(cfg);

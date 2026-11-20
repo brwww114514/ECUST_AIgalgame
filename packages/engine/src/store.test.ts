@@ -146,13 +146,14 @@ describe("FileStore（jsonl 一房间一文件）", () => {
     const created = await arbiter.apply(ROOM, [
       { op: "entity.create", args: { id: from, kind: "npc", name: "A", tags: ["t".repeat(40)] } },
       { op: "entity.create", args: { id: to, kind: "npc", name: "B" } },
-      { op: "link.create", args: { kind: "knows", from, to } },
+      { op: "link.create", args: { kind: "knows", from, to, audience: [""] } },
       { op: "plot.upsert", args: { goal: "g".repeat(130), actors: [from, to] } },
     ], cause);
     expect(created.ok).toBe(true);
     const state = await store.snapshot(ROOM);
     const linkId = state.links[0]!.id;
     expect(linkId.length).toBeGreaterThan(96);
+    expect(state.links[0]?.audience).toEqual([""]);
     expect(await new FileStore(dir).snapshot(ROOM)).toEqual(state);
 
     const removed = await arbiter.apply(ROOM, [{ op: "link.remove", args: { linkId } }], cause);

@@ -17,6 +17,7 @@ import { InMemoryMemory } from "../../../packages/engine/src/memory.ts";
 import { emptyRegistry, JsonRegistry } from "../../../packages/engine/src/registry.ts";
 import { FileStore } from "../../../packages/engine/src/store.ts";
 import { DefaultTurn } from "../../../packages/engine/src/turn.ts";
+import { parseCommitEvidence } from "../../../packages/engine/src/turn.evidence.ts";
 import { OP_NAMES } from "../../../packages/shared/src/contract/types.ts";
 import type {
   AttrDef, Entity, ModuleContext, ModuleInfo, ModuleManifest, ModuleOutcome, Modules, Proposal, TurnEvent, WorldState,
@@ -178,10 +179,14 @@ describe("#94 单房回合链验收", () => {
       })) events.push(ev);
       expect(events.map((e) => e.type), `第 ${i + 1} 回合`).toEqual(["turn.accepted", "turn.patch", "turn.commit"]);
       const commit = events.at(-1);
-      // #76：commitMarker 作为同批 Envelope 落在 EventLog 末尾，故每回合 seq 增量 ≥2；
-      // 不断言绝对增量，只要求 commit.seq 等于本回合落库后的最新 seq（marker 存在与否都成立）。
-      expect(commit?.type === "turn.commit" ? commit.seq : -1).toBe(store.seq(roomId));
-      expect(store.seq(roomId), `第 ${i + 1} 回合 seq 单调递增`).toBeGreaterThan(seededSeq + i);
+      // #76：每回合落库 attr.changed + turn.committed marker 共 2 条 Envelope，
+      // marker 是同批最后一条，其 seq 即本回合 committedSeq；turn.commit.seq 与它相等。
+      const commitSeq = seededSeq + 2 * (i + 1);
+      expect(commit?.type === "turn.commit" ? commit.seq : -1, `第 ${i + 1} 回合 commit.seq`).toBe(commitSeq);
+      expect(store.seq(roomId), `第 ${i + 1} 回合落库后最新 seq`).toBe(commitSeq);
+      const marker = (await store.events(roomId, seededSeq + 2 * i + 2)).find((e) => e.type === "turn.committed");
+      expect(marker?.seq, `第 ${i + 1} 回合 marker seq`).toBe(commitSeq);
+      expect(parseCommitEvidence(marker!)?.committedSeq, `第 ${i + 1} 回合 marker committedSeq`).toBe(commitSeq);
     }
 
     const finalSeq = store.seq(roomId);

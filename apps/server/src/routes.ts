@@ -11,7 +11,7 @@ import { DialogueBodySchema, TickBodySchema, TravelBodySchema, zodMessage } from
 import type { MapService } from "./map.ts";
 import type { LlmSettings } from "./settings.ts";
 import { maskNamesDeep, unmaskTargetPlaceholder, unknownPlaceholders } from "./view-names.ts";
-import { isAskNameInput, namesIntroducedIn } from "./name-unlock.ts";
+import { askedNameTargetId, introducedPresentIds, viewerSpeech } from "./name-unlock.ts";
 import type { SaveIndex } from "./saves.ts";
 import type { TurnHistory } from "./turn-history.ts";
 import { registerResumeRoutes } from "./resume.routes.ts";
@@ -606,31 +606,16 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
         if (deps.learnNpcNames && committed) {
           try {
             const snapshot = finalState;
-            const npcs = Object.values(snapshot.entities).filter((e) => e.kind === "npc" && e.status === "active");
-            const presentIds = new Set(snapshot.room.scene.presentIds);
             const learnedIds = new Set<string>();
-            if (utterance?.target && typeof utterance.target === "string" && isAskNameInput(utterance.content ?? "")) {
-              const target = snapshot.entities[utterance.target];
-              if (target && target.kind === "npc" && presentIds.has(target.id)) learnedIds.add(target.id);
-            }
-            // 台词判定：交付里没有说话人标签，按「真名：内容」还原后复用 v1 的自报姓名规则。
-            // 只统计**玩家实际收到**的那条 delivery：`to` 不是玩家（耳语给别的 NPC、私信别人）
-            // 说明玩家没听见，不能据此解锁；玩家自己的话也不算解锁来源。
-            const speech = out
-              .flatMap((ev) => {
-                if (ev.type !== "conversation.utterance") return [];
-                const d = ev.delivery;
-                if (d.to !== actorId || d.speaker === actorId) return [];
-                const speaker = snapshot.entities[d.speaker];
-                const parts: string[] = [];
-                if (d.channels.includes("content") && typeof d.content === "string" && d.content.trim() !== "") parts.push(d.content);
-                if (d.channels.includes("action") && typeof d.action === "string" && d.action.trim() !== "") parts.push(d.action);
-                return speaker && parts.length > 0 ? [`${speaker.name}：${parts.join(" ")}`] : [];
-              })
-              .join("\n");
-            for (const npc of namesIntroducedIn(speech, npcs)) {
-              if (presentIds.has(npc.id)) learnedIds.add(npc.id);
-            }
+            const asked = askedNameTargetId(
+              snapshot,
+              typeof utterance?.target === "string" ? utterance.target : undefined,
+              utterance?.content ?? "",
+            );
+            if (asked) learnedIds.add(asked);
+            // 台词判定：交付里没有说话人标签，按「真名：内容」还原后复用 v1 的自报姓名规则；
+            // 只统计玩家实际收到的 delivery（viewerSpeech 内含可见性过滤）。
+            for (const id of introducedPresentIds(snapshot, viewerSpeech(snapshot, actorId, out))) learnedIds.add(id);
             if (learnedIds.size > 0) {
               await deps.learnNpcNames(roomId, [...learnedIds]);
               finalState = await deps.store.snapshot(roomId);
@@ -863,13 +848,9 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
         // 已提交回合不能再被旁路失败改写：姓名解锁失败只记日志，账本保持 committed、事件照常下发
         try {
           const snapshot = finalState ?? (await deps.store.snapshot(roomId));
-          const npcs = Object.values(snapshot.entities).filter((e) => e.kind === "npc" && e.status === "active");
           const learnedIds = new Set<string>();
-          const presentIds = new Set(snapshot.room.scene.presentIds);
-          if (body.targetNpcId && isAskNameInput(body.input)) {
-            const targetNpc = snapshot.entities[body.targetNpcId];
-            if (targetNpc && targetNpc.kind === "npc" && presentIds.has(targetNpc.id)) learnedIds.add(targetNpc.id);
-          }
+          const asked = askedNameTargetId(snapshot, body.targetNpcId, body.input);
+          if (asked) learnedIds.add(asked);
           const speech = events
             .flatMap((ev) => {
               const d = ev as { type?: string; field?: string; text?: string; facts?: string[] };
@@ -878,9 +859,7 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
               return [];
             })
             .join("\n");
-          for (const npc of namesIntroducedIn(speech, npcs)) {
-            if (presentIds.has(npc.id)) learnedIds.add(npc.id);
-          }
+          for (const id of introducedPresentIds(snapshot, speech)) learnedIds.add(id);
           if (learnedIds.size > 0) {
             await deps.learnNpcNames(roomId, [...learnedIds]);
             finalState = await deps.store.snapshot(roomId);

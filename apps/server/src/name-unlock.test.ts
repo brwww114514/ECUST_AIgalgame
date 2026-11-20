@@ -2,8 +2,9 @@
  * 「谁报了名字才认识谁」判定：看说话人标签之后的台词内容，而不是标签本身。
  */
 import { describe, expect, it } from "vitest";
-import type { Entity } from "../../../packages/shared/src/contract/types.ts";
-import { namesIntroducedIn } from "./name-unlock.ts";
+import type { Delivery, ConversationEvent } from "../../../packages/shared/src/contract/v2.ts";
+import type { Entity, WorldState } from "../../../packages/shared/src/contract/types.ts";
+import { askedNameTargetId, introducedPresentIds, namesIntroducedIn, viewerSpeech } from "./name-unlock.ts";
 
 function npc(name: string, known = false): Entity {
   return {
@@ -64,5 +65,84 @@ describe("namesIntroducedIn", () => {
 
   it("英文冒号也认", () => {
     expect(namesIntroducedIn("林静: 林静，安静的静。", [npc("林静")])).toHaveLength(1);
+  });
+});
+
+/** 最小世界状态：只给解锁判定需要的字段，presentIds 决定"在场"。 */
+function world(entities: Entity[], presentIds: string[] = entities.map((e) => e.id)): WorldState {
+  return {
+    schemaVersion: 3,
+    room: {
+      id: "room_1",
+      mode: "solo",
+      worldId: "world_1",
+      members: [],
+      scene: { locId: "loc_1", presentIds },
+      createdAt: 0,
+      lastActiveAt: 0,
+    },
+    entities: Object.fromEntries(entities.map((e) => [e.id, e])),
+    links: [],
+    clock: { day: 1, phase: "morning", tick: 0 },
+    plots: [],
+    moduleState: {},
+  };
+}
+
+function utterance(d: Omit<Delivery, "utteranceId" | "mode">): ConversationEvent {
+  return { type: "conversation.utterance", delivery: { utteranceId: "u1", mode: "addressed", ...d } };
+}
+
+describe("askedNameTargetId（问名字直解，v1/v2 共用）", () => {
+  it("目标是在场 NPC 且玩家在问名字 → 解锁该 NPC", () => {
+    expect(askedNameTargetId(world([npc("林静")]), "npc_林静", "你叫什么名字？")).toBe("npc_林静");
+  });
+
+  it("目标不在场 / 没在问名字 / 没有目标 → 不解锁", () => {
+    expect(askedNameTargetId(world([npc("林静")], []), "npc_林静", "你叫什么名字？")).toBeNull();
+    expect(askedNameTargetId(world([npc("林静")]), "npc_林静", "你好呀")).toBeNull();
+    expect(askedNameTargetId(world([npc("林静")]), undefined, "你叫什么名字？")).toBeNull();
+  });
+});
+
+describe("introducedPresentIds（自报姓名，v1/v2 共用）", () => {
+  it("在场且自报姓名 → 返回 id；不在场不返回", () => {
+    const entities = [npc("林静"), npc("白晓通")];
+    expect(introducedPresentIds(world(entities, ["npc_林静"]), "林静：林静，安静的静。\n白晓通：白晓通，住三号楼。")).toEqual([
+      "npc_林静",
+    ]);
+  });
+
+  it("空文本 → 空数组", () => {
+    expect(introducedPresentIds(world([npc("林静")]), "   ")).toEqual([]);
+  });
+});
+
+describe("viewerSpeech（只还原玩家实际收到的 delivery）", () => {
+  it("to 是玩家且 channels 含 content → 还原成「真名：台词」", () => {
+    const state = world([npc("林静")]);
+    const speech = viewerSpeech(state, "plr_1", [
+      utterance({ to: "plr_1", speaker: "npc_林静", channels: ["content"], content: "林静，安静的静。" }),
+    ]);
+    expect(speech).toBe("林静：林静，安静的静。");
+  });
+
+  it("耳语给别的 NPC（to 不是玩家）→ 不计入（玩家没听见）", () => {
+    const state = world([npc("林静"), npc("白晓通")]);
+    expect(
+      viewerSpeech(state, "plr_1", [
+        utterance({ to: "npc_白晓通", speaker: "npc_林静", channels: ["content"], content: "我是林静" }),
+      ]),
+    ).toBe("");
+  });
+
+  it("玩家自己的交付不算解锁来源；channels 不含 content 时不拿正文判定", () => {
+    const state = world([npc("林静")]);
+    expect(
+      viewerSpeech(state, "plr_1", [
+        utterance({ to: "plr_1", speaker: "plr_1", channels: ["content"], content: "林静，安静。" }),
+        utterance({ to: "plr_1", speaker: "npc_林静", channels: ["action"], content: "林静，安静的静。", action: "凑近耳语" }),
+      ]),
+    ).toBe("林静：凑近耳语");
   });
 });

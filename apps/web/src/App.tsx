@@ -94,6 +94,8 @@ export default function App() {
   stateRef.current = state;
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  /** v2 回合的乐观玩家行：点发送到 committed 之间先浅色显示，引擎把本人 delivery 投回来就清掉 */
+  const [pendingLines, setPendingLines] = useState<{ kind: LineKind; text: string }[]>([]);
   const [err, setErr] = useState<string>("");
   /** 本次回合失败是否值得重试：由 turn.error/retryable 决定（issue #21-3） */
   const [errRetryable, setErrRetryable] = useState(false);
@@ -500,6 +502,20 @@ const token = scopeRef.current.current();
       // 所以这里保留「对<展示名>说：」的兜底拼法（服务端会先换回真名再喂模型）。
       const text = targetNpc ? `对${targetNpc.name}说：${base}` : base;
       lastTurn.current = { text: base, target: targetNpc, ...(utterance ? { utterance } : {}) };
+      // 乐观行：玩家自己的 utterance 要等引擎投回（SSE 非流式），先本地显示一句浅色的；
+      // 真行到达（to=自己）时在 apply 里清掉，按「同一句只出现一次」去重。
+      setPendingLines(
+        utterance
+          ? [
+              ...(base ? [{ kind: "player" as const, text: base }] : []),
+              ...(typeof utterance.action === "string" && utterance.action.trim() !== ""
+                ? [{ kind: "narrative" as const, text: utterance.action.trim() }]
+                : []),
+            ]
+          : text
+            ? [{ kind: "player" as const, text }]
+            : [],
+      );
       const tw = getTw();
       if (tw.typing) tw.skip();
       setBusy(true);
@@ -519,6 +535,10 @@ const token = scopeRef.current.current();
         if (ev.type === "conversation.committed") {
           setState(ev.state);
           setStateRev((v) => v + 1);
+        }
+        // 引擎把玩家自己的 utterance 作为 delivery 投回来：真行已到，清掉乐观行
+        if (ev.type === "conversation.utterance" && ev.delivery.to === actorId && ev.delivery.speaker === actorId) {
+          setPendingLines([]);
         }
         convView.current = reduceConversationView(convView.current, ev, {
           selfActorId: actorId,
@@ -540,11 +560,13 @@ const token = scopeRef.current.current();
         onEvent: apply,
         onError: (code: string, message: string, retryable?: boolean) => {
           if (!current()) return;
+          setPendingLines([]);
           setErr(message || code);
           setErrRetryable(retryable === true);
         },
         onUnconfirmed: () => {
           if (!current()) return;
+          setPendingLines([]);
           setUnconfirmed({ clientTurnId });
           setErr("会话结果未确认，重试会以同一 ID 重发（服务端按 ID 去重）。");
           setErrRetryable(true);
@@ -575,6 +597,7 @@ const token = scopeRef.current.current();
         setErr(`${httpFailMessage(e)}：本回合结果未确认，重试会以同一 ID 重发。`);
         setErrRetryable(true);
       } finally {
+        setPendingLines([]);
         if (current()) {
           // 流结束时仍在 listening：保留等待态，让 30s 定时器按服务端节奏清掉
           if (convView.current.phase !== "listening") disarmListenTimer();
@@ -977,6 +1000,7 @@ await runTurn(
             onLoadEarlier={() => void loadEarlier()}
             v2Modes={convMode === "v2" ? v2Modes : undefined}
             onSendUtterance={convMode === "v2" ? sendV2Utterance : undefined}
+            pendingLines={pendingLines}
           />
         )}
 

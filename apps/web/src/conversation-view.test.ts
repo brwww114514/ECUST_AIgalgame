@@ -8,6 +8,7 @@ import {
   insertSceneBeat,
   isListeningExpired,
   linesFromView,
+  pendingLinesFor,
   reduceConversationView,
   viewerParts,
 } from "./conversation-view.ts";
@@ -230,5 +231,71 @@ describe("linesFromView：通道摊平为 UI 行", () => {
     const lines = linesFromView(s, { selfActorId: ME, nameOf: () => "林雨" });
     expect(lines[0]!.text).toBe("林雨：大家好");
     expect(lines[1]!.text).toBe("抬眼打量对方");
+  });
+});
+
+describe("linesFromView：自己行动行的 kind 与乐观行一致", () => {
+  it("self action（contentless/signal）→ narrative，不会 pending(叙述)→真行(player) 跳样式", () => {
+    const view = reduceConversationView(
+      initialConversationView(),
+      {
+        type: "conversation.utterance",
+        delivery: { to: ME, speaker: ME, utteranceId: "u_action", mode: "signal", channels: ["action"], action: "把纸条推过去" },
+      },
+      ctx(),
+    );
+    const lines = linesFromView(view, { selfActorId: ME, nameOf: () => "你" });
+    expect(lines.map((l) => l.kind)).toEqual(["narrative"]);
+    expect(lines[0]!.text).toBe("把纸条推过去");
+  });
+});
+
+describe("pendingLinesFor（乐观玩家行）", () => {
+  const me = ME;
+
+  it("正文 + 动作 → player + narrative 两行", () => {
+    expect(pendingLinesFor(initialConversationView(), me, "你好啊", "抬手打了个招呼")).toEqual([
+      { kind: "player", text: "你好啊" },
+      { kind: "narrative", text: "抬手打了个招呼" },
+    ]);
+  });
+
+  it("只有动作（contentless）→ 只有 narrative 行（与真行 kind 一致）", () => {
+    expect(pendingLinesFor(initialConversationView(), me, "", "不动声色地递过去一张纸条")).toEqual([
+      { kind: "narrative", text: "不动声色地递过去一张纸条" },
+    ]);
+  });
+
+  it("正文为空且无动作 → 不挂 pending", () => {
+    expect(pendingLinesFor(initialConversationView(), me, "   ")).toEqual([]);
+  });
+
+  it("真行已渲染同一句 → 不重复挂（重试复用同一 clientTurnId，扫全部已渲染行）", () => {
+    const view = reduceConversationView(
+      initialConversationView(),
+      {
+        type: "conversation.utterance",
+        delivery: { to: me, speaker: me, utteranceId: "u1", mode: "broadcast", channels: ["content"], content: "你好啊" },
+      },
+      ctx(),
+    );
+    expect(pendingLinesFor(view, me, "你好啊", undefined, { sinceLineIndex: 0 })).toEqual([]);
+    expect(pendingLinesFor(view, me, "另一句", undefined, { sinceLineIndex: 0 })).toEqual([
+      { kind: "player", text: "另一句" },
+    ]);
+  });
+
+  it("新一轮又发完全相同的一句 → 仍显示 pending（去重只看本次派发之后追加的行）", () => {
+    const view = reduceConversationView(
+      initialConversationView(),
+      {
+        type: "conversation.utterance",
+        delivery: { to: me, speaker: me, utteranceId: "u1", mode: "broadcast", channels: ["content"], content: "你好啊" },
+      },
+      ctx(),
+    );
+    expect(pendingLinesFor(view, me, "你好啊", undefined, { sinceLineIndex: view.lines.length })).toEqual([
+      { kind: "player", text: "你好啊" },
+    ]);
   });
 });

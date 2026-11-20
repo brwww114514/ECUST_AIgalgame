@@ -11,7 +11,7 @@ import { DialogueBodySchema, TickBodySchema, TravelBodySchema, zodMessage } from
 import type { MapService } from "./map.ts";
 import type { LlmSettings } from "./settings.ts";
 import { maskNamesDeep, unmaskTargetPlaceholder, unknownPlaceholders } from "./view-names.ts";
-import { isAskNameInput, namesIntroducedIn } from "./name-unlock.ts";
+import { askedNameTargetId, introducedPresentIds, viewerSpeech } from "./name-unlock.ts";
 import type { SaveIndex } from "./saves.ts";
 import type { TurnHistory } from "./turn-history.ts";
 import { registerResumeRoutes } from "./resume.routes.ts";
@@ -599,7 +599,32 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
         if (opened) sseWrite(reply.raw, opened.type, opened);
         // 与 /turns 同一口径：收齐后按最终状态脱敏再一次性写出（模型可能把真名写进台词）
         const committed = out.find((e) => e.type === "conversation.committed");
-        const finalState = committed?.type === "conversation.committed" ? committed.state : access.state;
+        let finalState = committed?.type === "conversation.committed" ? committed.state : access.state;
+        // 与 v1 /turns 同一口径：先按回合结束后的状态解锁「玩家知道了谁的名字」，再算脱敏名单。
+        // 否则玩家问「你叫什么」、对方答出真名的那一回合，答复仍会被遮成外貌占位名——表现上
+        // 就成了「NPC 用外貌描述称呼自己」，玩家也永远学不到名字。
+        if (deps.learnNpcNames && committed) {
+          try {
+            const snapshot = finalState;
+            const learnedIds = new Set<string>();
+            const asked = askedNameTargetId(
+              snapshot,
+              typeof utterance?.target === "string" ? utterance.target : undefined,
+              utterance?.content ?? "",
+            );
+            if (asked) learnedIds.add(asked);
+            // 台词判定：交付里没有说话人标签，按「真名：内容」还原后复用 v1 的自报姓名规则；
+            // 只统计玩家实际收到的 delivery（viewerSpeech 内含可见性过滤）。
+            for (const id of introducedPresentIds(snapshot, viewerSpeech(snapshot, actorId, out))) learnedIds.add(id);
+            if (learnedIds.size > 0) {
+              await deps.learnNpcNames(roomId, [...learnedIds]);
+              finalState = await deps.store.snapshot(roomId);
+            }
+          } catch (e) {
+            // 已提交回合不能被旁路失败改写：解锁失败只记日志，事件照常下发（宁可多遮一句）
+            console.warn(`[names] v2 回合已提交，但姓名解锁失败：${roomId}`, e);
+          }
+        }
         const placeholders = unknownPlaceholders(finalState, deps.appearance);
         // BLOCKER-1：host.run 的事件是全量内部视图，下发前必须按已鉴权 viewer + 会话成员投影：
         // mental 永不下发，私聊只给目标本人，committed 的私忆/私有关系/GM 字段按可见性裁剪，最后再遮真名。
@@ -823,13 +848,9 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
         // 已提交回合不能再被旁路失败改写：姓名解锁失败只记日志，账本保持 committed、事件照常下发
         try {
           const snapshot = finalState ?? (await deps.store.snapshot(roomId));
-          const npcs = Object.values(snapshot.entities).filter((e) => e.kind === "npc" && e.status === "active");
           const learnedIds = new Set<string>();
-          const presentIds = new Set(snapshot.room.scene.presentIds);
-          if (body.targetNpcId && isAskNameInput(body.input)) {
-            const targetNpc = snapshot.entities[body.targetNpcId];
-            if (targetNpc && targetNpc.kind === "npc" && presentIds.has(targetNpc.id)) learnedIds.add(targetNpc.id);
-          }
+          const asked = askedNameTargetId(snapshot, body.targetNpcId, body.input);
+          if (asked) learnedIds.add(asked);
           const speech = events
             .flatMap((ev) => {
               const d = ev as { type?: string; field?: string; text?: string; facts?: string[] };
@@ -838,9 +859,7 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
               return [];
             })
             .join("\n");
-          for (const npc of namesIntroducedIn(speech, npcs)) {
-            if (presentIds.has(npc.id)) learnedIds.add(npc.id);
-          }
+          for (const id of introducedPresentIds(snapshot, speech)) learnedIds.add(id);
           if (learnedIds.size > 0) {
             await deps.learnNpcNames(roomId, [...learnedIds]);
             finalState = await deps.store.snapshot(roomId);

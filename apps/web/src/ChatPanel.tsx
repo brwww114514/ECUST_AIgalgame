@@ -62,6 +62,8 @@ export interface ChatPanelProps {
   v2Modes?: UtteranceModeInfo[];
   /** v2 会话：提交一条完整 utterance（mode/target/content/action），与 onSend 二选一 */
   onSendUtterance?: (draft: UtteranceDraft) => void;
+  /** v2 回合的乐观玩家行：等引擎把自己的 delivery 投回来就清掉（避免点了发送没反应） */
+  pendingLines?: { kind: LineKind; text: string }[];
 }
 
 export default function ChatPanel({
@@ -91,6 +93,7 @@ export default function ChatPanel({
   onLoadEarlier,
   v2Modes,
   onSendUtterance,
+  pendingLines,
 }: ChatPanelProps) {
   const [talking, setTalking] = useState<{ id: string; name: string } | null>(null);
   /** 点击时记的是占位名；对方自报姓名解锁后，用权威状态里的真名覆盖标题/输入框 */
@@ -334,6 +337,11 @@ export default function ChatPanel({
           )}
           {lines.map((l) => (
             <p key={l.id} className={`line ${l.kind}`}>
+              {l.text}
+            </p>
+          ))}
+          {pendingLines?.map((l, i) => (
+            <p key={`pending-${i}`} className={`line ${l.kind} pending`}>
               {l.text}
             </p>
           ))}

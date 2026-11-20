@@ -29,13 +29,7 @@ import type { Line, LineKind } from "./ui.ts";
 import type { ConversationEvent } from "../../../packages/shared/src/contract/v2.ts";
 import { detectConversation, fetchUtteranceModes, runConversationTurn, runConversationUtterance } from "./conversation-api.ts";
 import type { UtteranceDraft, UtteranceModeInfo } from "./conversation-api.ts";
-import {
-  DEFAULT_LISTEN_TIMEOUT_MS,
-  initialConversationView,
-  isListeningExpired,
-  linesFromView,
-  reduceConversationView,
-} from "./conversation-view.ts";
+import { DEFAULT_LISTEN_TIMEOUT_MS, initialConversationView, isListeningExpired, linesFromView, pendingLinesFor, reduceConversationView } from "./conversation-view.ts";
 import type { ConversationView } from "./conversation-view.ts";
 
 type Tab = "chat" | "gallery" | "drafts" | "inbox";
@@ -94,6 +88,8 @@ export default function App() {
   stateRef.current = state;
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  /** v2 回合的乐观玩家行：点发送到 committed 之间先浅色显示，引擎把本人 delivery 投回来就清掉 */
+  const [pendingLines, setPendingLines] = useState<{ kind: LineKind; text: string }[]>([]);
   const [err, setErr] = useState<string>("");
   /** 本次回合失败是否值得重试：由 turn.error/retryable 决定（issue #21-3） */
   const [errRetryable, setErrRetryable] = useState(false);
@@ -496,8 +492,22 @@ const token = scopeRef.current.current();
       if ((!base && !utterance) || busy || !roomId || !actorId) return;
       const token = scopeRef.current.current();
       const current = () => scopeRef.current.isCurrent(token.version);
+      // 没有完整 utterance 时退回 #85 别名端点：它只收自然语言 input，目标靠 targetNpcId 传，
+      // 所以这里保留「对<展示名>说：」的兜底拼法（服务端会先换回真名再喂模型）。
       const text = targetNpc ? `对${targetNpc.name}说：${base}` : base;
       lastTurn.current = { text: base, target: targetNpc, ...(utterance ? { utterance } : {}) };
+      // 乐观行：玩家自己的 utterance 要等引擎投回（SSE 非流式），先本地显示浅色的。
+      // 新一轮只在「本次派发之后追加的行」里查重（同一句两轮都发仍要显示）；
+      // 重试复用同一 clientTurnId，扫全部已渲染行——真行已在就不挂，避免短暂重复。
+      setPendingLines(
+        pendingLinesFor(
+          convView.current,
+          actorId,
+          utterance ? (utterance.content ?? "") : text,
+          utterance?.action,
+          { sinceLineIndex: reuseId ? 0 : convView.current.lines.length },
+        ),
+      );
       const tw = getTw();
       if (tw.typing) tw.skip();
       setBusy(true);
@@ -506,25 +516,9 @@ const token = scopeRef.current.current();
       setUnconfirmed(null);
       if (echo) {
         setInput("");
-        // contentless（如 signal）的正文被服务端丢弃，玩家行只该显示动作，不能拼成"对X说：<动作>"
-        const isContentless = utterance ? v2Modes.some((m) => m.id === utterance.mode && m.contentless) : false;
-        const echoChannel = isContentless ? "action" : "content";
-        const echoText = isContentless ? (utterance?.action ?? base) : text;
-        // v2 的玩家行放进 convView（而不是 v1 lines），scene beat 才能按 order 锚定它
-        convView.current = {
-          ...convView.current,
-          lines: [
-            ...convView.current.lines,
-            {
-              id: ++lineId,
-              kind: "utterance",
-              speaker: actorId,
-              parts: [{ channel: echoChannel, text: echoText }],
-              turn: convView.current.committedTurn,
-            },
-          ],
-        };
-        renderConv(convView.current, actorId);
+        // 玩家行不回显：引擎本就会把玩家自己的 utterance 作为 Delivery 投回给本人
+        // （deliver() 的 isTarget 含 speaker），由 SSE 的 conversation.utterance 渲染。
+        // 再本地回显同一句就会出现两行（且旧的「对<展示名>说：」前缀会把外貌占位名写进对话）。
       }
       const clientTurnId = reuseId ?? `${Date.now()}_${++turnSeq.current}`;
 
@@ -533,6 +527,10 @@ const token = scopeRef.current.current();
         if (ev.type === "conversation.committed") {
           setState(ev.state);
           setStateRev((v) => v + 1);
+        }
+        // 引擎把玩家自己的 utterance 作为 delivery 投回来：真行已到，清掉乐观行
+        if (ev.type === "conversation.utterance" && ev.delivery.to === actorId && ev.delivery.speaker === actorId) {
+          setPendingLines([]);
         }
         convView.current = reduceConversationView(convView.current, ev, {
           selfActorId: actorId,
@@ -554,11 +552,13 @@ const token = scopeRef.current.current();
         onEvent: apply,
         onError: (code: string, message: string, retryable?: boolean) => {
           if (!current()) return;
+          setPendingLines([]);
           setErr(message || code);
           setErrRetryable(retryable === true);
         },
         onUnconfirmed: () => {
           if (!current()) return;
+          setPendingLines([]);
           setUnconfirmed({ clientTurnId });
           setErr("会话结果未确认，重试会以同一 ID 重发（服务端按 ID 去重）。");
           setErrRetryable(true);
@@ -589,6 +589,7 @@ const token = scopeRef.current.current();
         setErr(`${httpFailMessage(e)}：本回合结果未确认，重试会以同一 ID 重发。`);
         setErrRetryable(true);
       } finally {
+        setPendingLines([]);
         if (current()) {
           // 流结束时仍在 listening：保留等待态，让 30s 定时器按服务端节奏清掉
           if (convView.current.phase !== "listening") disarmListenTimer();
@@ -991,6 +992,7 @@ await runTurn(
             onLoadEarlier={() => void loadEarlier()}
             v2Modes={convMode === "v2" ? v2Modes : undefined}
             onSendUtterance={convMode === "v2" ? sendV2Utterance : undefined}
+            pendingLines={pendingLines}
           />
         )}
 

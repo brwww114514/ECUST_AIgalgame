@@ -143,7 +143,28 @@ async function appWithHost(makeHost: (roomId: string, actorId: string) => Conver
   deps.conversation = { host: makeHost(roomId, actorId) };
   const app = Fastify();
   registerRoutes(app, deps);
-  return { app, roomId, actorId };
+  return { app, deps, roomId, actorId };
+}
+
+/** 未认识某个 NPC、且该 NPC 在场的极小 committed 状态（用于姓名解锁/脱敏顺序断言） */
+function unknownNpcState(roomId: string, actorId: string, npcId: string): WorldState {
+  return {
+    schemaVersion: 1,
+    room: {
+      id: roomId, mode: "solo", worldId: "w1", members: [],
+      scene: { locId: "loc", presentIds: [actorId, npcId] }, createdAt: 0, lastActiveAt: 0,
+    },
+    entities: {
+      [npcId]: {
+        id: npcId, kind: "npc", name: "严守一", attrs: { knows_name: false }, tags: [],
+        origin: "seed", canon: true, status: "active", createdAt: 0, updatedAt: 0,
+      },
+    },
+    links: [],
+    clock: { day: 1, phase: "morning", tick: 0 },
+    plots: [],
+    moduleState: {},
+  };
 }
 
 /** 一个已认识、一个未认识的 NPC + 带私忆/GM 字段的 committed 状态（只断言结构，不断言文案） */
@@ -523,4 +544,82 @@ describe("dev/v2 群聊端点（issue #85/#89 契约对齐）", () => {
     await app.close();
   });
 
+  it("NPC 自报姓名先解锁再脱敏：同一回合不再把本人名字遮成外貌占位（截图 bug）", async () => {
+    const npcId = "npc_yan";
+    const { app, deps, roomId, actorId } = await appWithHost((rid, aid) => {
+      const events: ConversationEvent[] = [
+        {
+          type: "conversation.utterance",
+          delivery: { to: aid, speaker: npcId, utteranceId: "utt_unlock_1", mode: "addressed", channels: ["content"], content: "严守一，记一下" },
+        },
+        { type: "conversation.committed", sessionId: "conv_1", turn: 1, proposals: [], state: unknownNpcState(rid, aid, npcId) },
+      ];
+      return fakeConversationHost({ events }).host;
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation`,
+      headers: { "x-user-id": "u_owner" },
+      payload: {
+        actorId,
+        clientTurnId: "unlock-1",
+        utterance: { id: "utt_unlock_1", mode: "addressed", target: npcId, content: "我还不知道你叫什么呢" },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    // 解锁已落库（knows_name=true）……
+    const after = await deps.store.snapshot(roomId);
+    expect(after.entities[npcId]!.attrs.knows_name).toBe(true);
+    // ……且发生在脱敏之前：同一回合的自报姓名不再被遮成"拿着文件夹…"这类外貌占位名
+    expect(res.body).toContain("严守一");
+    await app.close();
+  });
+
+  it("NPC 对别的 NPC 耳语自报姓名不算玩家认识（只统计玩家收到的 delivery）", async () => {
+    const npcId = "npc_yan";
+    const { app, deps, roomId, actorId } = await appWithHost((rid, aid) => {
+      const events: ConversationEvent[] = [
+        {
+          type: "conversation.utterance",
+          // to 是另一个 NPC：玩家只收到 coverAction，没听见内容
+          delivery: { to: "npc_zhou", speaker: npcId, utteranceId: "utt_whisper_1", mode: "whisper", channels: ["content"], content: "我是严守一" },
+        },
+        { type: "conversation.committed", sessionId: "conv_1", turn: 1, proposals: [], state: unknownNpcState(rid, aid, npcId) },
+      ];
+      return fakeConversationHost({ events }).host;
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation`,
+      headers: { "x-user-id": "u_owner" },
+      payload: { actorId, clientTurnId: "whisper-1", utterance: { id: "utt_w_1", mode: "broadcast", content: "嗯。" } },
+    });
+    expect(res.statusCode).toBe(200);
+    const after = await deps.store.snapshot(roomId);
+    expect(after.entities[npcId]!.attrs.knows_name ?? false).toBe(false);
+    await app.close();
+  });
+
+  it("alias 路径（input + targetNpcId）问名字同样解锁", async () => {
+    const npcId = "npc_yan";
+    const { app, deps, roomId, actorId } = await appWithHost((rid, aid) => {
+      const events: ConversationEvent[] = [
+        {
+          type: "conversation.utterance",
+          delivery: { to: aid, speaker: npcId, utteranceId: "utt_alias_1", mode: "addressed", channels: ["content"], content: "严守一，记一下" },
+        },
+        { type: "conversation.committed", sessionId: "conv_1", turn: 1, proposals: [], state: unknownNpcState(rid, aid, npcId) },
+      ];
+      return fakeConversationHost({ events }).host;
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/rooms/${roomId}/conversation/turns`,
+      headers: { "x-user-id": "u_owner" },
+      payload: { actorId, clientTurnId: "alias-unlock-1", targetNpcId: npcId, input: "你叫什么" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((await deps.store.snapshot(roomId)).entities[npcId]!.attrs.knows_name).toBe(true);
+    await app.close();
+  });
 });

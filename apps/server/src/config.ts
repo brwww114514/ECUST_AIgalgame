@@ -44,6 +44,8 @@ export interface ServerConfig {
   publicOrigin?: string;
   /** 一次性重置凭证有效期（分钟），默认 15 */
   resetTtlMin?: number;
+  /** 单次历史/事件响应的最大行数（GALGAME_HISTORY_LIMIT_MAX，默认 200；更早的历史靠游标翻页） */
+  historyLimitMax?: number;
   /**
    * 调试面板口令（GALGAME_DEBUG_PASSPHRASE）。未配置 = 调试端点整体不注册。
    * 只从环境变量读，绝不写进代码/仓库；用于首页快捷键解锁只读调试视图。
@@ -115,6 +117,7 @@ export function loadConfig(): ServerConfig {
     trustProxy: env("GALGAME_TRUST_PROXY", "0") === "1",
     publicOrigin: env("GALGAME_PUBLIC_ORIGIN", "") || undefined,
     resetTtlMin: Math.max(1, Number(env("GALGAME_RESET_TTL_MIN", "15")) || 15),
+    historyLimitMax: Math.max(1, Number(env("GALGAME_HISTORY_LIMIT_MAX", "200")) || 200),
     debugPassphrase: env("GALGAME_DEBUG_PASSPHRASE", "") || undefined,
     audit: {
       // 审核器必须独立配置：不继承主模型端点/key（否则等于同一家模型自己审自己），

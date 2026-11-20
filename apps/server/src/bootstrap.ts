@@ -242,7 +242,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   // 续玩（issue #7）：历史和存档索引都是"投影"，写失败不影响已提交的回合。
   // 历史挂在 Turn 外层（而不是 HTTP 路由里），这样 map.travel 这类内部回合也能被记录。
   const dataRoot = path.resolve(cfg.dataDir);
-  const history = new TurnHistory(path.join(dataRoot, "history"));
+  const history = new TurnHistory(path.join(dataRoot, "history"), cfg.historyLimitMax ?? 200);
   const saves = new SaveIndex(path.join(dataRoot, "users"));
   const users = new AuthStore(path.join(dataRoot, "auth", "auth.json"));
   await users.load();
@@ -432,6 +432,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
     impressions,
     worldRoom,
     adminToken: cfg.adminToken,
+    historyLimitMax: cfg.historyLimitMax ?? 200,
     history,
     saves,
     auth,

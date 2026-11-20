@@ -12,6 +12,7 @@ import MiniMap from "./MiniMap.tsx";
 import { getMap } from "./api.ts";
 import type { MapView } from "./api.ts";
 import { planNpcTalk } from "./npc-presence.ts";
+import { validateUtteranceDraft } from "./conversation-api.ts";
 import type { UtteranceDraft, UtteranceModeInfo } from "./conversation-api.ts";
 import { phaseLabel } from "./ui.ts";
 import type { Line, LineKind } from "./ui.ts";
@@ -186,6 +187,18 @@ export default function ChatPanel({
   };
 
   const stats = (Object.values(panels ?? {})[0] ?? []).slice(0, 4);
+
+  // v2 demo：当前说话类型与本地校验（规则对齐引擎 delivery.ts，避免用户第一次点就吃 E_SCHEMA_INVALID）
+  const v2Active = Boolean(v2Modes && v2Modes.length > 0 && onSendUtterance);
+  const currentMode = v2Modes?.find((m) => m.id === mode);
+  const draft = {
+    mode,
+    ...(talking ? { target: talking.id } : {}),
+    ...(currentMode?.contentless ? {} : { content: input }),
+    ...(action ? { action } : {}),
+  };
+  const v2Check = v2Active && v2Modes ? validateUtteranceDraft(draft, v2Modes) : { ok: true };
+  const submitDisabled = busy || !state || !v2Check.ok;
 
   return (
     <div className="world-page">
@@ -374,7 +387,7 @@ export default function ChatPanel({
         )}
 
         {/* v2 demo：说话类型选择 + @谁（点场景里的 NPC 即 talking）。老流程无 v2Modes 时不显示 */}
-        {v2Modes && v2Modes.length > 0 && (
+        {v2Active && v2Modes && (
           <div className="v2-composer-opts">
             <label className="v2-mode">
               <span>方式</span>
@@ -386,50 +399,55 @@ export default function ChatPanel({
                 ))}
               </select>
             </label>
-            {v2Modes.find((m) => m.id === mode)?.requiresAction && (
+            {currentMode?.requiresAction && (
               <input
                 className="v2-action"
                 value={action}
                 onChange={(e) => setAction(e.target.value)}
-                placeholder="伴随动作（自然语言，可留空）"
+                placeholder="伴随动作（必填，自然语言）"
                 disabled={busy || !state}
               />
             )}
+          </div>
+        )}
+        {/* 本地校验提示：与引擎规则一致，拦在提交前，不让用户第一次点就吃后端的 E_SCHEMA_INVALID */}
+        {v2Active && !v2Check.ok && (
+          <div className="v2-hint" role="status">
+            {v2Check.reason}
           </div>
         )}
         <form
           className="composer"
           onSubmit={(e) => {
             e.preventDefault();
-            if (v2Modes && v2Modes.length > 0 && onSendUtterance) {
-              const current = v2Modes.find((m) => m.id === mode);
-              onSendUtterance({
-                mode,
-                ...(talking ? { target: talking.id } : {}),
-                ...(current?.contentless ? {} : { content: input }),
-                ...(action ? { action } : {}),
-              });
+            if (v2Active && onSendUtterance) {
+              if (!v2Check.ok) return;
+              onSendUtterance(draft);
               setAction("");
               return;
             }
             onSend(talking ? { id: talking.id, name: talkingName } : null);
           }}
         >
-          <input
-            value={input}
-            onChange={(e) => onInput(e.target.value)}
-            placeholder={
-              v2Modes && v2Modes.length > 0
-                ? talking
-                  ? `对${talkingName}说…（自然语言）`
-                  : "公开说什么？（自然语言，点 NPC 可改为私下说）"
-                : talking
-                  ? `对${talkingName}说…`
-                  : "你要做什么？（也可以直接用 WASD 走动）"
-            }
-            disabled={busy || !state}
-          />
-          <button type="submit" disabled={busy || !state}>
+          {v2Active && currentMode?.contentless ? (
+            <input className="v2-contentless-note" value="此方式只填动作，不说话" readOnly disabled />
+          ) : (
+            <input
+              value={input}
+              onChange={(e) => onInput(e.target.value)}
+              placeholder={
+                v2Active
+                  ? talking
+                    ? `对${talkingName}说…（自然语言）`
+                    : "公开说什么？（自然语言，点 NPC 可改为私下说）"
+                  : talking
+                    ? `对${talkingName}说…`
+                    : "你要做什么？（也可以直接用 WASD 走动）"
+              }
+              disabled={busy || !state}
+            />
+          )}
+          <button type="submit" disabled={submitDisabled}>
             行动
           </button>
         </form>

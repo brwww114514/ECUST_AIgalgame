@@ -506,6 +506,10 @@ const token = scopeRef.current.current();
       setUnconfirmed(null);
       if (echo) {
         setInput("");
+        // contentless（如 signal）的正文被服务端丢弃，玩家行只该显示动作，不能拼成"对X说：<动作>"
+        const isContentless = utterance ? v2Modes.some((m) => m.id === utterance.mode && m.contentless) : false;
+        const echoChannel = isContentless ? "action" : "content";
+        const echoText = isContentless ? (utterance?.action ?? base) : text;
         // v2 的玩家行放进 convView（而不是 v1 lines），scene beat 才能按 order 锚定它
         convView.current = {
           ...convView.current,
@@ -515,7 +519,7 @@ const token = scopeRef.current.current();
               id: ++lineId,
               kind: "utterance",
               speaker: actorId,
-              parts: [{ channel: "content", text }],
+              parts: [{ channel: echoChannel, text: echoText }],
               turn: convView.current.committedTurn,
             },
           ],
@@ -594,7 +598,7 @@ const token = scopeRef.current.current();
         }
       }
     },
-    [actorId, armListenTimer, busy, disarmListenTimer, expireSession, refreshSaves, refreshState, renderConv, roomId],
+    [actorId, armListenTimer, busy, disarmListenTimer, expireSession, refreshSaves, refreshState, renderConv, roomId, v2Modes],
   );
 
   /** v2 demo：从 ChatPanel 的选择器提交一条完整 utterance（@谁 + 方式 + 说话/行动） */

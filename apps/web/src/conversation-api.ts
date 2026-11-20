@@ -62,6 +62,27 @@ export async function fetchUtteranceModes(roomId: string, signal?: AbortSignal):
   }
 }
 
+/**
+ * 提交前的本地校验（规则与引擎 delivery.ts 的 validateUtterance 对齐，避免用户第一次点就收到 E_SCHEMA_INVALID）。
+ * - requiresTarget：未 @ 到目标 → 拦
+ * - requiresAction：whisper/signal 的动作必填 → 拦
+ * - contentless：正文会被服务端丢弃，UI 应隐藏正文框；这里不因正文为空而拦
+ * - 其余模式：正文与动作都空 → 拦（空 broadcast 是语义空洞的 utterance）
+ */
+export function validateUtteranceDraft(
+  draft: { mode: string; target?: string; content?: string; action?: string },
+  modes: UtteranceModeInfo[],
+): { ok: boolean; reason?: string } {
+  const m = modes.find((x) => x.id === draft.mode);
+  if (!m) return { ok: false, reason: "说话类型未就绪，请稍候" };
+  const content = (draft.content ?? "").trim();
+  const action = (draft.action ?? "").trim();
+  if (m.requiresTarget && !draft.target) return { ok: false, reason: "先点一位在场 NPC（此方式需要 @ 目标）" };
+  if (m.requiresAction && !action) return { ok: false, reason: "请填写伴随动作" };
+  if (!m.contentless && !content && !action) return { ok: false, reason: "请填写说话内容或动作" };
+  return { ok: true };
+}
+
 export interface ConversationStreamHandlers {
   onEvent?: (ev: ConversationEvent) => void;
   onError?: (code: string, message: string, retryable?: boolean) => void;

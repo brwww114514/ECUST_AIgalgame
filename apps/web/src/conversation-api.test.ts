@@ -9,6 +9,7 @@ import {
   isConversationAvailable,
   runConversationTurn,
   runConversationUtterance,
+  validateUtteranceDraft,
 } from "./conversation-api.ts";
 import type { ConversationStreamHandlers } from "./conversation-api.ts";
 
@@ -120,6 +121,42 @@ describe("runConversationTurn 结局判定", () => {
       onError: (code, message) => calls.push(`${code}:${message}`),
     });
     expect(calls).toEqual(["E_CONV_NOT_FOUND:无会话"]);
+  });
+});
+
+describe("validateUtteranceDraft（提交前本地校验，对齐引擎 delivery.ts）", () => {
+  const modes = [
+    { id: "broadcast", label: "公开说", requiresTarget: false, requiresAction: false, contentless: false, targetPresence: "present" as const },
+    { id: "addressed", label: "对某人说", requiresTarget: true, requiresAction: false, contentless: false, targetPresence: "present" as const },
+    { id: "whisper", label: "悄悄话", requiresTarget: true, requiresAction: true, contentless: false, targetPresence: "present" as const },
+    { id: "signal", label: "不动声色", requiresTarget: true, requiresAction: true, contentless: true, targetPresence: "present" as const },
+  ];
+
+  it("P2-1 requiresTarget：没 @ 到目标就拦，有目标则放行", () => {
+    expect(validateUtteranceDraft({ mode: "addressed", content: "你好" }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "addressed", target: "npc_lin", content: "你好" }, modes).ok).toBe(true);
+  });
+
+  it("P2-2 requiresAction：whisper/signal 动作必填，纯空白也拦", () => {
+    expect(validateUtteranceDraft({ mode: "whisper", target: "npc_lin", content: "悄悄话" }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "whisper", target: "npc_lin", content: "悄悄话", action: "   " }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "whisper", target: "npc_lin", content: "悄悄话", action: "凑近压低声音" }, modes).ok).toBe(true);
+  });
+
+  it("P2-3 contentless：正文空不拦、只靠动作即可；有动作才通过", () => {
+    expect(validateUtteranceDraft({ mode: "signal", target: "npc_lin" }, modes).ok).toBe(false); // 动作仍必填
+    expect(validateUtteranceDraft({ mode: "signal", target: "npc_lin", action: "目光扫过桌面" }, modes).ok).toBe(true);
+  });
+
+  it("空 broadcast（正文与动作都空）被拦；仅动作也接受（引擎不强制正文）", () => {
+    expect(validateUtteranceDraft({ mode: "broadcast" }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "broadcast", action: "点点头" }, modes).ok).toBe(true);
+    expect(validateUtteranceDraft({ mode: "broadcast", content: "大家好" }, modes).ok).toBe(true);
+  });
+
+  it("未知模式 / 清单未就绪 → 拦，不让它带着坏 mode 发出去", () => {
+    expect(validateUtteranceDraft({ mode: "nope", content: "x" }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "broadcast", content: "x" }, []).ok).toBe(false);
   });
 });
 

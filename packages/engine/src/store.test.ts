@@ -1,5 +1,5 @@
 /** Store 的契约：日志是唯一真相，snapshot 只是缓存的投影。 */
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -146,6 +146,32 @@ describe("FileStore 读档失败不污染已载入标记（issue #7）", () => {
     return d;
   }
 
+  it.skipIf(process.getuid?.() === 0)("目录权限恢复后重新载入原日志，并接续写入", async () => {
+    const dir = await tempDir();
+    const seed = new FileStore(dir);
+    await seed.append(ROOM, [env(1, "entity.created", { entity: npc })]);
+    const store = new FileStore(dir);
+    await chmod(dir, 0o000);
+    try {
+      await expect(store.load(ROOM)).rejects.toMatchObject({ code: "EACCES" });
+      await expect(store.listRooms()).rejects.toMatchObject({ code: "EACCES" });
+    } finally {
+      await chmod(dir, 0o700);
+    }
+
+    expect(await store.load(ROOM)).toBe(1);
+    await store.append(ROOM, [env(2, "attr.changed", { entityId: npc.id, key: "stamina", to: 40 })]);
+    expect(await new FileStore(dir).events(ROOM, 1)).toMatchObject([{ seq: 1 }, { seq: 2 }]);
+  });
+
+  it("确实不存在的房间可以写入首批日志", async () => {
+    const dir = await tempDir();
+    const store = new FileStore(dir);
+    expect(await store.load(ROOM)).toBe(0);
+    await store.append(ROOM, [env(1, "entity.created", { entity: npc })]);
+    expect(await new FileStore(dir).load(ROOM)).toBe(1);
+  });
+
   it("readFile 第一次失败 → 未标记已载入；故障恢复后第二次 load 能读到真实日志", async () => {
     const dir = await tempDir();
     const file = path.join(dir, `${ROOM}.jsonl`);
@@ -169,5 +195,25 @@ describe("FileStore 读档失败不污染已载入标记（issue #7）", () => {
     expect(await store.load(ROOM)).toBe(2);
     expect(store.seq(ROOM)).toBe(2);
     expect((await store.snapshot(ROOM)).entities.npc_lin?.attrs.stamina).toBe(40);
+  });
+
+  it("目录路径不可用（ENOTDIR）时 load 与 listRooms 都上抛，不当作空房间", async () => {
+    const base = await tempDir();
+    // 用普通文件占位目录路径：readFile("<file>/room.jsonl") 与 readdir("<file>") 都稳定抛 ENOTDIR。
+    // 与 chmod 用例不同，这条不依赖"非 root"，CI 以 root 跑时仍能覆盖「非 ENOENT 必须上抛」的分支。
+    const dir = path.join(base, "not-a-dir");
+    await writeFile(dir, "not a directory", "utf8");
+
+    const store = new FileStore(dir);
+    await expect(store.load(ROOM)).rejects.toMatchObject({ code: "ENOTDIR" });
+    await expect(store.listRooms()).rejects.toMatchObject({ code: "ENOTDIR" });
+    // 读失败不能留下"已载入"幻觉：否则后续 append 会按 seq 0 续写并覆盖真实日志
+    expect(store.seq(ROOM)).toBe(0);
+
+    // 故障解除（换回真实目录）后可正常读写
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(dir);
+    await store.append(ROOM, [env(1, "entity.created", { entity: npc })]);
+    expect(await new FileStore(dir).listRooms()).toEqual([ROOM]);
   });
 });

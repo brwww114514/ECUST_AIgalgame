@@ -29,6 +29,7 @@ import { applyEvent } from "./projection.ts";
 import type { MemoryReader, OpLimits } from "./arbiter.ops.ts";
 import { validateOp } from "./arbiter.ops.ts";
 import type { EventLog } from "./store.ts";
+import { type TurnCommitEvidence, commitMarker } from "./turn.evidence.ts";
 
 /** 全部来自 docs/02 §3、03 §8 与 03 §10.4 的默认值；改这里等于改玩法手感，要同步文档 */
 export type ArbiterLimits = OpLimits & {
@@ -83,8 +84,14 @@ export function createTurnBudget(): TurnBudget {
   return { delta: new Map(), xWrites: 0, memSeq: 0 };
 }
 
-/** apply 可选参数：在 03 §2.3 的 ApplyOptions 之上加引擎内部的回合预算 */
-export type ArbiterApplyOptions = ApplyOptions & { turnBudget?: TurnBudget };
+/**
+ * apply 可选参数：在 03 §2.3 的 ApplyOptions 之上加引擎内部的回合预算与提交标记。
+ * `commitEvidence` 只在最终成功的那批 apply 落盘，标记与状态事件同批 append（issue #76）。
+ */
+export type ArbiterApplyOptions = ApplyOptions & {
+  turnBudget?: TurnBudget;
+  commitEvidence?: TurnCommitEvidence;
+};
 
 export class DefaultArbiter {
   private readonly store: EventLog;
@@ -188,6 +195,19 @@ export class DefaultArbiter {
         budget.xWrites = xBackup;
         budget.memSeq = memBackup;
         return { ok: false, mode, seq: seqBefore, applied: [], rejected: sim.rejected, events: [] };
+      }
+      // 提交标记必须是这批事件的最后一条：它的 seq 即本回合 committedSeq。
+      // 只有本批成功落盘时才带标记，失败批次不会留下"已提交"的假证据。
+      if (opts.commitEvidence && sim.events.length > 0) {
+        const seq = seqBefore + sim.events.length + 1;
+        const marker = commitMarker({ ...opts.commitEvidence, committedSeq: seq });
+        sim.events.push({
+          ...marker,
+          roomId,
+          seq,
+          ts: this.now(),
+          causedBy: cause.id,
+        });
       }
       if (sim.events.length > 0) {
         try {

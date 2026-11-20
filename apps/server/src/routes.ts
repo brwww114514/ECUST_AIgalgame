@@ -29,6 +29,8 @@ import { registerViewRoutes } from "./view.routes.ts";
 import { adminTokenOf, guardRoom } from "./room-guard.ts";
 import { AdminTokenGate, type TokenVerdict } from "./admin-token.ts";
 import { isStoreFault } from "./store-fault.ts";
+import { parseCommitEvidence } from "@galgame/engine";
+import type { TurnCommitEvidence } from "@galgame/engine";
 import { registerDebugRoutes } from "./debug.routes.ts";
 import type { DebugGate } from "./debug.ts";
 
@@ -151,6 +153,27 @@ const SSE_HEADERS = {
 
 function schemaError(message: string): GameError {
   return { ok: false, code: "E_SCHEMA_INVALID", message };
+}
+
+/**
+ * 从 EventLog 找 turn.committed 提交证据（issue #76）。
+ * 标记与状态事件同批落盘，是提交事实；坏标记跳过，绝不把未提交回合误判为已提交。
+ */
+async function findCommitEvidence(
+  store: Store,
+  roomId: string,
+  clientTurnId: string,
+  actorId?: string,
+): Promise<TurnCommitEvidence | undefined> {
+  const envs = await store.events(roomId, 0);
+  for (const env of envs) {
+    const evidence = parseCommitEvidence(env);
+    if (!evidence) continue;
+    if (evidence.clientTurnId !== clientTurnId) continue;
+    if (actorId && evidence.actorId !== actorId) continue;
+    return evidence;
+  }
+  return undefined;
 }
 
 /** 管理员鉴权失败超限：429 + Retry-After（不再暴露"这次令牌对不对"） */
@@ -1008,17 +1031,48 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     const needsHistoryIdentity = entry.state === "committed" && !entry.turnId;
     let recoveredTurn: { turnId: string; committedSeq: number } | undefined;
     // 历史按账号、角色和逻辑 ID 匹配。人工结案已提交但缺 turnId 时，仅补充查询响应。
-    if (scope && deps.history && (needsReconciliation || needsHistoryIdentity)) {
-      const line = (await deps.history.readAll(roomId)).find(
-        (l) => l.clientTurnId === clientTurnId && l.userId === userId && l.actorId === entry.actorId,
-      );
-      if (line && needsHistoryIdentity) {
-        recoveredTurn = { turnId: line.turnId, committedSeq: line.committedSeq };
-      } else if (line) {
-        const reconciled = await deps.ledger?.reconcileCommitted(scope, { turnId: line.turnId, committedSeq: line.committedSeq });
-        // 账本写失败不能伪装成"结果待核对"：玩家/运维需要区分存储故障与真的未决
-        if (reconciled && !reconciled.ok && reconciled.code === "E_STORE_FAULT") {
-          return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: reconciled.message });
+    if (scope && (needsReconciliation || needsHistoryIdentity)) {
+      // 先查 EventLog 的 turn.committed 标记（issue #76）：它与状态事件同批落盘，
+      // 即使进程在历史写入前被杀也能证明提交，避免 unconfirmed 永久卡住。
+      const evidence = deps.store ? await findCommitEvidence(deps.store, roomId, clientTurnId, entry.actorId) : undefined;
+      if (evidence) {
+        // 房间日志已提交但历史/续玩索引在崩溃时没写：用标记里的内容补历史行。
+        const exists = deps.history
+          ? (await deps.history.readAll(roomId)).some(
+              (l) => l.turnId === evidence.turnId && l.actorId === evidence.actorId,
+            )
+          : true;
+        if (!exists && deps.history) {
+          const line = {
+            formatVersion: 1 as const, roomId,
+            turnId: evidence.turnId, committedSeq: evidence.committedSeq,
+            actorId: evidence.actorId,
+            ...(userId ? { userId } : {}),
+            clientTurnId: evidence.clientTurnId,
+            input: "", narrative: evidence.narrative ?? "",
+            speakers: [], facts: evidence.facts ?? [], createdAt: Date.now(),
+          };
+          await deps.history.append(line);
+        }
+        recoveredTurn = { turnId: evidence.turnId, committedSeq: evidence.committedSeq };
+        if (needsReconciliation && scope && deps.ledger) {
+          const reconciled = await deps.ledger.reconcileCommitted(scope, recoveredTurn);
+          // 账本写失败不能伪装成"结果待核对"：玩家/运维需要区分存储故障与真的未决
+          if (!reconciled.ok && reconciled.code === "E_STORE_FAULT") {
+            return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: reconciled.message });
+          }
+        }
+      } else if (deps.history) {
+        const line = (await deps.history.readAll(roomId)).find(
+          (l) => l.clientTurnId === clientTurnId && l.userId === userId && l.actorId === entry.actorId,
+        );
+        if (line && needsHistoryIdentity) {
+          recoveredTurn = { turnId: line.turnId, committedSeq: line.committedSeq };
+        } else if (line) {
+          const reconciled = await deps.ledger?.reconcileCommitted(scope, { turnId: line.turnId, committedSeq: line.committedSeq });
+          if (reconciled && !reconciled.ok && reconciled.code === "E_STORE_FAULT") {
+            return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: reconciled.message });
+          }
         }
       }
     }

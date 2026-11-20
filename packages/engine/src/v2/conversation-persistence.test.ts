@@ -203,6 +203,51 @@ describe("issue #90：会话快照跨重启恢复", () => {
     expect(await loadSnapshot(file)).toEqual({ ok: false, reason: "invalid" });
     expect(host.restoreSessions({ version: 1, sessions: "bad" })).toMatchObject({ degraded: true });
   });
+
+  it("#123 P1-1：幂等缓存随快照跨重启恢复，同 clientTurnId 原样重放不生成新回合", async () => {
+    const store1 = new EventSourcedStore({ worldId: "w1", locId: GATE });
+    seed(store1);
+    const { host: h1 } = await makeHost(store1, [speak("utt_replay", "第一回合"), think("第一回合心想")], { t: 1000 });
+    const s1 = await h1.open({ roomId: ROOM, participants: [PLR, LIN, MA] });
+    const input = { clientTurnId: "turn-replay", utterance: { id: "utt_replay", speaker: PLR, mode: "broadcast" as const, content: "第一回合" } };
+    const first = await collect(h1.run(s1.id, input));
+    expect(first.some((e) => e.type === "conversation.committed" && e.turn === 1)).toBe(true);
+    expect(h1.hasCommitted(s1.id, PLR, "turn-replay")).toBe(true);
+
+    const snap = h1.exportSessions(ROOM);
+    expect(snap.seen?.length).toBeGreaterThan(0); // 快照真的带上了 seen
+    const dir = await mkdtemp(path.join(os.tmpdir(), "dsh-conv-"));
+    const file = sessionSnapshotPath(dir, ROOM);
+    await saveSnapshot(file, snap);
+    const loaded = await loadSnapshot(file);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+
+    const store2 = new EventSourcedStore({ worldId: "w1", locId: GATE });
+    seed(store2);
+    const { host: h2, llm: llm2 } = await makeHost(store2, [speak("utt_should_not_run", "不该出现"), think("不该出现")], { t: 1000 });
+    expect(h2.restoreSessions(loaded.snapshot, ROOM)).toMatchObject({ restored: 1, degraded: false });
+    expect(h2.hasCommitted(s1.id, PLR, "turn-replay")).toBe(true);
+
+    const retry = await collect(h2.run(s1.id, input));
+    expect(retry).toEqual(first); // 原样缓存：事件、turn 全等
+    expect(llm2.calls).toBe(0); // 没调模型 → 没生成新回合 → 不会出现未计费的重复落库
+    expect(retry.filter((e) => e.type === "conversation.committed").map((e) => e.type === "conversation.committed" ? e.turn : -1)).toEqual([1]);
+  });
+
+  it("#123 P1-5：房间 B 坏档只降级 B，不关掉房间 A 已恢复的 open 会话", async () => {
+    const store = new EventSourcedStore({ worldId: "w1", locId: GATE });
+    seed(store);
+    const { host } = await makeHost(store, [], { t: 1000 });
+    const a = await host.open({ roomId: ROOM, participants: [PLR, LIN, MA] });
+    expect(host.get(a.id)?.status).toBe("open");
+
+    // 模拟 bootstrap 顺序：A 快照正常恢复 → B 坏档解析失败
+    const bad = host.restoreSessions({ version: 1, sessions: "bad" }, "room_bad");
+    expect(bad).toMatchObject({ restored: 0, degraded: true, reason: "invalid" });
+    expect(host.get(a.id)?.status).toBe("open"); // A 不能被 B 的坏档连带关闭
+    expect(host.getByRoom(ROOM)?.id).toBe(a.id); // 仍可被路由层 getByRoom 复用
+  });
 });
 
 describe("issue #90：MessageIndex rebuild 幂等 / msg.sent 回放不重复", () => {

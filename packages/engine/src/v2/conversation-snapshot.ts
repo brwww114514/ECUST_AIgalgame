@@ -61,10 +61,21 @@ const sessionSchema = z.object({
   visibility: z.enum(["private", "scene", "public"]),
 });
 
+/**
+ * #123 P1-1：幂等缓存按会话一并持久化。
+ * events 用 z.unknown() 是因为它们已在提交时按 ConversationEvent 强类型构造过，
+ * 这里的 zod 只负责识别文件损坏/版本漂移；读出后由 host 内部再收窄为目标类型。
+ */
+const seenEntrySchema = z.object({
+  key: z.string(),
+  events: z.array(z.unknown()),
+});
+
 export const conversationSnapshotSchema = z.object({
   version: z.literal(1),
   savedAt: z.number().optional(),
   sessions: z.array(sessionSchema),
+  seen: z.array(seenEntrySchema).optional(),
 });
 
 export type ConversationSnapshot = z.infer<typeof conversationSnapshotSchema>;
@@ -74,6 +85,8 @@ export interface RestoreResult {
   /** true = 快照缺失/坏档/版本不符，已降级：旧会话 closed，改由调用方 open() 新会话 */
   degraded: boolean;
   sessions: string[];
+  /** 降级原因，供调用方打日志；"invalid"=解析失败，"mismatched-room"=会话房间不符 */
+  reason?: "invalid" | "mismatched-room";
 }
 
 export type LoadSnapshotResult =

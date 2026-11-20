@@ -126,25 +126,52 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     return found;
   }
 
+  /**
+   * #123 P1-1：从幂等 key 里取出 sessionId。key 形如 JSON.stringify([sessionId, actorId, clientTurnId])，
+   * 只在本 host 内部写入；解析失败即跳过，不让坏 key 影响导出/恢复。
+   */
+  private seenSessionId(key: string): string | undefined {
+    try {
+      const parsed: unknown = JSON.parse(key);
+      if (Array.isArray(parsed) && typeof parsed[0] === "string") return parsed[0];
+    } catch {
+      // 非本 host 写入的 key，忽略
+    }
+    return undefined;
+  }
+
   /** 导出会话快照（深拷贝，不写文件；落盘由调用方负责，见 conversation-snapshot.ts） */
   exportSessions(roomId?: RoomId): ConversationSnapshot {
     const sessions = [...this.sessions.values()]
       .filter((s) => !roomId || s.roomId === roomId)
       .map((s) => structuredClone(s));
-    return { version: 1, savedAt: this.deps.now?.() ?? Date.now(), sessions };
+    // #123 P1-1：幂等缓存与会话一起持久化，否则重启后同 clientTurnId 会生成新回合且不计费。
+    // 按房间导出时只带该房间会话的 key，避免跨房串缓存。
+    const exportedIds = new Set(sessions.map((s) => s.id));
+    const seen = [...this.seen.entries()]
+      .filter(([key]) => {
+        const sid = this.seenSessionId(key);
+        return sid !== undefined && exportedIds.has(sid);
+      })
+      .map(([key, events]) => ({ key, events: events.map((e) => structuredClone(e)) }));
+    return { version: 1, savedAt: this.deps.now?.() ?? Date.now(), sessions, seen };
   }
 
   /**
-   * 导入快照（重启恢复）。坏档/版本不符 → 降级：当前会话全部 closed，调用方须 open() 新会话。
+   * 导入快照（重启恢复）。坏档/版本不符 → 降级：目标房间的会话 closed，调用方须 open() 新会话。
    * 同 id 已存在则跳过（重复导入幂等）；turn 达上限的会话强制 closed。
    * #106：显式校验快照里的 session.roomId 与当前房间一致——不一致直接跳过并计入 degraded，
    * 防止把别的房间的会话挂进当前 host（若 snapshot 文件被串房间写入时 fail-closed）。
+   * #123 P1-5：坏档只影响传入的 roomId，绝不连带关掉其他房间已恢复的 open 会话。
+   * #123 P1-1：快照里的幂等缓存随会话一并恢复，保证重启后同 clientTurnId 真重放。
    */
   restoreSessions(raw: unknown, roomId?: RoomId): RestoreResult {
     const parsed = conversationSnapshotSchema.safeParse(raw);
     if (!parsed.success) {
-      for (const s of this.sessions.values()) s.status = "closed";
-      return { restored: 0, degraded: true, sessions: [] };
+      for (const s of this.sessions.values()) {
+        if (!roomId || s.roomId === roomId) s.status = "closed";
+      }
+      return { restored: 0, degraded: true, sessions: [], reason: "invalid" };
     }
     const restored: string[] = [];
     let mismatched = false;
@@ -158,8 +185,35 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       if (Number.isFinite(n) && n > this.nextId) this.nextId = n;
       restored.push(s.id);
     }
+    // #123 P1-1：只恢复属于本次实际导入会话的 key；重复导入不覆盖内存中更新的缓存
+    const restoredIds = new Set(restored);
+    for (const entry of parsed.data.seen ?? []) {
+      const sid = this.seenSessionId(entry.key);
+      if (sid === undefined || !restoredIds.has(sid) || this.seen.has(entry.key)) continue;
+      this.seen.set(entry.key, entry.events as ConversationEvent[]);
+    }
+    this.trim(this.seen, MAX_SEEN);
     // 只要出现 roomId 不一致的会话就降级：调用方应告警/重新加载正确快照（不静默吞掉）
-    return { restored: restored.length, degraded: mismatched, sessions: restored };
+    return {
+      restored: restored.length, degraded: mismatched, sessions: restored,
+      ...(mismatched ? { reason: "mismatched-room" as const } : {}),
+    };
+  }
+
+  /**
+   * #123 P1-1：路由层据此判定「ledger 里 committed 的 clientTurnId」是否对应 host 真重放。
+   * 只有幂等缓存里确实有一条 conversation.committed，才算真重放；否则 ledger 与缓存已失配，
+   * 不能放行（否则会生成未计费的新回合）。
+   */
+  hasCommitted(sessionId: Id, actorId: string, clientTurnId: string): boolean {
+    const key = JSON.stringify([sessionId, actorId, clientTurnId]);
+    return this.seen.get(key)?.some((e) => e.type === "conversation.committed") ?? false;
+  }
+
+  /** 同上，但按房间取当前可续聊会话后判定；路由层在 openOrReuse 之前拿不到 sessionId */
+  hasCommittedByRoom(roomId: RoomId, actorId: string, clientTurnId: string): boolean {
+    const s = this.getByRoom(roomId);
+    return s ? this.hasCommitted(s.id, actorId, clientTurnId) : false;
   }
 
   /** 插话超时恢复；返回被恢复的会话 id（保留旧签名供 server tick 使用） */

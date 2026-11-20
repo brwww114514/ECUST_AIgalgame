@@ -131,6 +131,11 @@ function fakeConversationHost(opts: {
       return session;
     },
     get(id: string): ConversationSessionV2 | undefined { return sessions.get(id); },
+    // #123：路由层 openOrReuse 在 Map miss 时回退 getByRoom；reserve 时用 hasCommittedByRoom 确认真重放
+    getByRoom(roomId: string): ConversationSessionV2 | undefined {
+      return [...sessions.values()].filter((s) => s.roomId === roomId && s.status === "open").at(-1);
+    },
+    hasCommittedByRoom(): boolean { return false; },
     close(id: string): boolean {
       closed.push(id);
       const s = sessions.get(id);

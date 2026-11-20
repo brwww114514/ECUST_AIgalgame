@@ -576,7 +576,16 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
 
     const openOrReuse = async (roomId: string, actorId: string, state: WorldState) => {
       const cached = sessions.get(roomId);
-      const session = cached ? host.get(cached) : undefined;
+      let session = cached ? host.get(cached) : undefined;
+      if (!(session && session.roomId === roomId && session.status === "open")) {
+        // #123 P0-C：进程内 Map 在重启后必然为空，但 bootstrap 已把快照恢复进 host。
+        // 这里回退到 host.getByRoom，否则恢复的会话成孤儿、被新 open 的 conv 覆盖。
+        const restored = host.getByRoom(roomId);
+        if (restored && restored.roomId === roomId && restored.status === "open") {
+          session = restored;
+          sessions.set(roomId, restored.id);
+        }
+      }
       if (session && session.roomId === roomId && session.status === "open") {
         // #104：复用时 participants 以 host 内会话为准（这里不重算/不覆盖），
         // 后续回合的可见性投影读 host.get(sessionId).participants，而非本函数的入参快照。
@@ -630,8 +639,18 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
           dailyLimit, actionsEnabled: settings?.actionsEnabled ?? true,
         });
         if (!reserved.ok) {
-          // 已 committed 的同 ID 重放：host 会原样回缓存事件，不调用模型 → 不重复计费、不重复结算
-          if (reserved.code === "E_PRECONDITION" && reserved.committedSeq !== undefined) return true;
+          if (reserved.code === "E_PRECONDITION" && reserved.committedSeq !== undefined) {
+            // #123 P1-1：ledger 说 committed 还不够——必须 host 幂等缓存里真有这条提交才算重放。
+            // 快照丢失/崩溃窗口下 host 已无该 key：此时放行会生成新回合并且不计费（P1-1 原 bug），
+            // 因此 fail-closed 返回 409，让客户端换新 clientTurnId 重试。
+            if (host.hasCommittedByRoom(roomId, actorId, body.clientTurnId)) return true;
+            reply.code(409).send({
+              ok: false, code: "E_PRECONDITION",
+              message: "该 clientTurnId 已提交但会话缓存已失效，请使用新的 clientTurnId 重试",
+              committedSeq: reserved.committedSeq,
+            });
+            return false;
+          }
           const status = reserved.code === "E_RATE_LIMITED" ? 429 : 409;
           reply.code(status).send({ ok: false, code: reserved.code, message: reserved.message, ...(reserved.committedSeq !== undefined ? { committedSeq: reserved.committedSeq } : {}) });
           return false;

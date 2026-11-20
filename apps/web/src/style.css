@@ -967,3 +967,22 @@ dl { margin:0; } .row { display:flex; justify-content:space-between; font-size:1
 .inbox-row select { flex:0 0 160px; }
 .inbox-row input:focus, .inbox-row select:focus { border-color:#42506f; }
 .inbox-row .btn { flex:none; }
+
+/* ---------------------------------------------------------------- 收件箱手机适配（只覆盖 .inbox-*，不改游戏主界面/标题页） */
+@media (max-width: 720px) {
+  .inbox-list { padding:12px; gap:8px; }
+  /* 气泡满宽，长正文强制任意处换行，避免撑破视口 */
+  .inbox-msg { width:100%; max-width:100%; padding:10px 12px; }
+  .inbox-msg-head { gap:6px; font-size:12px; }
+  .inbox-msg-head time { flex-basis:100%; margin-left:0; text-align:right; }
+  .inbox-msg-body { overflow-wrap:anywhere; }
+  .inbox-reply-btn { min-height:44px; padding:0 16px; }
+  .inbox-notice { margin:0 12px 8px; }
+  .inbox-composer { padding:10px 12px 12px; gap:8px; }
+  .inbox-replying { flex-wrap:wrap; }
+  .inbox-replying .btn { min-height:44px; padding:0 16px; }
+  /* composer 换行：收件人/正文/发送按钮各占一整行，触摸目标 ≥44px */
+  .inbox-row { flex-wrap:wrap; }
+  .inbox-row select, .inbox-row input { flex:1 1 100%; min-height:44px; }
+  .inbox-row .btn { flex:1 1 100%; min-height:44px; }
+}

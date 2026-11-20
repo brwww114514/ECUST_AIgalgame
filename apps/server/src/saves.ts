@@ -94,7 +94,9 @@ export class SaveIndex {
   touch(userId: string, roomId: string, turnId: string, committedSeq: number): Promise<boolean> {
     return this.mutate(userId, (file) => {
       const entry = file.saves.find((s) => s.roomId === roomId);
-      if (!entry || committedSeq < entry.lastCommittedSeq) return false;
+      // 严格前进才推进：相同 seq 是同一回合的重放（重试/重复回调），不刷新 updatedAt，
+      // 否则「我的存档」的排序会被无意义的重复提交搅动。
+      if (!entry || committedSeq <= entry.lastCommittedSeq) return false;
       entry.lastTurnId = turnId;
       entry.lastCommittedSeq = committedSeq;
       entry.updatedAt = this.now();

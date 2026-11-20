@@ -54,6 +54,19 @@ describe("SaveIndex", () => {
     expect(list[0]).toMatchObject({ lastTurnId: "t1", lastCommittedSeq: 5, updatedAt: 900 });
   });
 
+  it("touch 相同 seq 视为重放：返回 false，不刷新 updatedAt，也不改回合 ID", async () => {
+    let now = 900;
+    const index = new SaveIndex(tempDir("galgame-saves-replay-"), () => now);
+    await index.upsert("u_a", entry());
+    expect(await index.touch("u_a", "room_a", "t1", 5)).toBe(true);
+    now = 950;
+    // 重放同一回合（客户端重试 / 重复回调）：游标已在该 seq，不应把存档当成"刚更新过"
+    expect(await index.touch("u_a", "room_a", "t1", 5)).toBe(false);
+    expect((await index.list("u_a"))[0]).toMatchObject({
+      lastTurnId: "t1", lastCommittedSeq: 5, updatedAt: 900,
+    });
+  });
+
   it("按 userId 隔离：u_b 看不到 u_a 的存档；remove 只删自己的", async () => {
     const index = new SaveIndex(tempDir("galgame-saves-iso-"));
     await index.upsert("u_a", entry());

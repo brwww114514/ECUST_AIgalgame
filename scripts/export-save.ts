@@ -13,24 +13,33 @@ import { FileStore } from "@galgame/engine";
 import { loadConfig } from "../apps/server/src/config.ts";
 import { SaveIndex } from "../apps/server/src/saves.ts";
 import { buildArchive } from "../apps/server/src/save-archive.ts";
+import { assertSafeArchiveOut, boolFlag, parseCliArgs, requireArg } from "./cli-args.ts";
 
-const args = new Map<string, string>();
-for (let i = 2; i < process.argv.length; i++) {
-  const a = process.argv[i]!;
-  if (a.startsWith("--")) args.set(a.slice(2), process.argv[i + 1]?.startsWith("--") ? "" : (process.argv[++i] ?? ""));
-}
+const USAGE = "用法: npx tsx scripts/export-save.ts --room <roomId> [--data-dir data] [--out <file>] [--user <userId>] [--dry-run[=true|false]] [--json]";
 
-const roomId = args.get("room");
-if (!roomId) {
-  console.error("用法: npx tsx scripts/export-save.ts --room <roomId> [--data-dir data] [--out <file>] [--user <userId>] [--dry-run] [--json]");
+let args: Map<string, string>;
+let roomId: string;
+let dataDir: string;
+let out: string;
+let dryRun: boolean;
+let jsonOut: boolean;
+let userId: string | undefined;
+try {
+  args = parseCliArgs(process.argv, ["room", "data-dir", "out", "user", "dry-run", "json"]);
+  roomId = requireArg(args, "room");
+  const cfg = loadConfig();
+  dataDir = path.resolve(args.get("data-dir") ?? cfg.dataDir);
+  out = path.resolve(args.get("out") ?? path.join(dataDir, "archives", `${roomId}.json`));
+  // P1-F：拒绝把归档写到权威事件日志上（mkdir + rename 会整份覆盖房间日志）
+  assertSafeArchiveOut(dataDir, out);
+  dryRun = boolFlag(args, "dry-run");
+  jsonOut = boolFlag(args, "json");
+  userId = args.get("user");
+} catch (e) {
+  console.error(`[export-save] ${e instanceof Error ? e.message : String(e)}`);
+  console.error(USAGE);
   process.exit(2);
 }
-
-const cfg = loadConfig();
-const dataDir = path.resolve(args.get("data-dir") ?? cfg.dataDir);
-const out = path.resolve(args.get("out") ?? path.join(dataDir, "archives", `${roomId}.json`));
-const dryRun = args.has("dry-run");
-const userId = args.get("user");
 
 try {
   const store = new FileStore(path.join(dataDir, "rooms"));
@@ -64,7 +73,7 @@ try {
     checksum: archive.checksum, savedAt: archive.savedAt,
     saveIndexUser: userId ?? null, out, dryRun,
   };
-  if (args.has("json")) console.log(JSON.stringify(summary, null, 2));
+  if (jsonOut) console.log(JSON.stringify(summary, null, 2));
   else {
     console.log(`[export-save] ${roomId}: ${archive.eventCount} 条事件，seq=${archive.seq}，${archive.checksum}`);
     console.log(`  schemaVersion=${archive.schemaVersion} contractVersion=${archive.contractVersion}`);

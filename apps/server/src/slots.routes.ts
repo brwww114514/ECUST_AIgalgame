@@ -36,7 +36,7 @@ export function registerSlotsRoutes(app: FastifyInstance, deps: AppDeps, helpers
     }
     const result = deps.saves
       ? await deps.saves.putSlot(userId, {
-          label: body.label, roomId: body.roomId,
+          label: body.label, roomId: body.roomId, createOnly: true,
           ...(body.slotId !== undefined ? { slotId: body.slotId as string } : {}),
         })
       : { ok: false as const, code: "E_STORE_FAULT" as const };

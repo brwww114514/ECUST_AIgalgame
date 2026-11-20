@@ -82,4 +82,18 @@ describe("历史单次响应上限（issue #100）", () => {
     process.env.GALGAME_HISTORY_LIMIT_MAX = "garbage";
     expect(loadConfig().historyLimitMax).toBe(200);
   });
+
+  it("PR #123 边界：0 / 负数 / 小数 / NaN / Infinity 都不再产生 NaN 或无上限", () => {
+    clearAudit();
+    for (const raw of ["0", "-5", "garbage", "NaN", "Infinity", ""]) {
+      process.env.GALGAME_HISTORY_LIMIT_MAX = raw;
+      expect(loadConfig().historyLimitMax, raw).toBe(200);
+    }
+    process.env.GALGAME_HISTORY_LIMIT_MAX = "3.7";
+    expect(loadConfig().historyLimitMax).toBe(3);
+    process.env.GALGAME_HISTORY_LIMIT_MAX = "1";
+    expect(loadConfig().historyLimitMax).toBe(1);
+    process.env.GALGAME_HISTORY_LIMIT_MAX = " 12 ";
+    expect(loadConfig().historyLimitMax).toBe(12);
+  });
 });

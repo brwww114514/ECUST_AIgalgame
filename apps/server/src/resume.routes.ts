@@ -10,6 +10,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import type { WorldState } from "../../../packages/shared/src/contract/types.ts";
 import type { AppDeps } from "./routes.ts";
 import { guardRoom } from "./room-guard.ts";
+import { clampLimit } from "./limit.ts";
 import { maskNamesDeep, unknownPlaceholders } from "./view-names.ts";
 
 /** 从 routes.ts 注入，避免 routes ↔ resume.routes 的运行时循环依赖 */
@@ -76,13 +77,13 @@ export function registerResumeRoutes(app: FastifyInstance, deps: AppDeps, helper
     if (exact && !match) {
       return reply.code(400).send({ ok: false, code: "E_SCHEMA_INVALID", message: "精确查询历史需要同时提供 turnId 和 actorId" });
     }
-    const limit = Number(query.limit ?? 50);
+    const limit = clampLimit(query.limit, deps.historyLimitMax ?? 200, 50);
     const page = deps.history
       ? await deps.history.list(roomId, {
           match,
           ...(query.fromTurn ? { fromTurn: query.fromTurn } : {}),
           ...(query.before ? { before: query.before } : {}),
-          limit: Number.isFinite(limit) ? limit : 50,
+          limit,
         })
       : { lines: [], lastCommittedSeq: 0, hasEarlier: false };
     // 历史按当前认识状态脱敏。精确查询的两个标识由调用方提供，可原样返回供核对。

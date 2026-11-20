@@ -11,22 +11,27 @@ import { FileStore } from "@galgame/engine";
 import { loadConfig } from "../apps/server/src/config.ts";
 import { SaveIndex } from "../apps/server/src/saves.ts";
 import { importArchive, inspectArchive, planImport } from "../apps/server/src/save-archive.ts";
+import { boolFlag, parseCliArgs, requireArg } from "./cli-args.ts";
 
-const args = new Map<string, string>();
-for (let i = 2; i < process.argv.length; i++) {
-  const a = process.argv[i]!;
-  if (a.startsWith("--")) args.set(a.slice(2), process.argv[i + 1]?.startsWith("--") ? "" : (process.argv[++i] ?? ""));
-}
+const USAGE = "用法: npx tsx scripts/import-save.ts --file <archive.json> [--data-dir data] [--dry-run[=true|false]] [--json]";
 
-const file = args.get("file");
-if (!file) {
-  console.error("用法: npx tsx scripts/import-save.ts --file <archive.json> [--data-dir data] [--dry-run] [--json]");
+let args: Map<string, string>;
+let file: string;
+let dataDir: string;
+let dryRun: boolean;
+let jsonOut: boolean;
+try {
+  args = parseCliArgs(process.argv, ["file", "data-dir", "dry-run", "json"]);
+  file = requireArg(args, "file");
+  const cfg = loadConfig();
+  dataDir = path.resolve(args.get("data-dir") ?? cfg.dataDir);
+  dryRun = boolFlag(args, "dry-run");
+  jsonOut = boolFlag(args, "json");
+} catch (e) {
+  console.error(`[import-save] ${e instanceof Error ? e.message : String(e)}`);
+  console.error(USAGE);
   process.exit(2);
 }
-
-const cfg = loadConfig();
-const dataDir = path.resolve(args.get("data-dir") ?? cfg.dataDir);
-const dryRun = args.has("dry-run");
 
 try {
   let raw: unknown;
@@ -60,7 +65,7 @@ try {
       targetSeq: seq + (plan.action === "noop" ? 0 : plan.toAppend.length),
       checksum: checked.archive.checksum, dryRun: true,
     };
-    console.log(args.has("json") ? JSON.stringify(summary, null, 2)
+    console.log(jsonOut ? JSON.stringify(summary, null, 2)
       : `[import-save] 演练：${summary.action}，将追加 ${summary.wouldAppend} 条到 seq=${summary.targetSeq}（未写盘）`);
     process.exit(0);
   }
@@ -76,7 +81,7 @@ try {
     console.error(`[import-save] 导入失败（${result.code}）：${result.message}`);
     process.exit(2);
   }
-  if (args.has("json")) console.log(JSON.stringify(result, null, 2));
+  if (jsonOut) console.log(JSON.stringify(result, null, 2));
   else {
     console.log(`[import-save] ${result.roomId}: ${result.action}，追加 ${result.appended} 条，seq=${result.seq}，${result.checksum}`);
     if (result.saveIndexRestored) console.log("  存档索引快照已恢复");

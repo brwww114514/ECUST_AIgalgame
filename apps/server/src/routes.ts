@@ -23,6 +23,7 @@ import type { TurnLedger } from "./quota.ts";
 import type { AdminLog } from "./admin-log.ts";
 import { makeRoomExists } from "./room-exists.ts";
 import { isSafeRoomId } from "../../../packages/engine/src/store.ts";
+import { clampLimit } from "./limit.ts";
 import { EMPTY_SCENARIOS } from "./scenarios.ts";
 import type { ScenarioCatalog } from "./scenarios.ts";
 import { registerViewRoutes } from "./view.routes.ts";
@@ -842,7 +843,7 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     const access = await guardRoom(req, reply, deps, roomId, userIdOf, viewer ? { actorId: viewer } : {});
     if (!access) return reply;
     const from = Number(q.fromSeq ?? 0);
-    const limit = Math.min(Number(q.limit ?? (deps.historyLimitMax ?? 200)), deps.historyLimitMax ?? 200);
+    const limit = clampLimit(q.limit, deps.historyLimitMax ?? 200);
     const allEvents = await deps.store.events(roomId, from, limit);
     // dev/v2：msg.sent 带 audience，玩家非收发双方连历史事件都不能读（十审 P1）
     const events = allEvents.filter((e) => {

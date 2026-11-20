@@ -11,6 +11,7 @@
 import { randomBytes } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { TURN_COMMITTED_TYPE } from "@galgame/engine";
 import { MAX_SAVES, saveFilePath, savesFileSchema } from "./saves.ts";
 import type { SaveEntry, SavesFile } from "./saves.ts";
 import type { TurnHistoryLine } from "./turn-history.ts";
@@ -45,7 +46,7 @@ interface RoomFacts {
   roomId: string;
   /** actorId → userId，来自 room.member.joined */
   owners: Map<string, string>;
-  /** 每个 committedSeq 最后一次 turn.commit 的 turnId（seq 单调） */
+  /** 每个 committedSeq 最后一次 turn.committed 的 turnId（seq 单调） */
   commits: Map<number, string>;
   createdAt: number;
 }
@@ -107,11 +108,14 @@ function parseRoom(text: string, roomId: string): RoomFacts {
         continue;
       }
       owners.set(actorId, userId);
-    } else if (env.type === "turn.commit") {
+    } else if (env.type === TURN_COMMITTED_TYPE) {
+      // 引擎自 #76 起只落 turn.committed 标记（packages/engine/src/arbiter.ts:203-215
+      // 的 commitMarker），turn.commit 只是 SSE TurnEvent，从不进 EventLog。
+      // 字段名与 packages/engine/src/turn.evidence.ts:25-33 的 payload 逐一对应。
       const turnId = record(env, ["payload", "turnId"]);
-      const seq = record(env, ["payload", "seq"]);
+      const seq = record(env, ["payload", "committedSeq"]);
       if (typeof turnId !== "string" || typeof seq !== "number" || !Number.isInteger(seq) || seq < 1) {
-        throw new Error("turn.commit 缺少合法 turnId/seq");
+        throw new Error("turn.committed 缺少合法 turnId/committedSeq");
       }
       commits.set(seq, turnId);
     }
@@ -169,7 +173,11 @@ function merge(existing: SavesFile | undefined, candidates: SaveEntry[]): SaveEn
     const old = byRoom.get(candidate.roomId);
     if (!old || candidate.lastCommittedSeq > old.lastCommittedSeq ||
         (candidate.lastCommittedSeq === old.lastCommittedSeq && candidate.updatedAt > old.updatedAt)) {
-      byRoom.set(candidate.roomId, candidate);
+      // 槽归属挂在房间上：事件日志不记 slotId，用新条目覆盖时必须把旧条目的命名槽带过去，
+      // 否则一次重建就把玩家的「主存档」命名全抹掉（P1-E）。
+      byRoom.set(candidate.roomId, old?.slotId && !candidate.slotId
+        ? { ...candidate, slotId: old.slotId }
+        : candidate);
     }
   }
   return [...byRoom.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_SAVES);
@@ -246,8 +254,15 @@ export async function rebuildSavesIndex(opts: RebuildOptions): Promise<RebuildRe
     const existing = await readExisting(opts.savesDir, userId, warn);
     const merged = merge(existing, candidates);
     report.rebuilt.set(userId, merged);
-    if (existing && JSON.stringify(existing.saves) === JSON.stringify(merged)) continue;
-    if (opts.write) await persist(saveFilePath(opts.savesDir, userId), { version: 1, userId, saves: merged }, report);
+    // 命名槽是索引的一部分：重建必须原样保留，只丢掉 roomId 已不在索引里的悬空槽。
+    const slots = (existing?.slots ?? []).filter((slot) => merged.some((s) => s.roomId === slot.roomId));
+    if (existing && JSON.stringify(existing.saves) === JSON.stringify(merged) &&
+        JSON.stringify(existing.slots ?? []) === JSON.stringify(slots)) continue;
+    const doc: SavesFile = {
+      version: 1, userId, saves: merged,
+      ...(slots.length > 0 ? { slots } : {}),
+    };
+    if (opts.write) await persist(saveFilePath(opts.savesDir, userId), doc, report);
   }
   return report;
 }

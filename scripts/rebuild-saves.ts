@@ -10,19 +10,30 @@
 import path from "node:path";
 import { loadConfig } from "../apps/server/src/config.ts";
 import { rebuildSavesIndex } from "../apps/server/src/rebuild-saves.ts";
+import { boolFlag, parseCliArgs } from "./cli-args.ts";
 
-const args = new Map<string, string>();
-for (let i = 2; i < process.argv.length; i++) {
-  const a = process.argv[i]!;
-  if (a.startsWith("--")) args.set(a.slice(2), process.argv[i + 1]?.startsWith("--") ? "" : (process.argv[++i] ?? ""));
+const USAGE = "用法: npx tsx scripts/rebuild-saves.ts [--data-dir data] [--rooms dir] [--history dir] [--saves dir] [--dry-run[=true|false]] [--json]";
+
+let args: Map<string, string>;
+let roomsDir: string;
+let historyDir: string;
+let savesDir: string;
+let dryRun: boolean;
+let jsonOut: boolean;
+try {
+  args = parseCliArgs(process.argv, ["data-dir", "rooms", "history", "saves", "dry-run", "json"]);
+  const cfg = loadConfig();
+  const dataDir = path.resolve(args.get("data-dir") ?? cfg.dataDir);
+  roomsDir = path.resolve(args.get("rooms") ?? path.join(dataDir, "rooms"));
+  historyDir = path.resolve(args.get("history") ?? path.join(dataDir, "history"));
+  savesDir = path.resolve(args.get("saves") ?? path.join(dataDir, "users"));
+  dryRun = boolFlag(args, "dry-run");
+  jsonOut = boolFlag(args, "json");
+} catch (e) {
+  console.error(`[rebuild-saves] ${e instanceof Error ? e.message : String(e)}`);
+  console.error(USAGE);
+  process.exit(2);
 }
-
-const cfg = loadConfig();
-const dataDir = path.resolve(args.get("data-dir") ?? cfg.dataDir);
-const roomsDir = path.resolve(args.get("rooms") ?? path.join(dataDir, "rooms"));
-const historyDir = path.resolve(args.get("history") ?? path.join(dataDir, "history"));
-const savesDir = path.resolve(args.get("saves") ?? path.join(dataDir, "users"));
-const dryRun = args.has("dry-run");
 
 const report = await rebuildSavesIndex({
   roomsDir,
@@ -32,7 +43,7 @@ const report = await rebuildSavesIndex({
 });
 
 const users = [...report.rebuilt.entries()].map(([userId, saves]) => ({ userId, count: saves.length }));
-if (args.has("json")) {
+if (jsonOut) {
   console.log(JSON.stringify({
     roomsScanned: report.roomsScanned,
     roomsSkipped: report.roomsSkipped,

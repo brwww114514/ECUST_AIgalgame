@@ -74,6 +74,21 @@ describe("SaveIndex 命名槽 (#98)", () => {
     expect((await index.list("u_a")).map((s) => s.roomId)).toEqual(["room_a"]);
     expect(await index.deleteSlot("u_a", "s1")).toBe(false);
   });
+
+  it("PR #123：remove() 删存档时同步清理该房间的悬空槽，别的房间槽保留", async () => {
+    const root = tempDir("galgame-slots-remove-save-");
+    const index = new SaveIndex(root, () => 500);
+    await index.upsert("u_a", entry("room_a"));
+    await index.upsert("u_a", entry("room_b"));
+    await index.putSlot("u_a", { slotId: "s_a", label: "a", roomId: "room_a" });
+    await index.putSlot("u_a", { slotId: "s_b", label: "b", roomId: "room_b" });
+    expect(await index.remove("u_a", "room_a")).toBe(true);
+    expect(await index.listSlots("u_a")).toMatchObject([{ slotId: "s_b", roomId: "room_b" }]);
+    expect((await index.list("u_a")).map((s) => s.roomId)).toEqual(["room_b"]);
+    const doc = JSON.parse(await readFile(saveFilePath(root, "u_a"), "utf8")) as { slots: { slotId: string }[] };
+    expect(doc.slots.map((s) => s.slotId)).toEqual(["s_b"]);
+    expect(await index.remove("u_a", "room_a")).toBe(false);
+  });
 });
 
 describe("命名槽 HTTP 端点 (#98)", () => {
@@ -115,6 +130,30 @@ describe("命名槽 HTTP 端点 (#98)", () => {
     const history = await wrapped.inject({ method: "GET", url: `/api/v1/rooms/${roomId}/history`, headers: h });
     expect(history.statusCode).toBe(200);
     expect(history.json()).toMatchObject({ ok: true, roomId, history: [] });
+    await wrapped.close();
+  });
+
+  it("PR #123：POST 显式带已存在 slotId → 409 E_ID_TAKEN（更新走 PUT）", async () => {
+    const cfg = testConfig();
+    const app = await createApp(cfg);
+    const wrapped = Fastify();
+    registerRoutes(wrapped, { ...app, version: "test" });
+    await wrapped.ready();
+    const h = { "X-User-Id": "u_a" };
+    const room = await wrapped.inject({ method: "POST", url: "/api/v1/rooms", headers: h,
+      payload: { mode: "solo", scenarioId: "default" } });
+    const roomId = (room.json() as { roomId: string }).roomId;
+    const first = await wrapped.inject({ method: "POST", url: "/api/v1/me/saves/slots", headers: h,
+      payload: { slotId: "s1", label: "白天线", roomId } });
+    expect(first.statusCode).toBe(201);
+    const duplicate = await wrapped.inject({ method: "POST", url: "/api/v1/me/saves/slots", headers: h,
+      payload: { slotId: "s1", label: "改名", roomId } });
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json()).toMatchObject({ ok: false, code: "E_ID_TAKEN" });
+    const updated = await wrapped.inject({ method: "PUT", url: "/api/v1/me/saves/slots/s1", headers: h,
+      payload: { label: "改名" } });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toMatchObject({ ok: true, slot: { slotId: "s1", label: "改名" } });
     await wrapped.close();
   });
 

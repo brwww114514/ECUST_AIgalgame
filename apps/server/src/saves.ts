@@ -116,7 +116,7 @@ export class SaveIndex {
    * 绑定/改绑命名槽。房间必须属于该账号（saves 里有条目）——槽不创建房间。
    * 返回业务结果而非抛错，HTTP 层按 code 映射状态。
    */
-  async putSlot(userId: string, input: { slotId?: string; label: string; roomId: string }): Promise<SlotResult<SaveSlot>> {
+  async putSlot(userId: string, input: { slotId?: string; label: string; roomId: string; createOnly?: boolean }): Promise<SlotResult<SaveSlot>> {
     const label = input.label.trim();
     if ((input.slotId !== undefined && !SLOT_ID_RE.test(input.slotId)) || !label ||
         label.length > SLOT_LABEL_MAX || !input.roomId) {
@@ -133,6 +133,12 @@ export class SaveIndex {
       }
       if (!file.saves.some((s) => s.roomId === input.roomId)) {
         result = { ok: false, code: "E_REF_NOT_FOUND" };
+        return false;
+      }
+      // docs/03 §5.2.7：POST 是"建槽"，显式带已存在 slotId 必须 E_ID_TAKEN；
+      // 更新只能走 PUT。判断放在 mutate 内（与槽表同一把串行锁），避免路由层先查后写的竞态。
+      if (existing && input.createOnly) {
+        result = { ok: false, code: "E_ID_TAKEN" };
         return false;
       }
       if (existing) {
@@ -214,12 +220,15 @@ export class SaveIndex {
     });
   }
 
-  /** 只删索引，不删房间：返回是否真的删掉了一条 */
+  /** 只删索引，不删房间：返回是否真的删掉了一条（含该房间的悬空命名槽） */
   remove(userId: string, roomId: string): Promise<boolean> {
     return this.mutate(userId, (file) => {
       const before = file.saves.length;
       file.saves = file.saves.filter((s) => s.roomId !== roomId);
-      return file.saves.length < before;
+      const slotsBefore = file.slots?.length ?? 0;
+      if (file.slots) file.slots = file.slots.filter((s) => s.roomId !== roomId);
+      const slotRemoved = (file.slots?.length ?? 0) < slotsBefore;
+      return file.saves.length < before || slotRemoved;
     });
   }
 

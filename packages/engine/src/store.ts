@@ -16,6 +16,7 @@ import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Envelope, RoomId, Store, WorldState } from "../../shared/src/contract/types.ts";
 import { applyEvent, createInitialState } from "./projection.ts";
+import { decodeRoomLog, projectRoomEvents } from "./room-log.ts";
 
 export interface StoreOptions {
   worldId?: string;
@@ -141,8 +142,6 @@ export class FileStore extends EventSourcedStore {
   private readonly loading = new Map<RoomId, Promise<void>>();
   private readonly writes = new Map<RoomId, Promise<void>>();
   private readonly dir: string;
-  /** 载入时做过修复的房间（seq 断档/重复被截断），给诊断与测试用 */
-  readonly repaired = new Set<RoomId>();
 
   constructor(dir = path.join(process.cwd(), "data", "rooms"), opts: StoreOptions = {}) {
     super(opts);
@@ -176,14 +175,7 @@ export class FileStore extends EventSourcedStore {
     return task;
   }
 
-  /**
-   * 回放文件 → 内存。遇到 seq 断档/重复时**修复而不是裸抛**：
-   * 保留能连成链的前缀，把修复后的日志写回，房间仍可继续玩（丢的是断档之后的尾部事件）。
-   *
-   * Issue #7：`loaded` 只能在**成功读取并回放**之后才置位。读失败（网络盘/占用/权限/EISDIR）
-   * 时若先置位，房间会被永久当成"已载入"：seq 假 0、后续 append 从 1 重写并覆盖真实日志。
-   * 同理，断档修复的写盘也必须在改内存之前完成，写失败时 loaded/日志保持原样、下次可重试。
-   */
+  /** 坏档保留在原位置，仅在整份日志校验与投影成功后发布缓存。 */
   private async readLog(roomId: RoomId): Promise<void> {
     let text: string;
     try {
@@ -193,48 +185,10 @@ export class FileStore extends EventSourcedStore {
       this.loaded.add(roomId);
       return;
     }
-    const parsed: Envelope[] = [];
-    for (const line of text.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const env = JSON.parse(line) as Envelope;
-        if (typeof env?.seq === "number") parsed.push(env);
-      } catch {
-        // 崩溃留下的半行：跳过而不是让整份存档读不出来
-      }
-    }
-
-    const kept: Envelope[] = [];
-    let expected = 1;
-    let broken = false;
-    for (const env of parsed) {
-      if (env.seq === expected) {
-        kept.push(env);
-        expected += 1;
-      } else {
-        broken = true; // 重复（<）或断档（>）：证据链到这里为止
-        if (env.seq > expected) break;
-      }
-    }
-
-    if (broken) {
-      // 先写回修复结果、再改内存：写盘失败时本次 load 抛错，loaded 与内存都不变，可重试
-      await this.writeAll(roomId, kept);
-      this.repaired.add(roomId);
-      if (process.env.GALGAME_DEBUG) {
-        console.error(`[store] ${roomId} 日志 seq 不连续，已截断到 seq ${kept.length}（原 ${parsed.length} 条）`);
-      }
-    }
-
-    try {
-      this.appendMemory(roomId, kept);
-    } catch (err) {
-      // 正常路径不会失败（kept 已是 seq 1 起的连续前缀）；只有出现第二个写入口才可能到这里。
-      // 清掉本次半载入，避免"内存有日志、loaded 未置位"导致重试永远 E_SEQ_GAP。
-      this.logs.delete(roomId);
-      this.states.delete(roomId);
-      throw err;
-    }
+    const events = decodeRoomLog(text, roomId);
+    const state = projectRoomEvents(this.initial(roomId), events);
+    if (events.length > 0) this.logs.set(roomId, events);
+    this.states.set(roomId, state);
     this.loaded.add(roomId);
   }
 
@@ -294,6 +248,7 @@ export class FileStore extends EventSourcedStore {
     return names
       .filter((n) => n.endsWith(".jsonl"))
       .map((n) => n.slice(0, -".jsonl".length))
+      .filter(isSafeRoomId)
       .sort();
   }
 

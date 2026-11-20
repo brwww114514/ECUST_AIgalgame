@@ -119,13 +119,19 @@ describe("FileStore（jsonl 一房间一文件）", () => {
     await expect(store.append("../pwn", [env(1, "entity.created", { entity: npc })])).rejects.toMatchObject({ code: "E_SCHEMA_INVALID" });
   });
 
-  it("崩溃留下的半行被跳过，不影响读档", async () => {
+  it("半行或有效 JSON 的坏事件均拒绝载入并保留源文件", async () => {
     const dir = await tempDir();
+    const file = path.join(dir, `${ROOM}.jsonl`);
     const good = JSON.stringify(env(1, "entity.created", { entity: npc }));
-    await writeFile(path.join(dir, `${ROOM}.jsonl`), `${good}\n{"v":1,"id":"evt_broken`, "utf8");
     const store = new FileStore(dir);
-    const snap = await store.snapshot(ROOM);
-    expect(snap.entities.npc_lin?.name).toBe("林月");
+    for (const bad of ['{"v":1', JSON.stringify(env(2, "entity.created", {}))]) {
+      const original = good + "\n" + bad;
+      await writeFile(file, original);
+      await expect(store.snapshot(ROOM)).rejects.toMatchObject({ code: "E_STORE_FAULT" });
+      expect(await readFile(file, "utf8")).toBe(original);
+    }
+    await writeFile(file, good + "\n");
+    expect((await store.snapshot(ROOM)).entities.npc_lin?.name).toBe("林月");
   });
 
   it("replay 用的是同一套 applyEvent（与内存版逐字段相等）", () => {

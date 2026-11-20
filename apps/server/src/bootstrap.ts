@@ -61,6 +61,7 @@ import { LlmSettings, loadPersistedLlmSettings } from "./settings.ts";
 import { appearanceById, loadScenarios } from "./scenarios.ts";
 import { createDebugGate } from "./debug.ts";
 import type { AppDeps } from "./routes.ts";
+import { isStoreFault } from "./store-fault.ts";
 
 interface CanonWorld {
   worldId: string;
@@ -113,6 +114,18 @@ export type App = AppDeps & {
   /** 管理操作日志 */
   adminLog: AdminLog;
 };
+
+async function loadRoomForIndex(store: FileStore, roomId: string): Promise<boolean> {
+  try {
+    await store.load(roomId);
+    return true;
+  } catch (error) {
+    if (!isStoreFault(error)) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[store] 房间 ${roomId} 暂不可读：${message}`);
+    return false;
+  }
+}
 
 export async function createApp(cfg: ServerConfig): Promise<App> {
   const contentDir = path.resolve(cfg.contentDir);
@@ -329,7 +342,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
       void (async () => {
         try {
           for (const roomId of await store.listRooms()) {
-            if (roomId === worldRoom) continue;
+            if (roomId === worldRoom || !(await loadRoomForIndex(store, roomId))) continue;
             await canonize.retireRoom(roomId);
           }
         } catch (e) {
@@ -340,20 +353,14 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
     timer.unref?.();
   }
 
-  // ---------------------------------------------------------------- 启动重建记忆索引
-  // 事件日志是唯一真源，Memory 只是投影：不重建的话，重启后所有召回为 0（审阅 P0-1/P0-3）。
-  // 房间与世界层都要重建；世界层必须单独 rebuild，因为 Turn 只 sync 自己那个房间。
-  for (const roomId of await store.listRooms()) {
-    memory.rebuild(roomId, await store.events(roomId, 0));
-  }
-  await store.load(worldRoom);
-  memory.rebuild(worldRoom, await store.events(worldRoom, 0));
-
-
-  // ---------------------------------------------------------------- dev/v2 微信私信宿主
+  // 世界层和普通房间分别回放，避免单个坏档阻断其他房间启动。
   const messageIndex = new MessageIndex();
-  for (const roomId of await store.listRooms()) {
-    messageIndex.rebuild(roomId, await store.events(roomId, 0));
+  const roomIds = new Set([...(await store.listRooms()), worldRoom]);
+  for (const roomId of roomIds) {
+    if (!(await loadRoomForIndex(store, roomId))) continue;
+    const events = await store.events(roomId, 0);
+    memory.rebuild(roomId, events);
+    messageIndex.rebuild(roomId, events);
   }
   const contentRoot = path.resolve(cfg.contentDir);
   const gossipPolicy = await loadGossipPolicy(path.join(contentRoot, "v2", "gossip-policy.json"));
@@ -420,7 +427,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
       void (async () => {
         try {
           for (const roomId of await store.listRooms()) {
-            if (roomId === worldRoom) continue;
+            if (roomId === worldRoom || !(await loadRoomForIndex(store, roomId))) continue;
             await gossip.step(roomId);
           }
         } catch (e) {

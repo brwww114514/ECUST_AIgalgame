@@ -6,6 +6,10 @@
  *   ② 玩家与 NPC 的开场 located_in / presentIds 必须真的落库；
  *   ③ solo 房 members 为空时 tick 的 playerActorId 仍应是玩家而不是 "system"。
  */
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import Fastify from "fastify";
+import { registerRoutes } from "./routes.ts";
 import { describe, expect, it } from "vitest";
 import { tempDir } from "@galgame/testkit";
 import { createApp } from "./bootstrap.ts";
@@ -26,6 +30,31 @@ function testConfig(): ServerConfig {
 }
 
 describe("bootstrap", () => {
+  it("坏档不阻断启动，访问坏房间返回存储故障，正常房间仍可读取", async () => {
+    const cfg = testConfig();
+    const original = await createApp(cfg);
+    const good = await original.createRoom("solo");
+    const bad = await original.createRoom("solo");
+    const file = path.join(cfg.dataDir, "rooms", `${bad.roomId}.jsonl`);
+    const broken = (await readFile(file, "utf8")) + '{"v":1';
+    await writeFile(file, broken);
+    await writeFile(path.join(cfg.dataDir, "rooms", "room_old.history.jsonl"), "{}\n");
+
+    const deps = await createApp(cfg);
+    const app = Fastify();
+    registerRoutes(app, deps);
+    try {
+      const failed = await app.inject({ url: `/api/v1/rooms/${bad.roomId}/state` });
+      expect(failed.statusCode).toBe(503);
+      expect(failed.json()).toMatchObject({ code: "E_STORE_FAULT" });
+      const healthy = await app.inject({ url: `/api/v1/rooms/${good.roomId}/state` });
+      expect(healthy.statusCode).toBe(200);
+      expect(await readFile(file, "utf8")).toBe(broken);
+    } finally {
+      await app.close();
+    }
+  });
+
   it("建房把玩家与 NPC 的初始位置真正写进世界", async () => {
     const deps = await createApp(testConfig());
     const { roomId, actorId } = await deps.createRoom("solo");

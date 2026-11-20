@@ -3,7 +3,7 @@
   "worldId": "ecust_campus",
   "width": 6000,
   "height": 4500,
-  "image": "/map/ecust-campus.jpg",
+  "image": "/map/campus-wide.jpg",
   "startLocId": "loc_library",
   "scenes": [
     {

@@ -5,12 +5,14 @@
  * 对话框始终在底部（叙事要一直看得见），点 NPC 之后标题变成"和谁在说话"，
  * 输入框的提示也跟着换 —— 但输入仍然是自然语言，不受对话对象限制。
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ViewPatch, WorldState } from "../../../packages/shared/src/contract/types.ts";
 import CampusMap from "./CampusMap.tsx";
+import InteriorMap from "./InteriorMap.tsx";
 import MiniMap from "./MiniMap.tsx";
 import { getMap } from "./api.ts";
 import type { MapView } from "./api.ts";
+import { interiorFor, interiorNpcSpot } from "./interior.ts";
 import { planNpcTalk } from "./npc-presence.ts";
 import { phaseLabel } from "./ui.ts";
 import type { Line, LineKind } from "./ui.ts";
@@ -89,6 +91,10 @@ export default function ChatPanel({
   const [pendingTalk, setPendingTalk] = useState<{ id: string; name: string; locId: string } | null>(null);
   const [travelling, setTravelling] = useState(false);
   const [map, setMap] = useState<MapView | null>(null);
+  /** 当前所在室内地图对应的场景 id；null = 在校园大地图 */
+  const [inside, setInside] = useState<string | null>(null);
+  /** 刚点了入口、等世界状态真的走到该场景后再切渲染 */
+  const [enteringInterior, setEnteringInterior] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
   // 是否"跟着最新一条走"：玩家往上翻历史时不打扰，回到底部附近后自动恢复跟随
   const stickRef = useRef(true);
@@ -112,6 +118,24 @@ export default function ChatPanel({
   useEffect(() => {
     setTalking(null);
   }, [pos?.locId]);
+
+  // 进室内：等 pos 真的落到该场景再切渲染，避免"人在路上就已经在馆里"
+  useEffect(() => {
+    if (!enteringInterior) return;
+    if (pos?.locId === enteringInterior) {
+      setInside(enteringInterior);
+      setEnteringInterior(null);
+      return;
+    }
+    // 传送失败或超时：清掉等待，留在原地
+    const t = window.setTimeout(() => setEnteringInterior(null), 3000);
+    return () => window.clearTimeout(t);
+  }, [enteringInterior, pos?.locId]);
+
+  // 被传送到别处（点了小地图 / 世界状态变化）：自动退出门内地图
+  useEffect(() => {
+    if (inside && pos?.locId && pos.locId !== inside) setInside(null);
+  }, [inside, pos?.locId]);
 
   // 「前往 TA 所在地」：travel 成功会推进 pos.locId，等它到位再选中目标 NPC
   useEffect(() => {
@@ -174,20 +198,41 @@ export default function ChatPanel({
 
   const stats = (Object.values(panels ?? {})[0] ?? []).slice(0, 4);
 
+  // 室内视图：当前场景是否挂了室内地图，以及馆内的 NPC（位置按索引落到馆内座位点）
+  const insideInterior = inside ? interiorFor(inside) : null;
+  const interiorNpcs = useMemo(() => {
+    if (!map || !inside) return [];
+    return map.npcs
+      .filter((n) => n.locId === inside)
+      .map((n, i) => ({ ...n, ...interiorNpcSpot(i) }));
+  }, [map, inside]);
+
   return (
     <div className="world-page">
       <div className="world-shell">
-        <CampusMap
-          map={map}
-          roomId={roomId}
-          version={version}
-          heroSrc={`/heroes/hero-${heroId}.png`}
-          talkingTo={talking?.id ?? ""}
-          busy={busy}
-          onTalk={talkTo}
-          onEnter={onEnterScene}
-        />
-
+        {insideInterior ? (
+          <InteriorMap
+            interior={insideInterior}
+            npcs={interiorNpcs}
+            heroSrc={`/heroes/hero-${heroId}-down.png`}
+            talkingTo={talking?.id ?? ""}
+            busy={busy}
+            onTalk={talkTo}
+            onExit={() => setInside(null)}
+          />
+        ) : (
+          <CampusMap
+            map={map}
+            roomId={roomId}
+            version={version}
+            heroSrc={`/heroes/hero-${heroId}-down.png`}
+            talkingTo={talking?.id ?? ""}
+            busy={busy}
+            onTalk={talkTo}
+            onEnter={onEnterScene}
+            onEnterInterior={setEnteringInterior}
+          />
+        )}
         <div className="world-hud-left">
           <MiniMap roomId={roomId} locId={pos?.locId ?? ""} onOpen={onOpenMap} />
           <div className="hud-place">

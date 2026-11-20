@@ -11,18 +11,23 @@
  * "附近有谁"这类要进 React 的状态，放在 160ms 的独立 interval 里算。
  * 这样无论父组件怎么重渲染，手上按着的键和每一帧的位移都不会被打断。
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { MapScene, MapView } from "./api.ts";
 import { fetchGallery, muttersByNpcId } from "./api-gallery.ts";
 import type { GalleryNpc } from "./api-gallery.ts";
+import { interiorFor } from "./interior.ts";
 
 const W = 6000;
 const H = 4500;
-const SCALE = 0.42;
+const SCALE = 0.62;
 const SPEED = 300;
 const ENTER_DIST = 170;
 const TALK_DIST = 140;
 const PROBE_MS = 160;
+/** 4 帧走路循环：并腿 → 迈左脚 → 并腿 → 迈右脚 */
+const WALK_SEQ = ["", "-walk1", "", "-walk2"];
+/** 每帧时长（毫秒）：4 帧约 0.6 秒一个完整步循环 */
+const STEP_MS = 150;
 
 const MOVE_KEYS = new Set(["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"]);
 
@@ -62,8 +67,10 @@ export interface CampusMapProps {
   talkingTo: string;
   busy: boolean;
   onTalk: (actorId: string, name: string) => void;
-  /** 走到某个点位旁：交给上层静默同步世界状态 */
-  onEnter: (sceneId: string) => void;
+  /** 走到某个点位旁：交给上层静默同步世界状态；返回 ok=false 时允许再次触发 */
+  onEnter: (sceneId: string) => Promise<{ ok: boolean; message?: string }> | void;
+  /** 走近带室内场景的点位（如图书馆）并点入口：进入室内地图 */
+  onEnterInterior?: (sceneId: string) => void;
 }
 
 export default function CampusMap({
@@ -75,6 +82,7 @@ export default function CampusMap({
   busy,
   onTalk,
   onEnter,
+  onEnterInterior,
 }: CampusMapProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<HTMLDivElement>(null);
@@ -113,6 +121,27 @@ export default function CampusMap({
   const onEnterRef = useRef(onEnter);
   onEnterRef.current = onEnter;
 
+  // 四方向立绘：heroSrc 指向 down 图，其余按 -up / -side / -left 推导
+  const heroBase = useMemo(
+    () => (heroSrc.endsWith("-down.png") ? heroSrc.slice(0, -"-down.png".length) : heroSrc.replace(/\.png$/, "")),
+    [heroSrc],
+  );
+  const heroImgRef = useRef<HTMLImageElement | null>(null);
+  const heroDirRef = useRef("down");
+  const heroStepRef = useRef(0);
+  const heroLastStepRef = useRef(0);
+  const heroBaseRef = useRef(heroBase);
+  heroBaseRef.current = heroBase;
+
+  // 预加载所有帧，切方向 / 换步不闪
+  useEffect(() => {
+    for (const d of ["up", "side", "left", "down-walk1", "down-walk2", "side-walk1", "side-walk2", "left-walk1", "left-walk2"]) {
+      const im = new Image();
+      im.src = `${heroBase}-${d}.png`;
+    }
+  }, [heroBase]);
+
+  const coordRef = useRef<HTMLSpanElement | null>(null);
   const nearSceneRef = useRef<string>("");
   const nearNpcRef = useRef<string>("");
   const enteredRef = useRef<string>("");
@@ -201,12 +230,44 @@ export default function CampusMap({
         cam.y += (targetY - cam.y) * 0.22;
 
         const world = worldRef.current;
-        if (world) world.style.transform = `translate3d(${-cam.x * SCALE}px, ${-cam.y * SCALE}px, 0)`;
+        if (world) world.style.transform = `translate3d(${Math.round(-cam.x * SCALE)}px, ${Math.round(-cam.y * SCALE)}px, 0)`;
         const hero = heroRef.current;
         if (hero) {
-          hero.style.transform = `translate3d(${p.x * SCALE}px, ${p.y * SCALE}px, 0)`;
+          hero.style.transform = `translate3d(${Math.round(p.x * SCALE)}px, ${Math.round(p.y * SCALE)}px, 0)`;
           // 走动时给立绘一点起伏，肉眼就能确认"人在动"
           hero.classList.toggle("walking", vx !== 0 || vy !== 0);
+          // 四方向朝向 + 走路帧：只换图，不碰 React
+          const img = heroImgRef.current;
+          if (img) {
+            const moving = vx !== 0 || vy !== 0;
+            let dir = "";
+            if (vx < 0) dir = "left";
+            else if (vx > 0) dir = "side";
+            else if (vy < 0) dir = "up";
+            else if (vy > 0) dir = "down";
+
+            let changed = false;
+            if (dir && dir !== heroDirRef.current) {
+              heroDirRef.current = dir;
+              changed = true;
+            }
+            // 4 帧走路循环：并腿 → 迈左脚 → 并腿 → 迈右脚
+            if (moving && dir && dir !== "up") {
+              if (now - heroLastStepRef.current > STEP_MS) {
+                heroLastStepRef.current = now;
+                heroStepRef.current = (heroStepRef.current + 1) % WALK_SEQ.length;
+                changed = true;
+              }
+            } else if (heroStepRef.current !== 0) {
+              heroStepRef.current = 0;
+              changed = true;
+            }
+            if (changed) {
+              const d = heroDirRef.current;
+              const suffix = d !== "up" ? WALK_SEQ[heroStepRef.current] : "";
+              img.src = `${heroBaseRef.current}-${d}${suffix}.png`;
+            }
+          }
         }
       }
       raf = requestAnimationFrame(tick);
@@ -222,6 +283,11 @@ export default function CampusMap({
       const p = posRef.current;
       const live = mapRef.current;
       if (!p || !live) return;
+
+      // 调试读数：直接改 DOM，不触发重渲染
+      if (coordRef.current) {
+        coordRef.current.textContent = `x=${Math.round(p.x)} y=${Math.round(p.y)}`;
+      }
 
       let bestScene: MapScene | null = null;
       let bestD = ENTER_DIST;
@@ -239,7 +305,17 @@ export default function CampusMap({
         setNearScene(bestScene);
         if (bestScene && bestScene.id !== live.player.locId && enteredRef.current !== bestScene.id) {
           enteredRef.current = bestScene.id;
-          onEnterRef.current(bestScene.id);
+          // 传送失败就把"已进入"标记清掉，让人还能再试一次，而不是永远卡在门口
+          const pending = onEnterRef.current(bestScene.id);
+          if (pending && typeof (pending as Promise<unknown>).then === "function") {
+            (pending as Promise<{ ok: boolean }>)
+              .then((r) => {
+                if (!r || !r.ok) enteredRef.current = "";
+              })
+              .catch(() => {
+                enteredRef.current = "";
+              });
+          }
         }
         if (!bestScene) enteredRef.current = "";
       }
@@ -285,24 +361,42 @@ export default function CampusMap({
       <div className="campus-world" ref={worldRef} style={{ width: W * SCALE, height: H * SCALE }}>
         <div
           className="campus-ground"
-          style={{ backgroundImage: `url(${map.image ?? "/map/ecust-campus.jpg"})` }}
+          style={{ backgroundImage: `url(${map.image ?? "/map/campus-wide.jpg"})` }}
         />
 
         {map.scenes.map((s) => {
           const built = s.status === "built";
           const isNear = nearScene?.id === s.id;
+          const hasInterior = built && interiorFor(s.id) !== null;
           return (
-            <button
-              type="button"
-              key={s.id}
-              className={`campus-poi${built ? "" : " planned"}${isNear ? " near" : ""}`}
-              style={{ left: s.x * SCALE, top: s.y * SCALE }}
-              title={built ? s.name : `${s.name}（${s.status === "planned" ? "规划中" : "在建"}）`}
-              onClick={() => built && onEnter(s.id)}
-            >
-              <i />
-              <span>{s.name}</span>
-            </button>
+            <Fragment key={s.id}>
+              <button
+                type="button"
+                className={`campus-poi${built ? "" : " planned"}${isNear ? " near" : ""}`}
+                style={{ left: Math.round(s.x * SCALE), top: Math.round(s.y * SCALE) }}
+                title={built ? s.name : `${s.name}（${s.status === "planned" ? "规划中" : "在建"}）`}
+                onClick={() => built && onEnter(s.id)}
+              >
+                <i />
+                <span>{s.name}</span>
+              </button>
+              {hasInterior && (
+                <button
+                  type="button"
+                  className={`campus-entry${isNear ? " near" : ""}`}
+                  style={{ left: Math.round(s.x * SCALE) + 34, top: Math.round(s.y * SCALE) - 44 }}
+                  title={`进入${s.name}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEnter(s.id);
+                    onEnterInterior?.(s.id);
+                  }}
+                >
+                  <i>进</i>
+                  <span>进入{s.name}</span>
+                </button>
+              )}
+            </Fragment>
           );
         })}
 
@@ -315,21 +409,30 @@ export default function CampusMap({
               type="button"
               key={n.id}
               className={`campus-npc${isNear ? " near" : ""}${isTalking ? " talking" : ""}`}
-              style={{ left: n.x * SCALE, top: n.y * SCALE }}
+              style={{ left: Math.round(n.x * SCALE), top: Math.round(n.y * SCALE) }}
               onClick={() => onTalk(n.id, n.name)}
               disabled={busy}
               title={`和${n.name}说话`}
             >
               {/* 走近时头顶浮一句短台词：只提示"可以聊"，不打断你走路 */}
               {isNear && !talkingTo && mutter && <span className="campus-mutter">{mutter}</span>}
-              <img src={`/portraits/${n.id}.jpg`} alt="" onError={(e) => (e.currentTarget.style.display = "none")} />
+              <img
+                src={`/portraits/npc-${n.id.replace(/^npc_/, "")}.png`}
+                alt=""
+                onError={(e) => (e.currentTarget.style.display = "none")}
+              />
               <span className="npc-name">{n.name}</span>
             </button>
           );
         })}
 
         <div className="campus-hero" ref={heroRef}>
-          <img src={heroSrc} alt="" onError={(e) => (e.currentTarget.style.display = "none")} />
+          <img
+            ref={heroImgRef}
+            src={heroSrc}
+            alt=""
+            onError={(e) => (e.currentTarget.style.display = "none")}
+          />
         </div>
       </div>
 
@@ -339,6 +442,7 @@ export default function CampusMap({
         <span className="campus-key">S</span>
         <span className="campus-key">D</span>
         <span className="campus-hint">走动</span>
+        <span className="campus-coord" ref={coordRef} />
       </div>
 
       {nearScene && (

@@ -26,16 +26,23 @@ export interface SaveEntry {
   formatVersion: 1;
 }
 
-interface SavesFile {
+export interface SavesFile {
   version: 1;
   userId: string;
   saves: SaveEntry[];
 }
 
 /** 单账号最多保留的存档数：只是索引，超了淘汰最久未更新的（房间本身不删） */
-const MAX_SAVES = 100;
+export const MAX_SAVES = 100;
 
-const savesFileSchema = z.object({
+/** 目录名：可读前缀 + sha256 前缀（单射、防穿越/撞名）。重建工具与 SaveIndex 共用。 */
+export function saveFilePath(root: string, userId: string): string {
+  const readable = userId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 24) || "u";
+  const digest = createHash("sha256").update(userId, "utf8").digest("hex").slice(0, 24);
+  return path.join(root, `${readable}-${digest}`, "saves.json");
+}
+
+export const savesFileSchema = z.object({
   version: z.literal(1),
   userId: z.string(),
   saves: z.array(z.object({
@@ -60,9 +67,7 @@ export class SaveIndex {
 
   /** 可读前缀 + sha256：既是单射（防穿越/防撞目录），又方便运维认人 */
   private file(userId: string): string {
-    const readable = userId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 24) || "u";
-    const digest = createHash("sha256").update(userId, "utf8").digest("hex").slice(0, 24);
-    return path.join(this.root, `${readable}-${digest}`, "saves.json");
+    return saveFilePath(this.root, userId);
   }
 
   async list(userId: string): Promise<SaveEntry[]> {

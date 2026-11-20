@@ -10,7 +10,7 @@ import { DEFAULT_AUDIT_POLICY, NoopAudit, formatWarning, labelOf } from "./audit
 import type { DefaultArbiter } from "./arbiter.ts";
 import type { EventLog } from "./store.ts";
 import type { TurnCommitEvidence } from "./turn.evidence.ts";
-import { StoreCommitUnknownError } from "./store-write.ts";
+import { isRoomSyncFault } from "./store-write.ts";
 
 export type AuditGateResult =
   | { kind: "ok" }
@@ -187,7 +187,7 @@ export class AuditGate {
     try {
       await this.deps.store.flush(args.roomId);
     } catch (e) {
-      if (e instanceof StoreCommitUnknownError) throw e;
+      if (isRoomSyncFault(e)) throw e;
       events.push({
         type: "turn.error",
         code: "E_STORE_FAULT",

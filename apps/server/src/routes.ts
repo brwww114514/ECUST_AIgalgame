@@ -24,7 +24,7 @@ import type { AdminLog } from "./admin-log.ts";
 import { makeRoomExists } from "./room-exists.ts";
 import { isSafeRoomId } from "../../../packages/engine/src/store.ts";
 import { clampLimit } from "./limit.ts";
-import { StoreCommitUnknownError } from "../../../packages/engine/src/store-write.ts";
+import { isRoomSyncFault, StoreCommitUnknownError } from "../../../packages/engine/src/store-write.ts";
 import { EMPTY_SCENARIOS } from "./scenarios.ts";
 import type { ScenarioCatalog } from "./scenarios.ts";
 import { registerViewRoutes } from "./view.routes.ts";
@@ -776,14 +776,15 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
         const visible = projectConversationEvents(out, actorId, members, deps.registry);
         for (const ev of visible) sseWrite(reply.raw, ev.type, maskNamesDeep(ev, placeholders));
       } catch (e) {
-        const uncertain = e instanceof StoreCommitUnknownError;
+        const roomSyncFault = isRoomSyncFault(e);
         // #104：异常路径按失败回收额度（未 committed），与 v1 /turns 的 catch 同口径；重放命中不结算
-        // #117：目录同步失败时这次写入结果待核对，记 unconfirmed 而不是 failed
+        // #117：日志可能已替换（StoreCommitUnknownError）时记 unconfirmed；房间只是被冻结则按 failed 释放
+        const uncertain = e instanceof StoreCommitUnknownError;
         if (charged && turnScope && ledger) ledger.transition(turnScope, uncertain ? "unconfirmed" : "failed");
         const err: ConversationEvent = {
-          type: "conversation.error", sessionId, code: uncertain ? "E_STORE_FAULT" : "E_MODULE_FAULT",
+          type: "conversation.error", sessionId, code: roomSyncFault ? "E_STORE_FAULT" : "E_MODULE_FAULT",
           message: e instanceof Error ? e.message : String(e),
-          ...(uncertain ? { retryable: false } : {}),
+          ...(roomSyncFault ? { retryable: false } : {}),
         };
         sseWrite(reply.raw, err.type, err);
       } finally {
@@ -1031,13 +1032,15 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     } catch (e) {
       errored = true;
       // 收到 turn.commit 后才会走到这里的旁路异常：账本保持 committed，也不给客户端可重试信号
-      const uncertain = e instanceof StoreCommitUnknownError;
-      if (!committed && turnScope) ledger?.transition(turnScope, uncertain ? "unconfirmed" : "failed");
+      const roomSyncFault = isRoomSyncFault(e);
+      if (!committed && turnScope) {
+        ledger?.transition(turnScope, e instanceof StoreCommitUnknownError ? "unconfirmed" : "failed");
+      }
       sseWrite(reply.raw, "turn.error", {
         type: "turn.error",
-        code: uncertain ? "E_STORE_FAULT" : "E_UPSTREAM",
-        message: uncertain ? e.message : String(e),
-        retryable: !committed && !uncertain,
+        code: roomSyncFault ? "E_STORE_FAULT" : "E_UPSTREAM",
+        message: roomSyncFault ? e.message : String(e),
+        retryable: !committed && !roomSyncFault,
       });
     } finally {
       reply.raw.end();

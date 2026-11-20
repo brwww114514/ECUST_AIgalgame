@@ -3,7 +3,7 @@
  * 这里只做编排：投递 → 并行 NPC 决策 → 审核 → 一次性 Proposal；不直接写状态。
  * 每个私有步骤都控制在 50 行以内（AGENTS.md §6）；runStep 只保留顺序。
  */
-import { StoreCommitUnknownError } from "../store-write.ts";
+import { isRoomSyncFault } from "../store-write.ts";
 import type { ArbiterApplyResult } from "../arbiter.ts";
 import type {
   ActorId, ConversationEvent, ConversationSessionV2, ConversationTurnInput,
@@ -247,7 +247,7 @@ async function commitStep(ctx: StepCtx, utterance?: Utterance): Promise<boolean>
   try {
     await store.flush(s.roomId);
   } catch (error) {
-    if (error instanceof StoreCommitUnknownError) throw error;
+    if (isRoomSyncFault(error)) throw error;
     throw new StoreFlushError(s.roomId, applied, deps.policy.messages.storeFlushFailed, undefined, ctx.fresh);
   }
   await finish(applied);

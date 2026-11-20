@@ -17,7 +17,7 @@ import path from "node:path";
 import type { Envelope, RoomId, Store, WorldState } from "../../shared/src/contract/types.ts";
 import { applyEvent, createInitialState } from "./projection.ts";
 import { decodeRoomLog, projectRoomEvents } from "./room-log.ts";
-import { RoomLogWriter, StoreCommitUnknownError } from "./store-write.ts";
+import { RoomLogWriter, RoomStorageBlockedError, StoreCommitUnknownError } from "./store-write.ts";
 
 export interface StoreOptions {
   worldId?: string;
@@ -142,7 +142,7 @@ export class FileStore extends EventSourcedStore {
   private readonly writes = new Map<RoomId, Promise<void>>();
   private readonly dir: string;
   private readonly writer: RoomLogWriter;
-  private readonly uncertain = new Map<RoomId, StoreCommitUnknownError>();
+  private readonly uncertain = new Map<RoomId, RoomStorageBlockedError>();
 
   constructor(dir = path.join(process.cwd(), "data", "rooms"), opts: StoreOptions = {}) {
     super(opts);
@@ -198,7 +198,7 @@ export class FileStore extends EventSourcedStore {
     } catch (error) {
       if (error instanceof StoreCommitUnknownError) {
         // 原文件可能已被替换，封住该房间，避免用内存里的旧投影继续结算。
-        this.uncertain.set(roomId, error);
+        this.uncertain.set(roomId, new RoomStorageBlockedError(error));
         console.error(`[store] 房间 ${roomId} 的提交结果待核对`, error.cause);
       }
       throw error;

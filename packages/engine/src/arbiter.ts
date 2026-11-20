@@ -30,7 +30,7 @@ import type { MemoryReader, OpLimits } from "./arbiter.ops.ts";
 import { validateOp } from "./arbiter.ops.ts";
 import type { EventLog } from "./store.ts";
 import { type TurnCommitEvidence, commitMarker } from "./turn.evidence.ts";
-import { StoreCommitUnknownError } from "./store-write.ts";
+import { isRoomSyncFault } from "./store-write.ts";
 
 /** 全部来自 docs/02 §3、03 §8 与 03 §10.4 的默认值；改这里等于改玩法手感，要同步文档 */
 export type ArbiterLimits = OpLimits & {
@@ -224,7 +224,7 @@ export class DefaultArbiter {
           budget.delta = deltaBackup;
           budget.xWrites = xBackup;
           budget.memSeq = memBackup;
-          if (e instanceof StoreCommitUnknownError) throw e;
+          if (isRoomSyncFault(e)) throw e;
           return {
             ok: false, mode, seq: seqBefore, applied: [], rejected: [], events: [],
             error: { code: "E_STORE_FAULT", message: `落盘失败：${e instanceof Error ? e.message : String(e)}` },

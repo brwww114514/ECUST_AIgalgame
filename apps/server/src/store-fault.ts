@@ -1,4 +1,4 @@
-import { StoreCommitUnknownError } from "../../../packages/engine/src/store-write.ts";
+import { isRoomSyncFault } from "../../../packages/engine/src/store-write.ts";
 
 /**
  * 存储故障的统一判定：把 fs errno / 显式 `E_STORE_FAULT` 映射为 503，且不回显路径。
@@ -25,5 +25,5 @@ export function isStoreFault(error: unknown): boolean {
 
 /** 结果待核对的错误已经脱敏，保留其提示，避免建议重做可能已生效的操作。 */
 export function storeFaultMessage(error: unknown, fallback: string): string {
-  return error instanceof StoreCommitUnknownError ? error.message : fallback;
+  return isRoomSyncFault(error) ? error.message : fallback;
 }

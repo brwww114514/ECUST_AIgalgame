@@ -17,7 +17,7 @@ import type {
   Delivery,
 } from "../../../shared/src/index.ts";
 import type { EventLog } from "../store.ts";
-import { StoreCommitUnknownError } from "../store-write.ts";
+import { isRoomSyncFault } from "../store-write.ts";
 import type { ArbiterApplyResult, DefaultArbiter } from "../arbiter.ts";
 import type { EventSourcedMemory } from "../memory.ts";
 import { conversationSnapshotSchema, type ConversationSnapshot, type RestoreResult } from "./conversation-snapshot.ts";
@@ -291,7 +291,7 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       try {
         await this.deps.store.flush(pending.roomId);
       } catch (error) {
-        const uncertain = error instanceof StoreCommitUnknownError;
+        const uncertain = isRoomSyncFault(error);
         if (uncertain) this.pendingFlush.delete(key);
         return [{
           type: "conversation.error", sessionId, code: "E_STORE_FAULT",
@@ -317,7 +317,7 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     try {
       await runStep(this.deps, s, input, out, now, (ss, a) => this.commitWithState(ss, a));
     } catch (e) {
-      if (e instanceof StoreCommitUnknownError) {
+      if (isRoomSyncFault(e)) {
         // 提交结果待核对，丢弃本轮尚未发布的事件。
         return [{ type: "conversation.error", sessionId, code: e.code, message: e.message, retryable: false }];
       }

@@ -11,6 +11,19 @@ export class StoreCommitUnknownError extends Error {
   }
 }
 
+/** 其他写入已经进入待核对状态，本次调用还未写入。 */
+export class RoomStorageBlockedError extends Error {
+  readonly code = "E_STORE_FAULT";
+
+  constructor(cause: StoreCommitUnknownError) {
+    super("该房间有待核对的写入，请先核对存档。", { cause });
+  }
+}
+
+export function isRoomSyncFault(error: unknown): error is StoreCommitUnknownError | RoomStorageBlockedError {
+  return error instanceof StoreCommitUnknownError || error instanceof RoomStorageBlockedError;
+}
+
 async function syncDirectory(directory: string): Promise<void> {
   const handle = await open(directory, "r");
   try {

@@ -22,7 +22,7 @@ import type {
   WorldState,
 } from "../../shared/src/index.ts";
 import type { EventLog } from "./store.ts";
-import { StoreCommitUnknownError } from "./store-write.ts";
+import { isRoomSyncFault } from "./store-write.ts";
 import type { AuditPolicy, AuditPort } from "./audit.ts";
 import { codeOf, errMessage } from "./turn.parse.ts";
 import { RETRYABLE } from "../../shared/src/index.ts";
@@ -406,7 +406,7 @@ export class DefaultTurn implements Turn {
       try {
         await this.deps.store.flush(req.roomId);
       } catch (e) {
-        if (e instanceof StoreCommitUnknownError) throw e;
+        if (isRoomSyncFault(e)) throw e;
         yield emit({ type: "turn.error", code: "E_STORE_FAULT", message: `落盘失败：${errMessage(e)}`, retryable: true });
         return;
       }
@@ -427,7 +427,7 @@ export class DefaultTurn implements Turn {
       }
       yield emit({ type: "turn.commit", turnId, seq, usage });
     } catch (e) {
-      if (e instanceof StoreCommitUnknownError) throw e;
+      if (isRoomSyncFault(e)) throw e;
       const code = codeOf(e);
       // 可重试 = 契约 RETRYABLE（格式/超时/限流）+ E_STORE_FAULT（写盘失败，本回合未 commit，重试安全，docs/03 §7）；
       // E_MODULE_FAULT 这类硬失败重试也没用，不该给前端重试按钮（issue #21-3 / PR #23 复审）

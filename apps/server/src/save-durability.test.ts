@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import Fastify from "fastify";
+import Fastify, { type FastifyInstance } from "fastify";
 import { expect, it, vi } from "vitest";
 import { tempDir } from "@galgame/testkit";
 import { createApp } from "./bootstrap.ts";
@@ -139,6 +139,21 @@ it("区分替换前和替换后故障，只冻结结果待核对的房间", asyn
 });
 
 
+function pause() {
+  let arrived!: () => void;
+  let resume!: () => void;
+  const paused = new Promise<void>((resolve) => { arrived = resolve; });
+  const gate = new Promise<void>((resolve) => { resume = resolve; });
+  return { arrived, resume, paused, gate };
+}
+
+async function createPlayerRoom(app: FastifyInstance, userId: string) {
+  const headers = { "x-user-id": userId };
+  const response = await app.inject({ method: "POST", url: "/api/v1/rooms", headers, payload: { mode: "solo" } });
+  expect(response.statusCode).toBe(200);
+  return response.json() as { roomId: string; actorId: string };
+}
+
 it.each(["turn.delta", "turn.patch"])("后续同房间同步失败仍可确认先前 durable 回合（停在 %s）", async (pauseAt) => {
   const dataDir = tempDir("galgame-save-concurrent-");
   const deps = await createApp(config(dataDir));
@@ -146,14 +161,9 @@ it.each(["turn.delta", "turn.patch"])("后续同房间同步失败仍可确认�
   registerRoutes(app, deps);
   const userId = "u_concurrent";
   const headers = { "x-user-id": userId };
-  const created = await app.inject({ method: "POST", url: "/api/v1/rooms", headers, payload: { mode: "solo" } });
-  expect(created.statusCode).toBe(200);
-  const { roomId, actorId } = created.json() as { roomId: string; actorId: string };
+  const { roomId, actorId } = await createPlayerRoom(app, userId);
   const clientTurnId = "turn_a";
-  let arrived!: () => void;
-  let resume!: () => void;
-  const paused = new Promise<void>((resolve) => { arrived = resolve; });
-  const gate = new Promise<void>((resolve) => { resume = resolve; });
+  const { arrived, resume, paused, gate } = pause();
   const run = deps.turn.run.bind(deps.turn);
   vi.spyOn(deps.turn, "run").mockImplementation(async function* (req) {
     for await (const event of run(req)) {
@@ -183,6 +193,91 @@ it.each(["turn.delta", "turn.patch"])("后续同房间同步失败仍可确认�
     expect(deps.ledger.get({ userId, roomId, clientTurnId })).toMatchObject({ state: "committed", committedSeq: sequence });
     expect(await deps.history.readAll(roomId)).toMatchObject([{ committedSeq: sequence, clientTurnId }]);
     expect(await deps.saves.list(userId)).toMatchObject([{ lastCommittedSeq: sequence }]);
+  } finally {
+    resume();
+    fault.directory = "";
+    fault.phase = "";
+    await deps.ledger.flush();
+    await app.close();
+  }
+});
+
+it("已提交的地图移动在房间随后冻结时仍更新所属账号的历史和存档", async () => {
+  const dataDir = tempDir("galgame-save-travel-");
+  const deps = await createApp(config(dataDir));
+  const app = Fastify();
+  registerRoutes(app, deps);
+  const userId = "u_travel";
+  const { roomId, actorId } = await createPlayerRoom(app, userId);
+  const { arrived, resume, paused, gate } = pause();
+  const run = deps.turn.run.bind(deps.turn);
+  vi.spyOn(deps.turn, "run").mockImplementation(async function* (req) {
+    for await (const event of run(req)) {
+      if (event.type === "turn.patch") {
+        arrived();
+        await gate;
+      }
+      yield event;
+    }
+  });
+  try {
+    const travel = deps.map.travel(roomId, actorId, "loc_teaching_1");
+    await Promise.race([paused, travel.then(() => { throw new Error("travel finished before pause point"); })]);
+    const sequence = (await deps.store.events(roomId, 1)).at(-1)!.seq;
+    fault.directory = path.join(dataDir, "rooms");
+    fault.phase = "directory";
+    expect(await deps.map.tick(roomId, { advance: true })).toMatchObject({ ok: false, code: "E_STORE_FAULT" });
+    resume();
+
+    expect(await travel).toMatchObject({ ok: true, map: { player: { locId: "loc_teaching_1" } } });
+    expect(await deps.history.readAll(roomId)).toMatchObject([{ userId, committedSeq: sequence }]);
+    expect(await deps.saves.list(userId)).toMatchObject([{ roomId, lastCommittedSeq: sequence }]);
+  } finally {
+    resume();
+    fault.directory = "";
+    fault.phase = "";
+    await app.close();
+  }
+});
+
+it("未写入的另一个请求遇到冻结房间时释放自身额度", async () => {
+  const dataDir = tempDir("galgame-save-blocked-turn-");
+  const deps = await createApp(config(dataDir));
+  const app = Fastify();
+  registerRoutes(app, deps);
+  const userId = "u_blocked";
+  const { roomId, actorId } = await createPlayerRoom(app, userId);
+  const clientTurnId = "turn_not_started";
+  const scope = { userId, roomId, clientTurnId };
+  const { arrived, resume, paused, gate } = pause();
+  const transition = deps.ledger.transitionDurable.bind(deps.ledger);
+  vi.spyOn(deps.ledger, "transitionDurable").mockImplementation(async (...args) => {
+    const result = await transition(...args);
+    if (args[0].clientTurnId === clientTurnId && args[1] === "running") {
+      arrived();
+      await gate;
+    }
+    return result;
+  });
+  const run = vi.spyOn(deps.turn, "run");
+  try {
+    const pending = app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/turns`, headers: { "x-user-id": userId },
+      payload: { clientTurnId, actorId, input: "我去图书馆看看" },
+    });
+    await Promise.race([paused, pending.then(() => { throw new Error("turn finished before quota pause"); })]);
+    fault.directory = path.join(dataDir, "rooms");
+    fault.phase = "directory";
+    expect(await deps.map.tick(roomId, { advance: true })).toMatchObject({ ok: false, code: "E_STORE_FAULT" });
+    resume();
+
+    const response = await pending;
+    expect(response.body).toContain('"code":"E_STORE_FAULT"');
+    expect(response.body).toContain('"retryable":false');
+    expect(run).not.toHaveBeenCalled();
+    expect(deps.ledger.get(scope)?.state).toBe("failed");
+    expect(deps.ledger.todayTurns(userId)).toBe(0);
+    expect(await deps.history.readAll(roomId)).toEqual([]);
   } finally {
     resume();
     fault.directory = "";

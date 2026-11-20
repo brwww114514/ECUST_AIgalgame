@@ -150,6 +150,14 @@ describe("issue #90：会话快照跨重启恢复", () => {
     const loaded = await loadSnapshot(file);
     expect(loaded.ok && loaded.snapshot).toEqual(snap);
 
+    // #106：并发/重复保存使用独立 tmp 名，不残留固定 .tmp 覆盖邻居；落盘内容仍是最后一份
+    const { readdir } = await import("node:fs/promises");
+    const before = (await readdir(path.dirname(file))).filter((f) => f.endsWith(".tmp"));
+    expect(before).toHaveLength(0); // 原子 rename 后不留临时文件
+    await Promise.all([saveSnapshot(file, snap), saveSnapshot(file, snap)]);
+    const after = (await readdir(path.dirname(file))).filter((f) => f.endsWith(".tmp"));
+    expect(after).toHaveLength(0);
+
     const store2 = new EventSourcedStore({ worldId: "w1", locId: GATE });
     seed(store2);
     const { host: host2 } = await makeHost(store2, [], { t: 1000 });
@@ -160,7 +168,9 @@ describe("issue #90：会话快照跨重启恢复", () => {
     const store3 = new EventSourcedStore({ worldId: "w1", locId: GATE });
     seed(store3);
     const { host: host3 } = await makeHost(store3, [], { t: 1000 });
-    expect(host3.restoreSessions(snap, "room_other").restored).toBe(0); // 房间隔离
+    const mismatched = host3.restoreSessions(snap, "room_other");
+    expect(mismatched.restored).toBe(0); // 房间隔离
+    expect(mismatched.degraded).toBe(true); // #106：错档会话计入 degraded，不静默吞掉
     expect(host3.getByRoom(ROOM)).toBeUndefined();
 
     // turn 达上限的旧会话恢复为 closed，不会被 getByRoom 当成可续聊会话

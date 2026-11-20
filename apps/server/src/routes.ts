@@ -6,7 +6,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { ActorId, Memory, MemoryRecord, Registry, RoomId, Store, Turn, TurnEvent, WorldState } from "../../../packages/shared/src/contract/types.ts";
 import type { ConversationEvent, GossipEvent, MessageDigest, UtteranceModeDef } from "../../../packages/shared/src/contract/v2.ts";
-import { projectConversationEvents, type ConversationHostV2 } from "../../../packages/engine/src/v2/index.ts";
+import { projectConversationEvents, saveSnapshot, sessionSnapshotPath, type ConversationHostV2 } from "../../../packages/engine/src/v2/index.ts";
 import { DialogueBodySchema, TickBodySchema, TravelBodySchema, zodMessage } from "./map.data.ts";
 import type { MapService } from "./map.ts";
 import type { LlmSettings } from "./settings.ts";
@@ -84,8 +84,8 @@ export interface AppDeps {
     inbox(roomId: RoomId, to: ActorId): MessageDigest[];
     subscribe(roomId: RoomId, viewer: ActorId, cb: (ev: GossipEvent) => void): () => void;
   };
-  /** dev/v2：群聊会话宿主（未接线时不注册端点；会话/幂等缓存全在进程内，重启即新会话） */
-  conversation?: { host: ConversationHostV2; modes?: Map<string, UtteranceModeDef> };
+  /** dev/v2：群聊会话宿主（未接线时不注册端点；#90 起会话从独立快照文件恢复，见 bootstrap.ts） */
+  conversation?: { host: ConversationHostV2; modes?: Map<string, UtteranceModeDef>; dataDir?: string };
   /** 管理操作日志 */
   adminLog?: AdminLog;
   /** Cookie 写请求 CSRF 允许的 Origin（authRequired=1 时用） */
@@ -383,7 +383,7 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     return { ok: false, code: "E_FORBIDDEN", message };
   };
   /** 经 adminOnly 放行后再取令牌交给 MapService 二次校验；本身不作为鉴权凭据（#105）。 */
-  const adminToken = (req: FastifyRequest): string | undefined => adminTokenOf(req.headers);
+  const adminToken = (req: FastifyRequest): string => adminTokenOf(req.headers);
 
   app.post("/api/v1/settings/llm", async (req) => {
     const deny = settingsGuard(req);
@@ -529,7 +529,9 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     const host = deps.conversation.host;
     /** roomId → sessionId：进程内映射；会话本体/幂等缓存也在 host 内存里，重启即新会话 */
     const sessions = new Map<string, string>();
-    const MAX_SESSIONS = 256;
+    // 淘汰阈值默认 256；env 仅供单测压低到个位数触发淘汰路径（与 GALGAME_GOSSIP_SCAN_MS 同风格）
+    const configuredMax = Number(process.env.GALGAME_CONVERSATION_MAX_SESSIONS);
+    const MAX_SESSIONS = Number.isFinite(configuredMax) && configuredMax > 0 ? configuredMax : 256;
 
     /**
      * 房间级串行（MAJOR-2）：openOrReuse 的 get/open/insert 必须与本轮 host.run 共用一把锁，
@@ -552,14 +554,22 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       const cached = sessions.get(roomId);
       const session = cached ? host.get(cached) : undefined;
       if (session && session.roomId === roomId && session.status === "open") {
+        // #104：复用时 participants 以 host 内会话为准（这里不重算/不覆盖），
+        // 后续回合的可见性投影读 host.get(sessionId).participants，而非本函数的入参快照。
         return { sessionId: session.id, opened: undefined as ConversationEvent | undefined };
       }
       const present = [...state.room.scene.presentIds];
       if (!present.includes(actorId)) present.unshift(actorId);
+      // #104：participants 只是 open 时的初始猜测；host.open 内部按快照场景归一人后以 host 内为准。
       const fresh = await host.open({ roomId, participants: present });
       if (sessions.size >= MAX_SESSIONS) {
         const oldest = sessions.keys().next().value;
-        if (oldest) sessions.delete(oldest);
+        if (oldest) {
+          // #104：淘汰映射前先 close 旧 host 会话（标记 closed + 回收幂等缓存），避免会话泄漏。
+          const evictedId = sessions.get(oldest);
+          if (evictedId) host.close(evictedId);
+          sessions.delete(oldest);
+        }
       }
       sessions.set(roomId, fresh.id);
       const opened: ConversationEvent = { type: "conversation.opened", sessionId: fresh.id, participants: [...fresh.participants] };
@@ -576,6 +586,45 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       if (!access) return reply;
       if (actionsPaused(reply)) return reply;
 
+      // #104：与 v1 /turns 共用同一 TurnLedger 计量。按逻辑请求预留，拒绝必须在 SSE 头之前，
+      // 未登录（本地无 auth/无 userId）不结算额度；成功后 committed，失败/提前 EOF 按状态机回收。
+      const userId = access.userId;
+      const turnScope = userId ? { userId, roomId, clientTurnId: body.clientTurnId } : undefined;
+      const ledger = userId ? deps.ledger : undefined;
+      // charged=false：本请求不新增计费（未登录，或 v2 的同 ID 重放命中 host 幂等缓存、无 LLM 调用）
+      let charged = false;
+      // #104：预留与 host.run 共用房间串行锁（MAJOR-2）。v2 并发首回合的多个不同 clientTurnId
+      // 若在锁外 reserve，第二条会被 TurnLedger「同一用户同时只允许一个 running」抢先拒绝；
+      // 而 host 层本就把它们串行执行。放进锁内让第二条等第一条 committed 后再 reserve，
+      // 与 v1 /turns「按实际 LLM 调用计费」口径一致。reserve/settle 都在这把锁内完成。
+      const reserveTurn = async (): Promise<boolean> => {
+        if (!ledger || !userId || !turnScope) return true;
+        const settings = deps.auth?.store.getSettings();
+        const dailyLimit = settings ? dailyLimitFor(settings, userId) : null;
+        const reserved = ledger.reserve({
+          ...turnScope, actorId,
+          dailyLimit, actionsEnabled: settings?.actionsEnabled ?? true,
+        });
+        if (!reserved.ok) {
+          // 已 committed 的同 ID 重放：host 会原样回缓存事件，不调用模型 → 不重复计费、不重复结算
+          if (reserved.code === "E_PRECONDITION" && reserved.committedSeq !== undefined) return true;
+          const status = reserved.code === "E_RATE_LIMITED" ? 429 : 409;
+          reply.code(status).send({ ok: false, code: reserved.code, message: reserved.message, ...(reserved.committedSeq !== undefined ? { committedSeq: reserved.committedSeq } : {}) });
+          return false;
+        }
+        charged = true;
+        // running 必须先确认落盘再开跑，与 /turns 同口径（磁盘上不能只留 reserved）
+        try {
+          await ledger.transitionDurable(turnScope, "running");
+        } catch {
+          ledger.transition(turnScope, "failed");
+          charged = false;
+          reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: "额度账本写入失败，行动未开始，可重试" });
+          return false;
+        }
+        return true;
+      };
+
       const utterance = body.utterance
         ? { ...body.utterance, id: body.utterance.id ?? `utt_${body.clientTurnId}`, speaker: actorId }
         : undefined;
@@ -591,13 +640,16 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
         const placeholder = unknownPlaceholders(access.state, deps.appearance).get(utteranceTarget.name);
         utterance.content = unmaskTargetPlaceholder(utterance.content, placeholder, utteranceTarget.name);
       }
-      reply.raw.writeHead(200, SSE_HEADERS);
       let sessionId = "";
       let opened: ConversationEvent | undefined;
       const out: ConversationEvent[] = [];
-      try {
-        // open/insert 与 host.run 在同一房间锁内：并发首回合第二次进来时直接复用已 open 的会话。
-        await serializeTurn(roomId, async () => {
+      let caught: unknown;
+      // 房间锁内：额度预留 → openOrReuse → host.run → 结算，全在同一把锁上。
+      // 拒绝（额度不足/账本写失败）必须在 SSE 头之前返回，故先把锁内阶段的结果带出来。
+      let denied = false;
+      await serializeTurn(roomId, async () => {
+        if (!(await reserveTurn())) { denied = true; return; }
+        try {
           const r = await openOrReuse(roomId, actorId, access.state);
           sessionId = r.sessionId;
           opened = r.opened;
@@ -607,7 +659,43 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
             ...(body.interject ? { interject: body.interject } : {}),
             ...(access.userId ? { userId: access.userId } : {}),
           })) out.push(ev);
-        });
+          // #104：结算与事件流同源——只有真的 committed 才记 committed；
+          // conversation.error（含插话/拒绝）按 failed；无 committed 也无 error 的提前结束按 unconfirmed。
+          if (charged && turnScope && ledger) {
+            const commitEv = out.find((e) => e.type === "conversation.committed");
+            const errored = out.some((e) => e.type === "conversation.error");
+            if (commitEv && commitEv.type === "conversation.committed") {
+              // conversation.* 不写 EventLog（无 Envelope seq），用回合号作为 committedSeq 供重放识别；
+              // 重放时 reserve 见到 committedSeq 即放行到 host 幂等缓存，不重复计费。
+              ledger.transition(turnScope, "committed", { committedSeq: commitEv.turn });
+              // #90：回合已提交后把会话快照原子落盘（独立文件，不进 EventLog）。
+              // 快照只是恢复投影，写失败只记日志，不影响已提交的世界真源。
+              const dataDir = deps.conversation?.dataDir;
+              if (dataDir) {
+                try {
+                  await saveSnapshot(sessionSnapshotPath(dataDir, roomId), host.exportSessions(roomId));
+                } catch (e) {
+                  console.warn(`[conversation] 保存房间 ${roomId} 会话快照失败（不影响已提交回合）：`, e instanceof Error ? e.message : e);
+                }
+              }
+            } else if (errored) ledger.transition(turnScope, "failed");
+            else ledger.transition(turnScope, "unconfirmed");
+          }
+        } catch (e) {
+          // #104：异常路径按失败回收额度（未 committed），与 v1 /turns 的 catch 同口径；重放命中不结算
+          if (charged && turnScope && ledger) ledger.transition(turnScope, "failed");
+          caught = e;
+        }
+      });
+      if (denied) return reply;
+      reply.raw.writeHead(200, SSE_HEADERS);
+      // #106：心跳注释行（SSE comment，前端 parseSsePart 会忽略）。与 gossip SSE 同口径，
+      // 每 15s 写一次 `: ping\n\n`，避免代理/浏览器把长时间无数据的 LLM 流判为死连接。
+      // 前端无需额外超时检测：SSE 的 onUnconfirmed（正常 EOF 未收到 committed/error）已覆盖断流。
+      const heartbeat = setInterval(() => reply.raw.write(": ping\n\n"), 15_000);
+      heartbeat.unref?.();
+      try {
+        if (caught !== undefined) throw caught;
         if (opened) sseWrite(reply.raw, opened.type, opened);
         // 与 /turns 同一口径：收齐后按最终状态脱敏再一次性写出（模型可能把真名写进台词）
         const committed = out.find((e) => e.type === "conversation.committed");
@@ -644,12 +732,15 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
         const visible = projectConversationEvents(out, actorId, members, deps.registry);
         for (const ev of visible) sseWrite(reply.raw, ev.type, maskNamesDeep(ev, placeholders));
       } catch (e) {
+        // #104：异常路径按失败回收额度（未 committed），与 v1 /turns 的 catch 同口径；重放命中不结算
+        if (charged && turnScope && ledger) ledger.transition(turnScope, "failed");
         const err: ConversationEvent = {
           type: "conversation.error", sessionId, code: "E_MODULE_FAULT",
           message: e instanceof Error ? e.message : String(e),
         };
         sseWrite(reply.raw, err.type, err);
       } finally {
+        clearInterval(heartbeat);
         reply.raw.end();
       }
     };

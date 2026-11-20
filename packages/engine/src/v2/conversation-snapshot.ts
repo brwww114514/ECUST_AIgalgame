@@ -110,10 +110,13 @@ export async function loadSnapshot(filePath: string): Promise<LoadSnapshotResult
   return { ok: false, reason: version !== undefined && version !== 1 ? "bad-version" : "invalid" };
 }
 
-/** 原子落盘（tmp + rename）：写一半崩了也不会留下半份快照 */
+/**
+ * 原子落盘（tmp + rename）：写一半崩了也不会留下半份快照。
+ * #106：tmp 名带 pid + 随机后缀，避免同一房间并发保存（或崩溃残留的 .tmp）互相覆盖。
+ */
 export async function saveSnapshot(filePath: string, snapshot: ConversationSnapshot): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.tmp`;
+  const tmp = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
   await writeFile(tmp, JSON.stringify(snapshot), "utf8");
   await rename(tmp, filePath);
 }

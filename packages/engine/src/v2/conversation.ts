@@ -105,6 +105,20 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     return this.sessions.get(sessionId);
   }
 
+  /**
+   * #104：主动关闭会话（路由层淘汰 room→sessionId 映射时调用）。
+   * 标记 closed 并回收该会话的幂等缓存；pendingFlush 代表尚未落盘的提交，保留以免丢数据。
+   */
+  close(sessionId: Id): boolean {
+    const s = this.sessions.get(sessionId);
+    if (!s) return false;
+    s.status = "closed";
+    for (const [key, events] of this.seen) {
+      if (events.some((e) => "sessionId" in e && e.sessionId === sessionId)) this.seen.delete(key);
+    }
+    return true;
+  }
+
   /** 重启后"继续同房间群聊"：取该房间最后一个仍 open 的会话 */
   getByRoom(roomId: RoomId): ConversationSessionV2 | undefined {
     let found: ConversationSessionV2 | undefined;
@@ -123,6 +137,8 @@ export class ConversationHostV2 implements ConversationTurnV2 {
   /**
    * 导入快照（重启恢复）。坏档/版本不符 → 降级：当前会话全部 closed，调用方须 open() 新会话。
    * 同 id 已存在则跳过（重复导入幂等）；turn 达上限的会话强制 closed。
+   * #106：显式校验快照里的 session.roomId 与当前房间一致——不一致直接跳过并计入 degraded，
+   * 防止把别的房间的会话挂进当前 host（若 snapshot 文件被串房间写入时 fail-closed）。
    */
   restoreSessions(raw: unknown, roomId?: RoomId): RestoreResult {
     const parsed = conversationSnapshotSchema.safeParse(raw);
@@ -131,8 +147,10 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       return { restored: 0, degraded: true, sessions: [] };
     }
     const restored: string[] = [];
+    let mismatched = false;
     for (const s of parsed.data.sessions) {
-      if (roomId && s.roomId !== roomId) continue;
+      // 显式校验：传入 roomId 时，会话的 roomId 必须与之完全一致，否则视为错档（#106）
+      if (roomId && s.roomId !== roomId) { mismatched = true; continue; }
       if (this.sessions.has(s.id)) continue;
       if (s.turn >= s.maxTurns) s.status = "closed";
       this.sessions.set(s.id, s);
@@ -140,7 +158,8 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       if (Number.isFinite(n) && n > this.nextId) this.nextId = n;
       restored.push(s.id);
     }
-    return { restored: restored.length, degraded: false, sessions: restored };
+    // 只要出现 roomId 不一致的会话就降级：调用方应告警/重新加载正确快照（不静默吞掉）
+    return { restored: restored.length, degraded: mismatched, sessions: restored };
   }
 
   /** 插话超时恢复；返回被恢复的会话 id（保留旧签名供 server tick 使用） */

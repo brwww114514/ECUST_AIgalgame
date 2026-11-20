@@ -31,6 +31,8 @@ import { detectConversation, fetchUtteranceModes, runConversationTurn, runConver
 import type { UtteranceDraft, UtteranceModeInfo } from "./conversation-api.ts";
 import { DEFAULT_LISTEN_TIMEOUT_MS, initialConversationView, isListeningExpired, linesFromView, pendingLinesFor, reduceConversationView } from "./conversation-view.ts";
 import type { ConversationView } from "./conversation-view.ts";
+import DebugPanel from "./DebugPanel.tsx";
+import { cachedDebugToken, clearDebugToken, unlockDebug } from "./debug-api.ts";
 
 type Tab = "chat" | "gallery" | "drafts" | "inbox";
 type Screen = "title" | "game";
@@ -60,6 +62,11 @@ export default function App() {
   const { user, authReady, authStatus, notice, onAuthed, enterVisitor, logout: authLogout, expireSession } = useAuth();
   const [screen, setScreen] = useState<Screen>("title");
   const [tab, setTab] = useState<Tab>("chat");
+  /** 调试面板：首页快捷键 + 口令解锁，平时完全隐藏 */
+  const [debugPrompt, setDebugPrompt] = useState(false);
+  const [debugToken, setDebugToken] = useState<string>(() => cachedDebugToken());
+  const [debugPass, setDebugPass] = useState("");
+  const [debugErr, setDebugErr] = useState("");
   const [roomId, setRoomId] = useState<string>("");
   /** 当前房间的玩家角色 id：由服务端签发（建房返回值 / 房间成员表），不在前端猜 */
   const [actorId, setActorId] = useState<string>("");
@@ -134,6 +141,38 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
 
   // 全局按键音效（Web Audio 合成，零依赖）；开关由本地状态 + localStorage 记忆
   useEffect(() => installClickSound(), []);
+
+  /** 调试面板：首页按 D 键打开口令框（普通玩家不会碰，避免误触） */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
+      if (screen === "title" && (e.key === "d" || e.key === "D") && !debugToken) {
+        setDebugPrompt(true);
+      }
+      if (e.key === "Escape") {
+        setDebugPrompt(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [screen, debugToken]);
+
+  const submitDebugPass = useCallback(async () => {
+    setDebugErr("");
+    try {
+      const token = await unlockDebug(debugPass);
+      if (!token) {
+        setDebugErr("口令错误");
+        return;
+      }
+      setDebugToken(token);
+      setDebugPrompt(false);
+      setDebugPass("");
+    } catch (e) {
+      setDebugErr(e instanceof Error ? e.message : String(e));
+    }
+  }, [debugPass]);
 
   const push = useCallback((kind: LineKind, text: string) => {
     // 叙事类文本走打字机；玩家的输入和系统提示直接出现（它们不是"剧情"）
@@ -854,6 +893,8 @@ await runTurn(
         return;
       }
       scopeRef.current.renew();
+      clearDebugToken();
+      setDebugToken("");
       resetRoomUi();
       setScenario(null);
       setSavedRoomId("");
@@ -874,20 +915,43 @@ await runTurn(
 
   if (screen === "title") {
     return (
-      <TitleScreen
-        scenarios={scenarios}
-        scenariosLoading={scenariosLoading}
-        onStart={(scenarioId) => void startNew(scenarioId)}
-        onResume={savedRoomId ? () => void resumeLast() : null}
-        savesState={savesState}
-        onOpenSave={(save) => void openSave(save)}
-        onDeleteSave={(save) => void removeSave(save)}
-        savedRoomId={savedRoomId}
-        busy={entering}
-        err={err}
-        username={user.nickname || user.username}
-        onLogout={logoutNow}
-      />
+      <>
+        <TitleScreen
+          scenarios={scenarios}
+          scenariosLoading={scenariosLoading}
+          onStart={(scenarioId) => void startNew(scenarioId)}
+          onResume={savedRoomId ? () => void resumeLast() : null}
+          savesState={savesState}
+          onOpenSave={(save) => void openSave(save)}
+          onDeleteSave={(save) => void removeSave(save)}
+          savedRoomId={savedRoomId}
+          busy={entering}
+          err={err}
+          username={user.nickname || user.username}
+          onLogout={logoutNow}
+        />
+        {debugPrompt && (
+          <div className="dbg-overlay" role="dialog" aria-label="调试口令">
+            <div className="dbg-window dbg-unlock">
+              <h2>调试模式</h2>
+              <p className="panel-note">输入调试口令以解锁只读调试视图。</p>
+              <input
+                type="password"
+                autoFocus
+                value={debugPass}
+                onChange={(e) => setDebugPass(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") void submitDebugPass(); }}
+                placeholder="调试口令"
+              />
+              {debugErr && <div className="err">{debugErr}</div>}
+              <div className="dbg-header-actions">
+                <button type="button" onClick={() => { setDebugPrompt(false); setDebugErr(""); }}>取消</button>
+                <button type="button" onClick={() => void submitDebugPass()}>解锁</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </>
     );
   }
 
@@ -1022,6 +1086,16 @@ await runTurn(
           push={push}
           onRefreshState={refreshState}
           version={stateRev}
+        />
+      )}
+
+      {/* 调试面板：仅在首页解锁过口令后挂载，平时完全不出现在 DOM 中 */}
+      {debugToken && roomId && (
+        <DebugPanel
+          roomId={roomId}
+          token={debugToken}
+          onClose={() => { clearDebugToken(); setDebugToken(""); }}
+          onExpired={() => { clearDebugToken(); setDebugToken(""); }}
         />
       )}
     </div>

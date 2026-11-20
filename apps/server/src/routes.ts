@@ -28,6 +28,8 @@ import { registerViewRoutes } from "./view.routes.ts";
 import { adminTokenOf, guardRoom } from "./room-guard.ts";
 import { AdminTokenGate, type TokenVerdict } from "./admin-token.ts";
 import { isStoreFault } from "./store-fault.ts";
+import { registerDebugRoutes } from "./debug.routes.ts";
+import type { DebugGate } from "./debug.ts";
 
 export interface AppDeps {
   store: Store;
@@ -87,6 +89,8 @@ export interface AppDeps {
   adminLog?: AdminLog;
   /** Cookie 写请求 CSRF 允许的 Origin（authRequired=1 时用） */
   publicOrigin?: string;
+  /** 调试面板口令门；缺省/未配置时不注册调试端点 */
+  debugGate?: DebugGate | null;
   version: string;
 }
 
@@ -1066,4 +1070,15 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
 authorize: async (req, reply, roomId) => (await guardRoom(req, reply, deps, roomId, userIdOf)) !== null,
     appearance: deps.appearance,
   });
+
+  // ---------------------------------------------------------------- 调试面板（只读）
+  // 只在配置了 GALGAME_DEBUG_PASSPHRASE 时注册；口令从未进过仓库，解锁后拿 TTL 令牌。
+  if (deps.debugGate) {
+    registerDebugRoutes(app, {
+      gate: deps.debugGate,
+      store: deps.store,
+      memory: deps.memory,
+      roomExists,
+    });
+  }
 }

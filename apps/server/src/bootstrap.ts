@@ -57,6 +57,7 @@ import { loadSceneDescs, offlineNarrative } from "./offline-narrator.ts";
 import { LlmSwitch } from "./llm-switch.ts";
 import { LlmSettings, loadPersistedLlmSettings } from "./settings.ts";
 import { appearanceById, loadScenarios } from "./scenarios.ts";
+import { createDebugGate } from "./debug.ts";
 import type { AppDeps } from "./routes.ts";
 
 interface CanonWorld {
@@ -94,6 +95,8 @@ async function loadDirectors(dir: string): Promise<DialogueDirector[]> {
 export type App = AppDeps & {
   arbiter: DefaultArbiter;
   memory: EventSourcedMemory;
+  /** 调试面板口令门（GALGAME_DEBUG_PASSPHRASE 未配置时为 null，端点不注册） */
+  debugGate: import("./debug.ts").DebugGate | null;
   /** 世界层永久记忆的发布器（server 只做调度，闸门在引擎里） */
   canonize: CanonizeJob;
   worldRoom: string;
@@ -418,10 +421,13 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
     appearance: appearanceById(scenarios),
   });
 
+  const debugGate = createDebugGate(cfg.debugPassphrase ?? "");
+
   return {
     store,
     arbiter,
     memory,
+    debugGate,
     canonize,
     impressions,
     worldRoom,

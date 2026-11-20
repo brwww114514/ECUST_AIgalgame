@@ -29,13 +29,7 @@ import type { Line, LineKind } from "./ui.ts";
 import type { ConversationEvent } from "../../../packages/shared/src/contract/v2.ts";
 import { detectConversation, fetchUtteranceModes, runConversationTurn, runConversationUtterance } from "./conversation-api.ts";
 import type { UtteranceDraft, UtteranceModeInfo } from "./conversation-api.ts";
-import {
-  DEFAULT_LISTEN_TIMEOUT_MS,
-  initialConversationView,
-  isListeningExpired,
-  linesFromView,
-  reduceConversationView,
-} from "./conversation-view.ts";
+import { DEFAULT_LISTEN_TIMEOUT_MS, initialConversationView, isListeningExpired, linesFromView, pendingLinesFor, reduceConversationView } from "./conversation-view.ts";
 import type { ConversationView } from "./conversation-view.ts";
 
 type Tab = "chat" | "gallery" | "drafts" | "inbox";
@@ -502,19 +496,15 @@ const token = scopeRef.current.current();
       // 所以这里保留「对<展示名>说：」的兜底拼法（服务端会先换回真名再喂模型）。
       const text = targetNpc ? `对${targetNpc.name}说：${base}` : base;
       lastTurn.current = { text: base, target: targetNpc, ...(utterance ? { utterance } : {}) };
-      // 乐观行：玩家自己的 utterance 要等引擎投回（SSE 非流式），先本地显示一句浅色的；
-      // 真行到达（to=自己）时在 apply 里清掉，按「同一句只出现一次」去重。
+      // 乐观行：玩家自己的 utterance 要等引擎投回（SSE 非流式），先本地显示浅色的；
+      // 纯函数会跳过「已渲染过的同一句」，重试/重发不会短暂重复。
       setPendingLines(
-        utterance
-          ? [
-              ...(base ? [{ kind: "player" as const, text: base }] : []),
-              ...(typeof utterance.action === "string" && utterance.action.trim() !== ""
-                ? [{ kind: "narrative" as const, text: utterance.action.trim() }]
-                : []),
-            ]
-          : text
-            ? [{ kind: "player" as const, text }]
-            : [],
+        pendingLinesFor(
+          convView.current,
+          actorId,
+          utterance ? (utterance.content ?? "") : text,
+          utterance?.action,
+        ),
       );
       const tw = getTw();
       if (tw.typing) tw.skip();

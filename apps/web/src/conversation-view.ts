@@ -259,6 +259,33 @@ export function reduceConversationView(
   }
 }
 
+/**
+ * v2 乐观玩家行：点发送到 `committed` 之间先显示的浅色行（SSE 非流式，模型耗时期间没有即时反馈）。
+ * 纯函数便于测试，且按「同一句只出现一次」去重：重试/重发时若真行已渲染，就不再挂 pending。
+ * - 正文是台词 → `player`（与真行一致）；
+ * - 动作是叙述 → `narrative`（引擎对 action 通道也渲染成 narrative，contentless 不会跳样式）。
+ */
+export function pendingLinesFor(
+  view: ConversationView,
+  selfActorId: ActorId,
+  content: string,
+  action?: string,
+): { kind: LineKind; text: string }[] {
+  const seen = new Set<string>();
+  for (const line of view.lines) {
+    if (line.kind !== "utterance" || line.speaker !== selfActorId) continue;
+    for (const part of line.parts) {
+      if (part.text.trim() !== "") seen.add(part.text.trim());
+    }
+  }
+  const out: { kind: LineKind; text: string }[] = [];
+  const c = content.trim();
+  if (c !== "" && !seen.has(c)) out.push({ kind: "player", text: c });
+  const a = (action ?? "").trim();
+  if (a !== "" && !seen.has(a)) out.push({ kind: "narrative", text: a });
+  return out;
+}
+
 /** 服务端 listenTimeoutMs 到期会自动恢复 speaking；前端据此清掉自己的等待态。 */
 export function isListeningExpired(
   view: ConversationView,

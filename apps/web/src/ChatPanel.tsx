@@ -103,6 +103,8 @@ export default function ChatPanel({
   /** v2 demo：当前说话类型（mode）与动作文本（action）；仅在 v2Modes 提供时显示 */
   const [mode, setMode] = useState("broadcast");
   const [action, setAction] = useState("");
+  // 进房后用户尚未选择说话类型/输入内容时，不提前弹校验提示（避免一进房就报"请填写说话内容或动作"）
+  const [v2Touched, setV2Touched] = useState(false);
   const logRef = useRef<HTMLDivElement | null>(null);
   // 是否"跟着最新一条走"：玩家往上翻历史时不打扰，回到底部附近后自动恢复跟随
   const stickRef = useRef(true);
@@ -121,6 +123,13 @@ export default function ChatPanel({
   useEffect(() => {
     if (stickRef.current) scrollToBottom();
   }, [lines, typing?.text]);
+
+  // v2 modes 到位后校正默认值：不硬编码 "broadcast"，服务端清单若去掉它也能落到第一个合法 mode
+  useEffect(() => {
+    if (v2Modes && v2Modes.length > 0 && !v2Modes.some((m) => m.id === mode)) {
+      setMode(v2Modes[0]!.id);
+    }
+  }, [v2Modes, mode]);
 
   // 换地点后把对话对象清掉：你走出去，就不该还挂着"和谁说话"
   useEffect(() => {
@@ -391,7 +400,14 @@ export default function ChatPanel({
           <div className="v2-composer-opts">
             <label className="v2-mode">
               <span>方式</span>
-              <select value={mode} onChange={(e) => setMode(e.target.value)} disabled={busy || !state}>
+              <select
+                value={mode}
+                onChange={(e) => {
+                  setMode(e.target.value);
+                  setV2Touched(true);
+                }}
+                disabled={busy || !state}
+              >
                 {v2Modes.map((m) => (
                   <option key={m.id} value={m.id}>
                     {m.label}
@@ -403,15 +419,18 @@ export default function ChatPanel({
               <input
                 className="v2-action"
                 value={action}
-                onChange={(e) => setAction(e.target.value)}
+                onChange={(e) => {
+                  setAction(e.target.value);
+                  setV2Touched(true);
+                }}
                 placeholder="伴随动作（必填，自然语言）"
                 disabled={busy || !state}
               />
             )}
           </div>
         )}
-        {/* 本地校验提示：与引擎规则一致，拦在提交前，不让用户第一次点就吃后端的 E_SCHEMA_INVALID */}
-        {v2Active && !v2Check.ok && (
+        {/* 本地校验提示：与引擎规则一致，拦在提交前；进房未交互时不提前打扰（等用户先动一下） */}
+        {v2Active && v2Touched && !v2Check.ok && (
           <div className="v2-hint" role="status">
             {v2Check.reason}
           </div>
@@ -430,11 +449,16 @@ export default function ChatPanel({
           }}
         >
           {v2Active && currentMode?.contentless ? (
-            <input className="v2-contentless-note" value="此方式只填动作，不说话" readOnly disabled />
+            <div className="v2-contentless-note" role="note">
+              此方式只填动作，不说话
+            </div>
           ) : (
             <input
               value={input}
-              onChange={(e) => onInput(e.target.value)}
+              onChange={(e) => {
+                onInput(e.target.value);
+                setV2Touched(true);
+              }}
               placeholder={
                 v2Active
                   ? talking

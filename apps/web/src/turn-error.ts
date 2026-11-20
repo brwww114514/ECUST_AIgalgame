@@ -18,7 +18,8 @@ const FRIENDLY: Record<string, string> = {
   E_TURN_BUSY: "上一回合还没结束，稍等你再试。",
 };
 
-export function explainTurnError(code: string, message?: string): string {
+export function explainTurnError(code: string, message?: string, retryable?: boolean): string {
+  if (code === "E_STORE_FAULT" && retryable === false) return "请先核对本回合存档结果。";
   const hint = FRIENDLY[code];
   if (hint) return hint;
   const detail = (message ?? "").trim();

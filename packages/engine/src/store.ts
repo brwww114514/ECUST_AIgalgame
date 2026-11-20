@@ -225,12 +225,10 @@ export class FileStore extends EventSourcedStore {
     return next;
   }
 
-  /** 写盘已经在 append 里 await 过；这里只等可能仍在排队的写（给脚本/测试用） */
+  /** 只等队列结清；各批写入的结果由各自的 append 返回。 */
   override async flush(roomId?: RoomId): Promise<void> {
     const waits = roomId ? [this.writes.get(roomId)] : [...this.writes.values()];
     await Promise.all(waits.filter((p): p is Promise<void> => !!p));
-    const failure = roomId ? this.uncertain.get(roomId) : this.uncertain.values().next().value;
-    if (failure) throw failure;
   }
 
   override async snapshot(roomId: RoomId): Promise<WorldState> {

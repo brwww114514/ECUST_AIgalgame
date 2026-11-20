@@ -1,12 +1,17 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import Fastify from "fastify";
 import { expect, it, vi } from "vitest";
 import { tempDir } from "@galgame/testkit";
 import { createApp } from "./bootstrap.ts";
 import { registerRoutes } from "./routes.ts";
+import { GossipHost } from "../../../packages/engine/src/v2/index.ts";
 
-const fault = vi.hoisted(() => ({ directory: "", phase: "" as "" | "temporary" | "directory" }));
+const fault = vi.hoisted(() => ({
+  directory: "",
+  phase: "" as "" | "temporary" | "directory",
+  synced: [] as string[],
+}));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs/promises")>();
@@ -23,23 +28,68 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     },
     open: async (...args: Parameters<typeof fs.open>) => {
       const handle = await fs.open(...args);
-      if (args[0] === fault.directory && fault.phase === "directory") {
-        fault.phase = "";
-        vi.spyOn(handle, "sync").mockRejectedValueOnce(new Error("simulated directory sync failure"));
+      if (args[1] === "r" && typeof args[0] === "string") {
+        const directory = args[0];
+        const sync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementation(async () => {
+          fault.synced.push(directory);
+          if (directory === fault.directory && fault.phase === "directory") {
+            fault.phase = "";
+            throw new Error("simulated directory sync failure");
+          }
+          await sync();
+        });
       }
       return handle;
     },
   };
 });
 
+const config = (dataDir: string) => ({
+  port: 0, host: "127.0.0.1", dataDir, contentDir: "content", adminToken: "test-admin",
+  trustUserHeader: true, inviteCode: "test-invite",
+  llm: { baseUrl: "", model: "mock", apiKey: "", timeoutMs: 1000 },
+  audit: { baseUrl: "", model: "", apiKey: "", timeoutMs: 1000 },
+});
+
+it("先持久化新数据根目录的目录项，再处理注册和首次建房", async () => {
+  const root = tempDir("galgame-fresh-data-");
+  const nested = path.join(root, "nested");
+  const dataDir = path.join(nested, "data");
+  fault.synced.length = 0;
+
+  const deps = await createApp(config(dataDir));
+  expect(fault.synced.slice(-2)).toEqual([root, nested]);
+  const account = await deps.auth.register({
+    username: "durable_user", password: "password-for-local-test", inviteCode: "test-invite",
+  }, "127.0.0.1");
+  expect(account.ok).toBe(true);
+  await deps.createRoom("solo");
+  expect(fault.synced).toContain(dataDir);
+  expect(fault.synced).toContain(path.join(dataDir, "rooms"));
+});
+
+it("初始化同步失败后，重试会补做父目录同步", async () => {
+  const root = tempDir("galgame-data-retry-");
+  const nested = path.join(root, "nested");
+  const dataDir = path.join(nested, "data");
+  fault.directory = root;
+  fault.phase = "directory";
+  try {
+    await expect(createApp(config(dataDir))).rejects.toThrow("simulated directory sync failure");
+    await expect(stat(dataDir)).rejects.toMatchObject({ code: "ENOENT" });
+    fault.synced.length = 0;
+    await createApp(config(dataDir));
+    expect(fault.synced).toEqual([root, nested]);
+  } finally {
+    fault.directory = "";
+    fault.phase = "";
+  }
+});
+
 it("区分替换前和替换后故障，只冻结结果待核对的房间", async () => {
   const dataDir = tempDir("galgame-save-sync-");
-  const deps = await createApp({
-    port: 0, host: "127.0.0.1", dataDir, contentDir: "content", adminToken: "test-admin",
-    trustUserHeader: true,
-    llm: { baseUrl: "", model: "mock", apiKey: "", timeoutMs: 1000 },
-    audit: { baseUrl: "", model: "", apiKey: "", timeoutMs: 1000 },
-  });
+  const deps = await createApp(config(dataDir));
   const app = Fastify();
   registerRoutes(app, deps);
   try {
@@ -85,5 +135,100 @@ it("区分替换前和替换后故障，只冻结结果待核对的房间", asyn
     fault.phase = "";
     await deps.ledger?.flush();
     await app.close();
+  }
+});
+
+
+it.each(["turn.delta", "turn.patch"])("后续同房间同步失败仍可确认先前 durable 回合（停在 %s）", async (pauseAt) => {
+  const dataDir = tempDir("galgame-save-concurrent-");
+  const deps = await createApp(config(dataDir));
+  const app = Fastify();
+  registerRoutes(app, deps);
+  const userId = "u_concurrent";
+  const headers = { "x-user-id": userId };
+  const created = await app.inject({ method: "POST", url: "/api/v1/rooms", headers, payload: { mode: "solo" } });
+  expect(created.statusCode).toBe(200);
+  const { roomId, actorId } = created.json() as { roomId: string; actorId: string };
+  const clientTurnId = "turn_a";
+  let arrived!: () => void;
+  let resume!: () => void;
+  const paused = new Promise<void>((resolve) => { arrived = resolve; });
+  const gate = new Promise<void>((resolve) => { resume = resolve; });
+  const run = deps.turn.run.bind(deps.turn);
+  vi.spyOn(deps.turn, "run").mockImplementation(async function* (req) {
+    for await (const event of run(req)) {
+      if (event.type === pauseAt) {
+        arrived();
+        await gate;
+      }
+      yield event;
+    }
+  });
+
+  try {
+    const pending = app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/turns`, headers,
+      payload: { clientTurnId, actorId, input: "我去图书馆看看" },
+    });
+    await Promise.race([paused, pending.then(() => { throw new Error("turn finished before pause point"); })]);
+    const sequence = (await deps.store.events(roomId, 1)).at(-1)!.seq;
+    fault.directory = path.join(dataDir, "rooms");
+    fault.phase = "directory";
+    expect(await deps.map.tick(roomId, { advance: true })).toMatchObject({ ok: false, code: "E_STORE_FAULT" });
+    resume();
+
+    const response = await pending;
+    expect(response.body).toContain("turn.commit");
+    expect(response.body).not.toContain("turn.error");
+    expect(deps.ledger.get({ userId, roomId, clientTurnId })).toMatchObject({ state: "committed", committedSeq: sequence });
+    expect(await deps.history.readAll(roomId)).toMatchObject([{ committedSeq: sequence, clientTurnId }]);
+    expect(await deps.saves.list(userId)).toMatchObject([{ lastCommittedSeq: sequence }]);
+  } finally {
+    resume();
+    fault.directory = "";
+    fault.phase = "";
+    await deps.ledger.flush();
+    await app.close();
+  }
+});
+
+it("故障房间不会中断永久记忆和私信的后台扫描", async () => {
+  const dataDir = tempDir("galgame-save-background-");
+  const interval = globalThis.setInterval;
+  const callbacks = new Map<number, () => void>();
+  const spy = vi.spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, delay: number) => {
+    callbacks.set(delay, fn);
+    const timer = interval(fn, delay);
+    clearInterval(timer);
+    return timer;
+  }) as typeof setInterval);
+  vi.stubEnv("GALGAME_GOSSIP_SCAN_MS", "200");
+  const deps = await createApp({
+    ...config(dataDir),
+    canonize: { enabled: true, baseUrl: "", model: "", apiKey: "", timeoutMs: 1, dailyCap: 1, scanMinutes: 1 },
+  }).finally(() => {
+    spy.mockRestore();
+    vi.unstubAllEnvs();
+  });
+  const a = await deps.createRoom("solo");
+  const b = await deps.createRoom("solo");
+  const [faulty, healthy] = [a.roomId, b.roomId].sort() as [string, string];
+  fault.directory = path.join(dataDir, "rooms");
+  fault.phase = "directory";
+  const canonize = vi.spyOn(deps.canonize, "retireRoom");
+  const gossip = vi.spyOn(GossipHost.prototype, "step");
+  try {
+    expect(await deps.map.tick(faulty, { advance: true })).toMatchObject({ ok: false, code: "E_STORE_FAULT" });
+    callbacks.get(60_000)!();
+    callbacks.get(200)!();
+    await vi.waitFor(() => {
+      expect(canonize.mock.calls).toEqual([[healthy]]);
+      expect(gossip.mock.calls).toEqual([[healthy]]);
+    });
+  } finally {
+    canonize.mockRestore();
+    gossip.mockRestore();
+    fault.directory = "";
+    fault.phase = "";
   }
 });

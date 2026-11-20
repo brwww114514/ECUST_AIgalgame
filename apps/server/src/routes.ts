@@ -30,7 +30,7 @@ import type { ScenarioCatalog } from "./scenarios.ts";
 import { registerViewRoutes } from "./view.routes.ts";
 import { adminTokenOf, guardRoom } from "./room-guard.ts";
 import { AdminTokenGate, type TokenVerdict } from "./admin-token.ts";
-import { isStoreFault } from "./store-fault.ts";
+import { isStoreFault, storeFaultMessage } from "./store-fault.ts";
 import { parseCommitEvidence } from "@galgame/engine";
 import type { TurnCommitEvidence } from "@galgame/engine";
 import { registerDebugRoutes } from "./debug.routes.ts";
@@ -230,7 +230,7 @@ async function safe(reply: FastifyReply, fn: () => Promise<unknown>): Promise<un
     // 内部异常（含绝对路径的 zod 错误等）只进服务端日志，不回给客户端
     console.error("[server] unhandled route error", e);
     if (isStoreFault(e)) {
-      return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: "存储读写失败，请稍后重试" });
+      return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: storeFaultMessage(e, "存储读写失败，请稍后重试") });
     }
     return reply.code(500).send({ ok: false, code: "E_MODULE_FAULT", message: "服务器内部错误" });
   }
@@ -251,7 +251,7 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     }
     console.error("[server] unhandled route error", error);
     if (isStoreFault(error)) {
-      return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: "存储读写失败，请稍后重试" });
+      return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: storeFaultMessage(error, "存储读写失败，请稍后重试") });
     }
     return reply.code(500).send({ ok: false, code: "E_MODULE_FAULT", message: "服务器内部错误" });
   });

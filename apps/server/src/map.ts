@@ -6,6 +6,7 @@
  * - 写：只有两种写入 —— travel 的懒安装 / tick 的模块提案，全部经 Arbiter.apply；
  * - 草案：委托 DraftEngine（状态机 + AI 生成 + published.json 落盘）。
  */
+import type { DefaultArbiter } from "../../../packages/engine/src/index.ts";
 import { isErrorCode } from "../../../packages/shared/src/contract/errors.ts";
 import type {
   Arbiter,
@@ -101,7 +102,7 @@ export type DialogueResult = { ok: true; npc: { id: string; name: string }; line
 export interface MapServiceDeps {
   store: Store;
   turn: Turn;
-  arbiter: Arbiter;
+  arbiter: Pick<Arbiter, "dryRun"> & Pick<DefaultArbiter, "apply">;
   modules: Modules;
   dialogue: Dialogue;
   llm: LlmPort;
@@ -264,7 +265,8 @@ export class MapService {
     }
     if (failure) return this.outbound(failure, roomId, state);
 
-    const after = await this.deps.store.snapshot(roomId);
+    const patch = events.find((event) => event.type === "turn.patch");
+    const after = patch?.state ?? await this.deps.store.snapshot(roomId);
     // 模块对"不可达"会返回 ok:true + 空 proposals，而 Arbiter 部分应用也返回 ok:true；
     // 只看 turn 事件会把"没走动"当成到达。以移动后的权威位置做最终校验。
     const actorLoc = after.links.find((l) => l.kind === "located_in" && l.from === actor)?.to;
@@ -281,6 +283,7 @@ export class MapService {
   // -------------------------------------------------------------- tick（不经过 Turn / LLM）
   async tick(roomId: string, opts: { advance?: boolean } = {}): Promise<TickResult> {
     const events: Envelope[] = [];
+    let stateAfter: WorldState | undefined;
     const state = await this.deps.store.snapshot(roomId);
     const phase = opts.advance ? nextPhase(state.clock.phase) : state.clock.phase;
     const actorId = playerActorId(state);
@@ -318,7 +321,7 @@ export class MapService {
       }
       // apply 默认 atomic：dryRun 与 apply 之间若有竞争/落盘失败，整批回滚（含 time.advance）。
       try {
-        const applied = await this.deps.arbiter.apply(roomId, batch, this.cause(roomId, "tick"));
+        const applied = await this.deps.arbiter.apply(roomId, batch, this.cause(roomId, "tick"), { captureState: true });
         const rejected = applied.rejected[0];
         if (!applied.ok || rejected) {
           const code = rejected && isErrorCode(rejected.code)
@@ -329,13 +332,14 @@ export class MapService {
           return this.outbound(fail(code, rejected?.detail ?? applied.error?.message ?? "tick 提案未提交"), roomId, state);
         }
         events.push(...applied.events);
+        stateAfter = applied.stateAfter;
       } catch (e) {
-        // 兜底未预期异常；语义与 E_STORE_FAULT 一致：整批未提交
+        // 同时涵盖落盘失败和替换后结果待核对的情况。
         return this.outbound(fail(codeOfError(e), e instanceof Error ? e.message : String(e)), roomId, state);
       }
     }
 
-    const after = await this.deps.store.snapshot(roomId);
+    const after = stateAfter ?? await this.deps.store.snapshot(roomId);
     const map = await this.buildMapView(after, actorId);
     // 出站脱敏（issue #53 成功 / #58 失败）：apply 的 envelopes 与 moved 摘要都要过
     // 同一层掩码，否则 tick 响应会从 payload/state 里漏出未认识 NPC 真名。

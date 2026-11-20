@@ -4,8 +4,9 @@
  * 每个私有步骤都控制在 50 行以内（AGENTS.md §6）；runStep 只保留顺序。
  */
 import { StoreCommitUnknownError } from "../store-write.ts";
+import type { ArbiterApplyResult } from "../arbiter.ts";
 import type {
-  ActorId, ApplyResult, ConversationEvent, ConversationSessionV2, ConversationTurnInput,
+  ActorId, ConversationEvent, ConversationSessionV2, ConversationTurnInput,
   Delivery, Envelope, Proposal, Utterance, WorldState,
 } from "../../../shared/src/index.ts";
 import { deliver, validateUtterance } from "./delivery.ts";
@@ -24,7 +25,7 @@ export interface StoreRetry {
 export class StoreFlushError extends Error {
   constructor(
     readonly roomId: string,
-    readonly applied: ApplyResult,
+    readonly applied: ArbiterApplyResult,
     message = "store.flush failed",
     readonly retry?: StoreRetry,
     readonly fresh: Delivery[] = [],
@@ -47,7 +48,7 @@ export function rememberRecent(s: ConversationSessionV2, fresh: readonly Deliver
   recentBySession.set(s, merged);
 }
 
-type CommitFn = (s: ConversationSessionV2, applied: ApplyResult) => Promise<ConversationEvent>;
+type CommitFn = (s: ConversationSessionV2, applied: ArbiterApplyResult) => Promise<ConversationEvent>;
 type NpcResult = NpcDecisionResult & { npcId: ActorId };
 type PlayerResult =
   | { aborted: true }
@@ -219,15 +220,15 @@ async function commitStep(ctx: StepCtx, utterance?: Utterance): Promise<boolean>
     ts: now, actorId: utterance?.speaker ?? "sys", type: "dialogue.speak" as const, payload: {},
   };
   // lastLocId 只在提交成功后前移，失败时下轮仍能检测换地点（三审 P3-⑥）
-  const finish = async (applied: ApplyResult): Promise<void> => {
+  const finish = async (applied: ArbiterApplyResult): Promise<void> => {
     out.push(await commit(s, applied));
     s.lastLocId = ctx.state.room.scene.locId;
   };
   if (!ctx.proposals.length) {
-    await finish({ ok: true, mode: "atomic", seq: seq + 1, applied: [], rejected: [], events: [] });
+    await finish({ ok: true, mode: "atomic", seq: seq + 1, stateAfter: ctx.state, applied: [], rejected: [], events: [] });
     return true;
   }
-  const applied = await arbiter.apply(s.roomId, ctx.proposals, cause, { expectedSeq: seq });
+  const applied = await arbiter.apply(s.roomId, ctx.proposals, cause, { expectedSeq: seq, captureState: true });
   if (!applied.ok) {
     // ③ 写盘失败是暂时故障：必须走 retryable 分支，绝不能进 seen 缓存
     if (applied.error?.code === "E_STORE_FAULT") {

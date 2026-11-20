@@ -274,14 +274,14 @@ export class DefaultTurn implements Turn {
       // 两阶段兜底：记忆写坏了不该毁掉整回合（玩家行动本身是合法的），去掉记忆重提一次。
       const applyBatch = async (ops: Proposal[], expectedSeq: number) => {
         let result = await this.deps.arbiter.apply(req.roomId, ops, causeForBudget, {
-          expectedSeq, turnBudget, commitEvidence: evidence,
+          expectedSeq, turnBudget, commitEvidence: evidence, captureState: true,
         });
         if (!result.ok && memoryProposals.length > 0 && result.rejected.length > 0) {
           const onlyMemory = result.rejected.every((r) => memoryProposals.includes(r.proposal));
           if (onlyMemory) {
             memoryRejected = true;
             result = await this.deps.arbiter.apply(req.roomId, [...moduleProposals, ...llmProposals], causeForBudget, {
-              expectedSeq, turnBudget, commitEvidence: evidence,
+              expectedSeq, turnBudget, commitEvidence: evidence, captureState: true,
             });
           }
         }
@@ -397,8 +397,8 @@ export class DefaultTurn implements Turn {
       // 落库成功才更新记忆索引：读路径与写路径共用同一份事件日志（可回放）
       for (const ev of applied.events) this.deps.memory.ingest(ev);
 
-      const after = await this.deps.store.snapshot(req.roomId);
       if (applied.events.length > 0) {
+        const after = applied.stateAfter ?? await this.deps.store.snapshot(req.roomId);
         yield emit({ type: "turn.patch", state: after, ops: applied.applied });
       }
 
@@ -411,7 +411,7 @@ export class DefaultTurn implements Turn {
         return;
       }
 
-      const seq = this.deps.store.seq(req.roomId);
+      const seq = applied.seq;
       // issue #34：apps/server 的消费者在收到 turn.commit 后立即 `break` 生成器，
       // yield 之后的语句不会执行；所有提交记账必须在 yield 之前完成。
       this.seen.set(key, events);

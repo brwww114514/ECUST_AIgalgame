@@ -1,4 +1,4 @@
-import { mkdir, open, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Envelope } from "../../shared/src/contract/types.ts";
 
@@ -20,33 +20,41 @@ async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
+/** 逐级同步新目录项，即使初始化中途失败也能从已经创建的那一级继续。 */
+export async function prepareDurableDirectory(dir: string): Promise<void> {
+  const missing: string[] = [];
+  let directory = path.resolve(dir);
+  for (;;) {
+    try {
+      if (!(await stat(directory)).isDirectory()) {
+        throw Object.assign(new Error("存档路径不是目录"), { code: "ENOTDIR" });
+      }
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      missing.push(directory);
+      directory = path.dirname(directory);
+    }
+  }
+  // 已存在的最后一级也可能由刚失败的初始化或管理员脚本创建。
+  await syncDirectory(path.dirname(directory));
+  for (const child of missing.reverse()) {
+    await mkdir(child);
+    await syncDirectory(path.dirname(child));
+  }
+}
+
 export class RoomLogWriter {
   private ready?: Promise<void>;
-  private createdRoot?: string;
 
   constructor(private readonly directory: string) {}
 
   private ensureDirectory(): Promise<void> {
-    this.ready ??= this.prepareDirectory().catch((error: unknown) => {
+    this.ready ??= prepareDurableDirectory(this.directory).catch((error: unknown) => {
       this.ready = undefined;
       throw error;
     });
     return this.ready;
-  }
-
-  private async prepareDirectory(): Promise<void> {
-    const created = await mkdir(this.directory, { recursive: true });
-    this.createdRoot ??= created;
-    if (!this.createdRoot) return;
-
-    // 首次建目录时，每级新目录的名字也要在父目录里持久化。
-    const last = path.dirname(path.resolve(this.createdRoot));
-    let parent = path.dirname(path.resolve(this.directory));
-    while (parent !== last) {
-      await syncDirectory(parent);
-      parent = path.dirname(parent);
-    }
-    await syncDirectory(last);
   }
 
   async write(file: string, events: readonly Envelope[]): Promise<void> {

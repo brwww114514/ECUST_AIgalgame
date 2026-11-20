@@ -87,7 +87,11 @@ export class TurnHistory {
   private readonly chains = new Map<string, Promise<void>>();
   private readonly known = new Map<string, Set<string>>();
 
-  constructor(private readonly roomsDir: string) {}
+  /**
+   * @param maxLimit 单次 list 的上限（默认 200，来自 GALGAME_HISTORY_LIMIT_MAX）；
+   *   200 只是单次响应大小，不是历史总量上限——更早的历史靠 earlierCursor 翻页。
+   */
+  constructor(private readonly roomsDir: string, private readonly maxLimit = 200) {}
 
   fileFor(roomId: string): string {
     return path.join(this.roomsDir, `${safeRoomFile(roomId)}.history.jsonl`);
@@ -120,7 +124,7 @@ export class TurnHistory {
   async list(roomId: string, query: HistoryQuery = {}): Promise<HistoryPage> {
     const all = await this.readAll(roomId);
     const rawLimit = query.limit ?? 50;
-    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 50, 1), 200);
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 50, 1), this.maxLimit);
     let end = all.length;
     let start = Math.max(0, end - limit);
     if (query.match) {

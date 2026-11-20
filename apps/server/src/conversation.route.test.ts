@@ -48,9 +48,12 @@ function testConfig(): ServerConfig {
 }
 
 const prevScan = process.env.GALGAME_GOSSIP_SCAN_MS;
+const prevMax = process.env.GALGAME_CONVERSATION_MAX_SESSIONS;
 afterAll(() => {
   if (prevScan === undefined) delete process.env.GALGAME_GOSSIP_SCAN_MS;
   else process.env.GALGAME_GOSSIP_SCAN_MS = prevScan;
+  if (prevMax === undefined) delete process.env.GALGAME_CONVERSATION_MAX_SESSIONS;
+  else process.env.GALGAME_CONVERSATION_MAX_SESSIONS = prevMax;
 });
 
 async function appWith(): Promise<{ app: FastifyInstance; deps: App; roomId: string; actorId: string; llm: MockLlm }> {
@@ -109,8 +112,9 @@ function fakeConversationHost(opts: {
   events: ConversationEvent[];
   openDelayMs?: number;
   runDelayMs?: number;
-}): { host: ConversationHostV2; openCalls: () => number } {
+}): { host: ConversationHostV2; openCalls: () => number; closeCalls: () => string[] } {
   let opens = 0;
+  const closed: string[] = [];
   const sessions = new Map<string, ConversationSessionV2>();
   const host = {
     async open(spec: { roomId: string; participants: string[] }): Promise<ConversationSessionV2> {
@@ -127,12 +131,23 @@ function fakeConversationHost(opts: {
       return session;
     },
     get(id: string): ConversationSessionV2 | undefined { return sessions.get(id); },
+    // #123：路由层 openOrReuse 在 Map miss 时回退 getByRoom；reserve 时用 hasCommittedByRoom 确认真重放
+    getByRoom(roomId: string): ConversationSessionV2 | undefined {
+      return [...sessions.values()].filter((s) => s.roomId === roomId && s.status === "open").at(-1);
+    },
+    hasCommittedByRoom(): boolean { return false; },
+    close(id: string): boolean {
+      closed.push(id);
+      const s = sessions.get(id);
+      if (s) s.status = "closed";
+      return sessions.has(id);
+    },
     async *run(_sessionId: string): AsyncIterable<ConversationEvent> {
       if (opts.runDelayMs) await new Promise<void>((resolve) => setTimeout(resolve, opts.runDelayMs));
       for (const ev of opts.events) yield ev;
     },
   } as unknown as ConversationHostV2;
-  return { host, openCalls: () => opens };
+  return { host, openCalls: () => opens, closeCalls: () => closed };
 }
 
 /** 换掉 host 但不换房间/账号：房间仍由 createApp 真建，guardRoom/roomGate 照常生效 */
@@ -226,6 +241,68 @@ describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
     await app.close();
   });
 
+  it("#104：会话 Map 淘汰旧 room 时调用 host.close() 清理（不泄漏）", async () => {
+    const prevMax = process.env.GALGAME_CONVERSATION_MAX_SESSIONS;
+    process.env.GALGAME_CONVERSATION_MAX_SESSIONS = "2";
+    try {
+      const fake = fakeConversationHost({ events: [] });
+      process.env.GALGAME_GOSSIP_SCAN_MS = "0";
+      const deps = await createApp(testConfig());
+      const rooms = [await deps.createRoom("solo", "u_owner"), await deps.createRoom("solo", "u_owner"), await deps.createRoom("solo", "u_owner")];
+      deps.conversation = { host: fake.host };
+      const app = Fastify();
+      registerRoutes(app, deps);
+      const H = { "x-user-id": "u_owner" };
+      for (const { roomId, actorId } of rooms) {
+        const res = await app.inject({
+          method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+          payload: payload(actorId, `evict-${roomId}`),
+        });
+        expect(res.statusCode).toBe(200);
+      }
+      // 3 个房间、上限 2 → 第 1 个被淘汰，host.close 至少被调用一次且对象被标记 closed
+      expect(fake.closeCalls().length).toBeGreaterThanOrEqual(1);
+      expect(fake.host.get(fake.closeCalls()[0]!)?.status).toBe("closed");
+      await app.close();
+    } finally {
+      if (prevMax === undefined) delete process.env.GALGAME_CONVERSATION_MAX_SESSIONS;
+      else process.env.GALGAME_CONVERSATION_MAX_SESSIONS = prevMax;
+    }
+  });
+
+  it("#104：/conversation 计入 TurnLedger 额度——成功后 committed，超额 429 且共享 /turns 账本", async () => {
+    const { app, deps, roomId, actorId } = await appWith();
+    const url = `/api/v1/rooms/${roomId}/conversation`;
+    const H = { "x-user-id": "u_owner", origin: "https://galgame.test" };
+    // 与 v1 /turns 同一 dailyLimitFor/ledger：把默认额度设为 1
+    await app.inject({
+      method: "PUT", url: "/api/v1/admin/settings",
+      headers: { "x-admin-token": "dev-admin", origin: "https://galgame.test" },
+      payload: { defaultDailyTurns: 1 },
+    });
+
+    const first = await app.inject({ method: "POST", url, headers: H, payload: payload(actorId, "quota-c1") });
+    expect(first.statusCode).toBe(200);
+    expect(sse(first.body).some((e) => e.type === "conversation.committed")).toBe(true);
+    // 账本条目已提交（作用域：u_owner + roomId + clientTurnId）
+    expect(deps.ledger.get({ userId: "u_owner", roomId, clientTurnId: "quota-c1" })?.state).toBe("committed");
+
+    // 第二个逻辑回合：额度已用完 → 429 E_RATE_LIMITED，拒绝在 SSE 头之前（普通 JSON）
+    const second = await app.inject({ method: "POST", url, headers: H, payload: payload(actorId, "quota-c2") });
+    expect(second.statusCode).toBe(429);
+    expect(second.json()).toMatchObject({ ok: false, code: "E_RATE_LIMITED" });
+    expect(second.headers["content-type"]).not.toContain("text/event-stream");
+
+    // 与 /turns 共用同一账本：v1 回合同样被额度拦住
+    const v1 = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/turns`, headers: H,
+      payload: { actorId, input: "你好", clientTurnId: "quota-v1" },
+    });
+    expect(v1.statusCode).toBe(429);
+    expect(v1.json()).toMatchObject({ ok: false, code: "E_RATE_LIMITED" });
+    await app.close();
+  });
+
   it("老 /turns 不受影响", async () => {
     const { app, roomId, actorId } = await appWith();
     const res = await app.inject({
@@ -267,6 +344,39 @@ describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
     });
     expect(withActor.statusCode).toBe(200);
     expect(sse(withActor.body).map((e) => e.type)).toContain("conversation.phase");
+    await app.close();
+  });
+
+  it("#106：HTTP 边界——超长 utterance、interject+utterance 同给、未知 sessionId 均按契约拒绝/不崩", async () => {
+    const { app, roomId, actorId } = await appWith();
+    const url = `/api/v1/rooms/${roomId}/conversation`;
+    const H = { "x-user-id": "u_owner" };
+
+    // 1) utterance.content 超过 2000 字 → zod 400 E_SCHEMA_INVALID，不开 SSE 流
+    const tooLong = await app.inject({
+      method: "POST", url, headers: H,
+      payload: { actorId, clientTurnId: "boundary-long", utterance: { mode: "broadcast", content: "x".repeat(2001) } },
+    });
+    expect(tooLong.statusCode).toBe(400);
+    expect(tooLong.json()).toMatchObject({ ok: false, code: "E_SCHEMA_INVALID" });
+
+    // 2) interject 与 utterance 同时给：实现按既有语义接受（插话只切 phase，utterance 忽略），
+    //    不崩且 200。显式锁住该行为，避免后续把两者同时给当成非法输入而误改（#106 记文档口径）。
+    const both = await app.inject({
+      method: "POST", url, headers: H,
+      payload: { actorId, clientTurnId: "boundary-both", interject: "npc_x", utterance: { mode: "broadcast", content: "大家好" } },
+    });
+    expect(both.statusCode).toBe(200);
+    expect(both.headers["content-type"]).toContain("text/event-stream");
+
+    // 3) 未知 sessionId：ConversationBody 不接收 sessionId 字段（strict），传了 → 400 E_SCHEMA_INVALID，
+    //    服务端不会去 host.get 一个不存在的会话（无 replay/越权面）。
+    const unknownSession = await app.inject({
+      method: "POST", url, headers: H,
+      payload: { ...payload(actorId, "boundary-session"), sessionId: "conv_missing" },
+    });
+    expect(unknownSession.statusCode).toBe(400);
+    expect(unknownSession.json()).toMatchObject({ ok: false, code: "E_SCHEMA_INVALID" });
     await app.close();
   });
 
@@ -344,6 +454,8 @@ describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
     const fake = fakeConversationHost({ events: [], openDelayMs: 20, runDelayMs: 20 });
     const { app, roomId, actorId } = await appWithHost(() => fake.host);
     const url = `/api/v1/rooms/${roomId}/conversation`;
+    // 两条请求带 userId（#104 起会走 TurnLedger），但不同 clientTurnId；
+    // 预留+host.run+结算共用房间串行锁，第二条须等第一条 committed 后再 reserve（不应 E_TURN_BUSY）。
     const [a, b] = await Promise.all([
       app.inject({ method: "POST", url, headers: { "x-user-id": "u_owner" }, payload: payload(actorId, "race-1") }),
       app.inject({ method: "POST", url, headers: { "x-user-id": "u_owner" }, payload: payload(actorId, "race-2") }),

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { WorldState, ViewPatch } from "../../../packages/shared/src/contract/types.ts";
-import { LEGACY_ACTOR_ID, createSoloRoom, deleteSave, fetchHistory, fetchState, fetchTurnStatus, runTurn, travel } from "./api.ts";
+import { LEGACY_ACTOR_ID, createSoloRoom, createSlot, deleteSave, deleteSlot, fetchHistory, fetchState, fetchTurnStatus, runTurn, travel, updateSlot } from "./api.ts";
+import type { SaveSlot } from "./api.ts";
 import type { HistoryPage } from "./api.ts";
 import { GameError, HttpError, httpFailMessage, isUnauthorized, onUnauthorized } from "./http.ts";
 import { useAuth } from "./use-auth.ts";
@@ -458,6 +459,49 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
         if (!ok) setErr("移除失败（索引未更新），请稍后重试");
       } catch (e) {
         setErr(`移除失败：${fail(e)}`);
+      }
+      await refreshSaves();
+    },
+    [refreshSaves, fail],
+  );
+
+  /** issue #98：命名槽最小交互——建/改名/删只动索引映射，房间与历史不动 */
+  const createNamedSlot = useCallback(
+    async (label: string, roomId: string) => {
+      try {
+        await createSlot(label, roomId);
+        setErr("");
+      } catch (e) {
+        setErr(`新建槽失败：${fail(e)}`);
+      }
+      await refreshSaves();
+    },
+    [refreshSaves, fail],
+  );
+
+  const renameNamedSlot = useCallback(
+    async (slot: SaveSlot) => {
+      const label = window.prompt("新的槽名（1–40 字）", slot.label);
+      if (!label || !label.trim() || label === slot.label) return;
+      try {
+        await updateSlot(slot.slotId, { label });
+        setErr("");
+      } catch (e) {
+        setErr(`改名失败：${fail(e)}`);
+      }
+      await refreshSaves();
+    },
+    [refreshSaves, fail],
+  );
+
+  const removeNamedSlot = useCallback(
+    async (slot: SaveSlot) => {
+      if (!window.confirm(`删除槽「${slot.label}」？房间与对话历史不会删除。`)) return;
+      try {
+        await deleteSlot(slot.slotId);
+        setErr("");
+      } catch (e) {
+        setErr(`删除槽失败：${fail(e)}`);
       }
       await refreshSaves();
     },
@@ -924,6 +968,9 @@ await runTurn(
           savesState={savesState}
           onOpenSave={(save) => void openSave(save)}
           onDeleteSave={(save) => void removeSave(save)}
+          onCreateSlot={(label, roomId) => void createNamedSlot(label, roomId)}
+          onRenameSlot={(slot) => void renameNamedSlot(slot)}
+          onDeleteSlot={(slot) => void removeNamedSlot(slot)}
           savedRoomId={savedRoomId}
           busy={entering}
           err={err}

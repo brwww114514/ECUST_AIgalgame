@@ -2,7 +2,40 @@
 
 按合并到 `main` 的日期记录。提交 sha 可在 `git log` 中查；跨系统协议版本以 `CONTRACT_VERSION` 为准（产品版本见 `package.json`，当前 0.0.1）。
 
-版本与 tag 对应：`v0.1.0` M0 骨架 → `v0.1.1` 引擎 3.0.0 → `v0.1.2` 审核/锚定 → `v0.2.0` 地图 v0.2 → `v0.3.0` 前端体验与运行时模型接入（PR #2）→ `v0.4.0` 记忆子系统 3.1.0 + 地图交互/图鉴 registry 收口（PR #4/#5）→ `v0.5.0` issue #1/#3/#7/#8 批量落地（PR #9–#13）→ `v0.5.1` 三条 issue 修复（PR #22–#24）→ `v0.5.2` 记忆可信边界 / 404 守卫 / tick 原子 / 部署边界（PR #43–#45，CONTRACT 3.3.0）→ `v0.5.3` Turn 幂等（PR #50）→ `v0.5.4` NPC 认识与名字解锁 + 地图出站脱敏/档案收窄（PR #52/#55/#56，CONTRACT 3.4.1）→ `v0.5.5`（候选版本号，尚未打 tag；发版时决定）简易用户系统 + 房间授权/行动额度（PR #72，merge 840e9c5，CONTRACT 3.5.0）→ `dev/v2` 群聊/微信八卦（PR #51，merge 02a3318）已合入 main（CONTRACT 3.6.0，13 op）。
+版本与 tag 对应：`v0.1.0` M0 骨架 → `v0.1.1` 引擎 3.0.0 → `v0.1.2` 审核/锚定 → `v0.2.0` 地图 v0.2 → `v0.3.0` 前端体验与运行时模型接入（PR #2）→ `v0.4.0` 记忆子系统 3.1.0 + 地图交互/图鉴 registry 收口（PR #4/#5）→ `v0.5.0` issue #1/#3/#7/#8 批量落地（PR #9–#13）→ `v0.5.1` 三条 issue 修复（PR #22–#24）→ `v0.5.2` 记忆可信边界 / 404 守卫 / tick 原子 / 部署边界（PR #43–#45，CONTRACT 3.3.0）→ `v0.5.3` Turn 幂等（PR #50）→ `v0.5.4` NPC 认识与名字解锁 + 地图出站脱敏/档案收窄（PR #52/#55/#56，CONTRACT 3.4.1）→ `v0.5.5`（候选版本号，尚未打 tag；发版时决定）简易用户系统 + 房间授权/行动额度（PR #72，merge 840e9c5，CONTRACT 3.5.0）→ `dev/v2` 群聊/微信八卦（PR #51，merge 02a3318）已合入 main（CONTRACT 3.6.0，13 op）→ `v0.5.6`（候选版本号，尚未打 tag；发版时决定）PR #123 打回修复批（14 commits，CONTRACT 3.6.0 不变）。
+
+## v0.5.6（候选 tag，尚未打；发版时决定）— 2026-11-20 PR #123 打回修复批（14 commits，CONTRACT 3.6.0 不变）
+
+> 合并前登记。基线 `6524420` → PR #123 head `2183828`；14 commit 覆盖 #76/#84/#90/#94/#95/#96/#97/#98/#99/#100/#104/#105/#106/#122。按「只增登记、不改契约」执行：13 op、`apiVersion`、`CONTRACT_VERSION`、`PROMPT_VERSION`、§7 错误码集合均未变（逐条见 docs/03 §10.24）。
+
+### 新增
+
+- **槽位存档（#98）**：`GET/POST/PUT/DELETE /api/v1/me/saves/slots`、`SaveSlot`、`SaveEntry.slotId` 与 `/me/saves` 的 `slots[]`；只删槽映射，不删房间事件日志/历史。拒绝路径复用已有错误码（400 `E_SCHEMA_INVALID` / 404 `E_REF_NOT_FOUND` / 409 `E_ID_TAKEN` / `E_OVER_LIMIT`）。
+- **存档导出/导入归档（#99）+ 只读重建（#122）**：`scripts/export-save.ts`、`scripts/import-save.ts`、`scripts/rebuild-saves.ts`；归档格式见 docs/02 §7.0，重复导入按 id 跳过。
+- **历史行上限可配（#100）**：`history.limitMax` / `GALGAME_HISTORY_LIMIT_MAX`（默认 200），限制单次响应行数，更早历史用 `earlierCursor` / `before` 翻页。
+- **玩法/导演补口（#96/#97）**：npc.plot 密谋导演、study 最小模块；只加内容，不改引擎。
+- **部署冒烟入口（#84）**：`npm run deploy:smoke`（`scripts/deploy-smoke.ts`），覆盖鉴权/CSRF/限流/邀请码/数据卷持久化。
+
+### 修复 / 变更
+
+- **跨重启幂等（#76）**：引擎在成功批次末尾写 `turn.committed` marker（payload `{clientTurnId,turnId,actorId,committedSeq,narrative?,facts?,usage?}`），重启从 EventLog 重建 `seen` 并补齐历史；本批把该事件补登记到 `content/registry/events.json` 并同步 docs/03 §4、docs/04 §3.2、docs/11（此前文档称「从未发射」已过时）。只增登记，不 bump 版本。
+- **会话快照端到端恢复（#90）**：恢复的会话由路由 `openOrReuse` 复用，不再是孤儿；坏档只降级该房为新会话。
+- **群聊额度统一（#104）**：`/conversation` 与 v1 `/turns` 共用 `TurnLedger`，预留/结算同房间串行；超额度 429 `E_RATE_LIMITED`、冲突 409 `E_PRECONDITION`/`E_TURN_BUSY`。
+- **interject 口径对齐（#106）**：无绑定角色 → 400 `E_SCHEMA_INVALID`；有绑定角色的 interject-only 预留额度并落 `unconfirmed`（文档不再写「不计入额度」），长流每 15s 发 SSE 注释心跳。
+- **管理端点鉴权统一（#105）**、验收测试补口（#94/#95）：不改契约。
+
+### 验证（lead 在 PR #123 修复分支实跑）
+
+- `npm test` → **93 files / 725 tests** 全过；`npm run check:contract` → **8/8**（CONTRACT 3.6.0）；`npm run deploy:smoke` → **12/12**。
+- 本批为纯文档/契约登记改动；文档 worktree 的 `npm run typecheck`、`npm test`、`npm run check:contract` 复跑输出见交付报告。
+
+### 已知边界
+
+- `turn.committed` 只补登记（事件已在代码发射），**不 bump `CONTRACT_VERSION`**；registry 中 `broadcast:false`，只进 EventLog，不向客户端广播。
+- 每回合因 `attr.changed` + marker 共多 1 条 seq；`commit.seq == marker.seq == committedSeq`，历史 `earlierCursor`/分页按此口径。
+- 有绑定 `actorId` 的 interject-only 落 `unconfirmed`，额度仍占占用态，需后续对账结案（不是免费）。
+- `deploy:smoke` 12/12 只证明应用层局部链路，**不覆盖** Docker compose、Nginx TLS/域名隔离、自签证书与备份恢复，后者仍须目标机实测。
+- 单进程单写者、`actionsEnabled` 全局暂停、`unconfirmed` 需人工对账等沿用 v0.5.5 已知边界。
 
 ## 3.6.0（dev/v2，2026-11-19）
 

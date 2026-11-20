@@ -9,6 +9,7 @@ import type { AuditPolicy, AuditPort, AuditVerdict } from "./audit.ts";
 import { DEFAULT_AUDIT_POLICY, NoopAudit, formatWarning, labelOf } from "./audit.ts";
 import type { DefaultArbiter } from "./arbiter.ts";
 import type { EventLog } from "./store.ts";
+import type { TurnCommitEvidence } from "./turn.evidence.ts";
 
 export type AuditGateResult =
   | { kind: "ok" }
@@ -81,6 +82,7 @@ export class AuditGate {
     verdict: AuditVerdict,
     state: WorldState,
     seq: number,
+    evidence?: TurnCommitEvidence,
   ): Promise<TurnEvent[]> {
     const policy = this.policy;
     const plr = state.entities[args.actorId];
@@ -151,7 +153,9 @@ export class AuditGate {
     }
 
     // 处置信封必须是 engine.* 来源：memory.write 的代写资格只看信封，不看 proposal.by
-    const applied = await this.deps.arbiter.apply(args.roomId, ops, { ...cause, type: "engine.audit" }, { expectedSeq: seq, mode: "atomic" });
+    const applied = await this.deps.arbiter.apply(args.roomId, ops, { ...cause, type: "engine.audit" }, {
+      expectedSeq: seq, mode: "atomic", ...(evidence ? { commitEvidence: evidence } : {}),
+    });
 
     const events: TurnEvent[] = [];
     if (!applied.ok) {

@@ -38,6 +38,8 @@ import {
   loadGossipPolicy,
   loadConversationPolicy,
   loadModes,
+  loadSnapshot,
+  sessionSnapshotPath,
 } from "../../../packages/engine/src/v2/index.ts";
 import { DEFAULT_CONVERSATION_POLICY } from "../../../packages/shared/src/index.ts";
 import type { ServerConfig } from "./config.ts";
@@ -242,7 +244,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   // 续玩（issue #7）：历史和存档索引都是"投影"，写失败不影响已提交的回合。
   // 历史挂在 Turn 外层（而不是 HTTP 路由里），这样 map.travel 这类内部回合也能被记录。
   const dataRoot = path.resolve(cfg.dataDir);
-  const history = new TurnHistory(path.join(dataRoot, "history"));
+  const history = new TurnHistory(path.join(dataRoot, "history"), cfg.historyLimitMax ?? 200);
   const saves = new SaveIndex(path.join(dataRoot, "users"));
   const users = new AuthStore(path.join(dataRoot, "auth", "auth.json"));
   await users.load();
@@ -363,9 +365,10 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
     policy: gossipPolicy, conversation: conversationPolicy, now,
     audit, auditPolicy, memory,
   });
-  // ---------------------------------------------------------------- dev/v2 群聊会话宿主（issue #89）
+  // ---------------------------------------------------------------- dev/v2 群聊会话宿主（issue #89/#90）
   // 场景文案来自 content/ 的地图数据 + 最近台词，不为氛围再开一次 LLM 调用；
-  // 真正的说话/心理由 NpcAgent 各自调 LLM。会话与幂等缓存都在 host 进程内（重启即新会话，见 docs/03 §5.2.11）。
+  // 真正的说话/心理由 NpcAgent 各自调 LLM。#90：会话从 data/rooms/<roomId>/conversation-sessions.json
+  // 恢复（独立文件、不进 EventLog）；坏档/缺档降级为新会话（旧会话 closed），不拖垮启动。
   const conversationModes = await loadModes(path.join(contentRoot, "v2", "utterance-modes.json"));
   const conversationScene: SceneAgentPort = {
     async describe({ locName }) {
@@ -388,6 +391,27 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
     budget: talkBudget,
     now,
   });
+
+  // #90：启动时逐房间恢复会话快照；每个房间单独恢复，某房坏档只影响该房（fail-soft）。
+  for (const roomId of await store.listRooms()) {
+    try {
+      const loaded = await loadSnapshot(sessionSnapshotPath(dataRoot, roomId));
+      if (!loaded.ok) {
+        // 缺档对新房间是正常情况；其他损坏原因必须可见，不能静默降级（#123 P1-5）
+        if (loaded.reason !== "missing") {
+          console.warn(`[conversation] 房间 ${roomId} 会话快照不可用（${loaded.reason}），已降级为新会话`);
+        }
+        continue;
+      }
+      const restored = conversation.restoreSessions(loaded.snapshot, roomId);
+      if (restored.degraded) {
+        console.warn(`[conversation] 房间 ${roomId} 会话快照恢复降级（${restored.reason ?? "未知原因"}），已按空会话启动`);
+      }
+    } catch (e) {
+      // 快照是投影，坏档不该拖垮启动；缺失/坏档/版本不符都走「新会话 + 旧 closed」降级
+      console.warn(`[conversation] 恢复房间 ${roomId} 会话快照失败，已降级：`, e instanceof Error ? e.message : e);
+    }
+  }
 
   // 后台波次：玩家离线也能互相回消息。unref + try/catch，失败等下一轮（仿 canonize 补扫）
   const gossipScanMs = Number(process.env.GALGAME_GOSSIP_SCAN_MS ?? 30_000);
@@ -432,6 +456,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
     impressions,
     worldRoom,
     adminToken: cfg.adminToken,
+    historyLimitMax: cfg.historyLimitMax ?? 200,
     history,
     saves,
     auth,
@@ -442,8 +467,8 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
       inbox: (roomId, to) => messageIndex.inbox(roomId, to),
       subscribe: (roomId, viewer, cb) => gossip.subscribe(roomId, viewer, cb),
     },
-    /** dev/v2 群聊回合宿主（HTTP 接线见 routes.ts；缺省 = 不注册端点） */
-    conversation: { host: conversation, modes: conversationModes },
+    /** dev/v2 群聊回合宿主（HTTP 接线见 routes.ts；#90 快照保存需要 dataDir 定位房间文件） */
+    conversation: { host: conversation, modes: conversationModes, dataDir: dataRoot },
     turn,
     map,
     settings,

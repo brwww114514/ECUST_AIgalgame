@@ -13,7 +13,6 @@
  */
 
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Envelope, RoomId, Store, WorldState } from "../../shared/src/contract/types.ts";
 import { applyEvent, createInitialState } from "./projection.ts";
@@ -186,13 +185,14 @@ export class FileStore extends EventSourcedStore {
    * 同理，断档修复的写盘也必须在改内存之前完成，写失败时 loaded/日志保持原样、下次可重试。
    */
   private async readLog(roomId: RoomId): Promise<void> {
-    const file = this.file(roomId);
-    if (!existsSync(file)) {
+    let text: string;
+    try {
+      text = await readFile(this.file(roomId), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       this.loaded.add(roomId);
       return;
     }
-
-    const text = await readFile(file, "utf8");
     const parsed: Envelope[] = [];
     for (const line of text.split("\n")) {
       if (!line.trim()) continue;
@@ -284,8 +284,13 @@ export class FileStore extends EventSourcedStore {
 
   /** 扫描 data/rooms/*.jsonl：重启后要把这些房间的记忆索引一起重建（审阅 P0-1/P0-3） */
   override async listRooms(): Promise<RoomId[]> {
-    if (!existsSync(this.dir)) return [];
-    const names = await readdir(this.dir);
+    let names: string[];
+    try {
+      names = await readdir(this.dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
     return names
       .filter((n) => n.endsWith(".jsonl"))
       .map((n) => n.slice(0, -".jsonl".length))

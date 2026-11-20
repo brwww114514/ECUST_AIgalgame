@@ -1,5 +1,5 @@
 /** Store 的契约：日志是唯一真相，snapshot 只是缓存的投影。 */
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -145,6 +145,32 @@ describe("FileStore 读档失败不污染已载入标记（issue #7）", () => {
     dirs.push(d);
     return d;
   }
+
+  it.skipIf(process.getuid?.() === 0)("目录权限恢复后重新载入原日志，并接续写入", async () => {
+    const dir = await tempDir();
+    const seed = new FileStore(dir);
+    await seed.append(ROOM, [env(1, "entity.created", { entity: npc })]);
+    const store = new FileStore(dir);
+    await chmod(dir, 0o000);
+    try {
+      await expect(store.load(ROOM)).rejects.toMatchObject({ code: "EACCES" });
+      await expect(store.listRooms()).rejects.toMatchObject({ code: "EACCES" });
+    } finally {
+      await chmod(dir, 0o700);
+    }
+
+    expect(await store.load(ROOM)).toBe(1);
+    await store.append(ROOM, [env(2, "attr.changed", { entityId: npc.id, key: "stamina", to: 40 })]);
+    expect(await new FileStore(dir).events(ROOM, 1)).toMatchObject([{ seq: 1 }, { seq: 2 }]);
+  });
+
+  it("确实不存在的房间可以写入首批日志", async () => {
+    const dir = await tempDir();
+    const store = new FileStore(dir);
+    expect(await store.load(ROOM)).toBe(0);
+    await store.append(ROOM, [env(1, "entity.created", { entity: npc })]);
+    expect(await new FileStore(dir).load(ROOM)).toBe(1);
+  });
 
   it("readFile 第一次失败 → 未标记已载入；故障恢复后第二次 load 能读到真实日志", async () => {
     const dir = await tempDir();

@@ -140,6 +140,8 @@ export default function ChatPanel({
   useEffect(() => {
     if (!pendingTalk || pos?.locId !== pendingTalk.locId) return;
     setTalking({ id: pendingTalk.id, name: pendingTalk.name });
+    // issue #110：选中对话目标即视为"已交互"，否则缺伴随动作时按钮禁用却无提示
+    setV2Touched(true);
     setPendingTalk(null);
     setBlocked(null);
   }, [pos?.locId, pendingTalk]);
@@ -171,6 +173,8 @@ export default function ChatPanel({
     if (plan.kind === "present") {
       setBlocked(null);
       setTalking({ id: plan.npc.id, name: plan.npc.name || fallbackName });
+      // issue #110：点选在场 NPC 与选方式/输入同等视为"已交互"，让缺参数的校验提示出现
+      setV2Touched(true);
       return;
     }
     setTalking(null);

@@ -5,6 +5,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Envelope } from "../../shared/src/contract/types.ts";
 import { applyEvent, createInitialState } from "./projection.ts";
+import { DefaultArbiter } from "./arbiter.ts";
+import { emptyRegistry } from "./registry.ts";
 import { EventSourcedStore, FileStore, isSafeRoomId } from "./store.ts";
 
 const ROOM = "room_test";
@@ -132,6 +134,30 @@ describe("FileStore（jsonl 一房间一文件）", () => {
     }
     await writeFile(file, good + "\n");
     expect((await store.snapshot(ROOM)).entities.npc_lin?.name).toBe("林月");
+  });
+
+  it("裁决生成的长关系 ID 及删除事件在重启后仍能回放", async () => {
+    const dir = await tempDir();
+    const store = new FileStore(dir);
+    const arbiter = new DefaultArbiter({ store, registry: emptyRegistry() });
+    const from = "npc_" + "a".repeat(48);
+    const to = "npc_" + "b".repeat(48);
+    const cause = env(1, "turn.input", {});
+    const created = await arbiter.apply(ROOM, [
+      { op: "entity.create", args: { id: from, kind: "npc", name: "A", tags: ["t".repeat(40)] } },
+      { op: "entity.create", args: { id: to, kind: "npc", name: "B" } },
+      { op: "link.create", args: { kind: "knows", from, to } },
+      { op: "plot.upsert", args: { goal: "g".repeat(130), actors: [from, to] } },
+    ], cause);
+    expect(created.ok).toBe(true);
+    const state = await store.snapshot(ROOM);
+    const linkId = state.links[0]!.id;
+    expect(linkId.length).toBeGreaterThan(96);
+    expect(await new FileStore(dir).snapshot(ROOM)).toEqual(state);
+
+    const removed = await arbiter.apply(ROOM, [{ op: "link.remove", args: { linkId } }], cause);
+    expect(removed.ok).toBe(true);
+    expect((await new FileStore(dir).snapshot(ROOM)).links).toEqual([]);
   });
 
   it("replay 用的是同一套 applyEvent（与内存版逐字段相等）", () => {

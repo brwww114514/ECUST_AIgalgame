@@ -55,6 +55,30 @@ describe("bootstrap", () => {
     }
   });
 
+  it("成功提交的长回合 ID 重启后仍能读取", async () => {
+    const cfg = testConfig();
+    const deps = await createApp(cfg);
+    const { roomId, actorId } = await deps.createRoom("solo");
+    const app = Fastify();
+    registerRoutes(app, deps);
+    try {
+      const response = await app.inject({
+        method: "POST", url: `/api/v1/rooms/${roomId}/turns`,
+        payload: { actorId, input: "我去图书馆看看", clientTurnId: "a".repeat(100) },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain("turn.commit");
+      const events = await deps.store.events(roomId, 1);
+      expect(events.some((e) => (e.causedBy?.length ?? 0) > 96)).toBe(true);
+
+      const restarted = await createApp(cfg);
+      expect(await restarted.store.events(roomId, 1)).toEqual(events);
+      expect(await restarted.store.snapshot(roomId)).toEqual(await deps.store.snapshot(roomId));
+    } finally {
+      await app.close();
+    }
+  });
+
   it("建房把玩家与 NPC 的初始位置真正写进世界", async () => {
     const deps = await createApp(testConfig());
     const { roomId, actorId } = await deps.createRoom("solo");

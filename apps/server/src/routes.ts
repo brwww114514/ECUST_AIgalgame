@@ -382,6 +382,8 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     if (deps.auth.resolve(req)?.role === "admin") return null;
     return { ok: false, code: "E_FORBIDDEN", message };
   };
+  /** 经 adminOnly 放行后再取令牌交给 MapService 二次校验；本身不作为鉴权凭据（#105）。 */
+  const adminToken = (req: FastifyRequest): string | undefined => adminTokenOf(req.headers);
 
   app.post("/api/v1/settings/llm", async (req) => {
     const deny = settingsGuard(req);
@@ -1037,28 +1039,41 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     return safe(reply, () => deps.map.createDraft(req.body));
   });
 
-  app.get("/api/v1/map/drafts", (req, reply) => safe(reply, () => deps.map.listDrafts(adminTokenOf(req.headers))));
+  // #105：所有草案端点统一走 AdminTokenGate（sha256+timingSafeEqual+10次/60s 限流），
+  // 不再直接用原始令牌绕过 tokenEquals/限流。adminOnly 内部即 adminVerdict(req)，
+  // 与登录门/CSRF/room-guard/admin.routes 共用同一请求级判定缓存。
+  app.get("/api/v1/map/drafts", (req, reply) => {
+    const deny = adminOnly(req, "地图草案暂仅管理员可用");
+    if (deny) return reply.code(deny.code === "E_RATE_LIMITED" ? 429 : 200).send(deny);
+    return safe(reply, () => deps.map.listDrafts(adminToken(req)));
+  });
 
   app.get("/api/v1/map/drafts/:id", (req, reply) => {
     const deny = adminOnly(req, "地图草案暂仅管理员可用");
-    if (deny) return deny;
+    if (deny) return reply.code(deny.code === "E_RATE_LIMITED" ? 429 : 200).send(deny);
     const { id } = req.params as { id: string };
     return safe(reply, () => deps.map.getDraft(id));
   });
 
   app.post("/api/v1/admin/map/drafts/:id/review", (req, reply) => {
+    const deny = adminOnly(req, "地图草案暂仅管理员可用");
+    if (deny) return reply.code(deny.code === "E_RATE_LIMITED" ? 429 : 200).send(deny);
     const { id } = req.params as { id: string };
-    return safe(reply, () => deps.map.reviewDraft(id, adminTokenOf(req.headers), req.body));
+    return safe(reply, () => deps.map.reviewDraft(id, adminToken(req), req.body));
   });
 
   app.post("/api/v1/admin/map/drafts/:id/publish", (req, reply) => {
+    const deny = adminOnly(req, "地图草案暂仅管理员可用");
+    if (deny) return reply.code(deny.code === "E_RATE_LIMITED" ? 429 : 200).send(deny);
     const { id } = req.params as { id: string };
-    return safe(reply, () => deps.map.publishDraft(id, adminTokenOf(req.headers), req.body));
+    return safe(reply, () => deps.map.publishDraft(id, adminToken(req), req.body));
   });
 
   app.post("/api/v1/admin/map/drafts/:id/generate", (req, reply) => {
+    const deny = adminOnly(req, "地图草案暂仅管理员可用");
+    if (deny) return reply.code(deny.code === "E_RATE_LIMITED" ? 429 : 200).send(deny);
     const { id } = req.params as { id: string };
-    return safe(reply, () => deps.map.retryGenerate(id, adminTokenOf(req.headers)));
+    return safe(reply, () => deps.map.retryGenerate(id, adminToken(req)));
   });
 
   // ---------------------------------------------------------------- 图鉴 / 开局剧本（docs/03 §5.2.5、§5.2.6）

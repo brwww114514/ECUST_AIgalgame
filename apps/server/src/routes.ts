@@ -15,6 +15,7 @@ import { askedNameTargetId, introducedPresentIds, viewerSpeech } from "./name-un
 import type { SaveIndex } from "./saves.ts";
 import type { TurnHistory } from "./turn-history.ts";
 import { registerResumeRoutes } from "./resume.routes.ts";
+import { registerSlotsRoutes } from "./slots.routes.ts";
 import { registerAuthRoutes, type AuthService } from "./auth.ts";
 import { registerAdminRoutes } from "./admin.routes.ts";
 import { dailyLimitFor } from "./auth-store.ts";
@@ -457,7 +458,10 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
   });
 
   // 续玩/存档（issue #7）：独立区块，见 resume.routes.ts
-  registerResumeRoutes(app, deps, { userIdOf, isWorldRoom, roomExists });
+  const resumeHelpers = { userIdOf, isWorldRoom, roomExists };
+  registerResumeRoutes(app, deps, resumeHelpers);
+  // 命名槽（issue #98）：docs/03 §5.2.7 已登记，独立区块见 slots.routes.ts
+  registerSlotsRoutes(app, deps, resumeHelpers);
 
   // ---------------------------------------------------------------- dev/v2 微信私信
   if (deps.gossip) {

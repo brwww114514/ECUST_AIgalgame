@@ -30,7 +30,9 @@ export function registerResumeRoutes(app: FastifyInstance, deps: AppDeps, helper
     const userId = userIdOf(req, deps);
     if (!userId) return missingUser(reply);
     const saves = deps.saves ? await deps.saves.list(userId) : [];
-    return { ok: true, userId, saves };
+    // issue #98：附槽映射（旧索引 slots 缺省 → 空数组）
+    const slots = deps.saves ? await deps.saves.listSlots(userId) : [];
+    return { ok: true, userId, saves, slots };
   });
 
   app.delete("/api/v1/me/saves/:roomId", async (req, reply) => {

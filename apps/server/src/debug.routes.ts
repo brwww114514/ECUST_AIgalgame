@@ -28,8 +28,9 @@ export function registerDebugRoutes(app: FastifyInstance, deps: DebugRouteDeps):
   const unlockLimiter = new RateLimiter(5, 60_000);
   app.post("/api/v1/debug/unlock", async (req, reply) => {
     const ip = req.ip;
-    if (!unlockLimiter.hit(`dbg:${ip}`).allowed) {
-      reply.header("Retry-After", "60");
+    const decision = unlockLimiter.hit(`dbg:${ip}`);
+    if (!decision.allowed) {
+      reply.header("Retry-After", String(Math.max(1, Math.ceil(decision.retryAfterMs / 1000))));
       return reply.code(429).send({ ok: false, code: "E_RATE_LIMITED", message: "尝试过于频繁，请稍后再试" });
     }
     await sleep(progressiveDelayMs(unlockLimiter.count(`dbg:${ip}`)));

@@ -161,6 +161,34 @@ describe("FileStore（jsonl 一房间一文件）", () => {
     expect((await new FileStore(dir).snapshot(ROOM)).links).toEqual([]);
   });
 
+  it("v2 私信旧档（gossip 转发、message 自带 seq/visibility）可直接载入，无需迁移", async () => {
+    const dir = await tempDir();
+    const file = path.join(dir, `${ROOM}.jsonl`);
+    // 0a862d9 首次引入 msg.sent 时的载荷形状：message.seq 与 visibility 都在，
+    // 没有后续版本新增的顶层字段。严格校验不能把这种合法旧档判成坏档。
+    const legacy = [
+      env(1, "entity.created", { entity: npc }),
+      {
+        v: 1, id: "evt_2", roomId: ROOM, seq: 2, ts: 20, actorId: "npc_lin", type: "msg.sent",
+        audience: ["npc_lin", "plr_me"],
+        payload: {
+          message: {
+            id: `msg_${ROOM}_evt_1_1`, roomId: ROOM, from: "npc_lin", to: "plr_me",
+            kind: "gossip", content: "旧档里的转发私信", hop: 1, confidence: 0.8,
+            visibility: "private", createdAt: 5, seq: 1,
+          },
+        },
+      },
+    ];
+    const original = legacy.map((event) => JSON.stringify(event)).join("\n") + "\n";
+    await writeFile(file, original, "utf8");
+
+    const store = new FileStore(dir);
+    expect(await store.load(ROOM)).toBe(2);
+    expect((await store.snapshot(ROOM)).entities.npc_lin?.name).toBe("林月");
+    expect(await readFile(file, "utf8")).toBe(original);
+  });
+
   it("replay 用的是同一套 applyEvent（与内存版逐字段相等）", () => {
     const state = applyEvent(createInitialState(ROOM), env(1, "entity.created", { entity: npc }));
     expect(state.entities.npc_lin?.status).toBe("active");

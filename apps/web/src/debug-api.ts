@@ -56,6 +56,14 @@ export interface DebugSnapshot {
 
 const TOKEN_KEY = "ecust.galgame.debugToken";
 
+/** 令牌失效专用错误：调用方据此分支，不再靠错误文案 includes("过期") 判断。 */
+export class DebugSessionExpiredError extends Error {
+  constructor() {
+    super("调试会话已过期，请重新输入口令");
+    this.name = "DebugSessionExpiredError";
+  }
+}
+
 export function cachedDebugToken(): string {
   try {
     return sessionStorage.getItem(TOKEN_KEY) ?? "";
@@ -104,7 +112,7 @@ export async function fetchDebugSnapshot(roomId: string, token: string): Promise
   });
   if (r.status === 401) {
     clearDebugToken();
-    throw new Error("调试会话已过期，请重新输入口令");
+    throw new DebugSessionExpiredError();
   }
   if (!r.ok) throw new Error(`读取调试快照失败（HTTP ${r.status}）`);
   const data = (await r.json()) as { ok: boolean; snapshot: DebugSnapshot };

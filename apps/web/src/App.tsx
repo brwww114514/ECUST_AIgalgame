@@ -893,6 +893,8 @@ await runTurn(
         return;
       }
       scopeRef.current.renew();
+      clearDebugToken();
+      setDebugToken("");
       resetRoomUi();
       setScenario(null);
       setSavedRoomId("");
@@ -1092,7 +1094,7 @@ await runTurn(
         <DebugPanel
           roomId={roomId}
           token={debugToken}
-          onClose={() => setDebugToken("")}
+          onClose={() => { clearDebugToken(); setDebugToken(""); }}
           onExpired={() => { clearDebugToken(); setDebugToken(""); }}
         />
       )}

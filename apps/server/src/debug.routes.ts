@@ -7,8 +7,10 @@ import { z } from "zod";
 import type { RoomId, Store } from "../../../packages/shared/src/contract/types.ts";
 import { isSafeRoomId } from "../../../packages/engine/src/store.ts";
 import { buildDebugSnapshot, TOKEN_TTL_MS, type DebugGate } from "./debug.ts";
+import { progressiveDelayMs, RateLimiter, sleep } from "./rate-limit.ts";
 
-const UnlockBody = z.object({ passphrase: z.string().min(1).max(256) });
+const UnlockBody = z.object({ passphrase: z.string().max(256) });
+const UNLOCK_FAIL = { ok: false, code: "E_UNAUTHORIZED", message: "调试口令错误" } as const;
 
 export interface DebugRouteDeps {
   gate: DebugGate;
@@ -22,15 +24,25 @@ function tokenOf(raw: unknown): string {
 }
 
 export function registerDebugRoutes(app: FastifyInstance, deps: DebugRouteDeps): void {
+  // P2：unlock 端点在线爆破防护——同 IP 5 次/分钟（与 auth/login 同款），失败渐进延迟。
+  const unlockLimiter = new RateLimiter(5, 60_000);
   app.post("/api/v1/debug/unlock", async (req, reply) => {
-    const parsed = UnlockBody.safeParse(req.body);
+    const ip = req.ip;
+    if (!unlockLimiter.hit(`dbg:${ip}`).allowed) {
+      reply.header("Retry-After", "60");
+      return reply.code(429).send({ ok: false, code: "E_RATE_LIMITED", message: "尝试过于频繁，请稍后再试" });
+    }
+    await sleep(progressiveDelayMs(unlockLimiter.count(`dbg:${ip}`)));
+    const parsed = UnlockBody.safeParse(req.body ?? {});
     if (!parsed.success) {
-      return reply.code(400).send({ ok: false, code: "E_SCHEMA_INVALID", message: "passphrase 必填" });
+      // 不区分“口令错/长度错”，避免探测口令结构。
+      return reply.code(401).send(UNLOCK_FAIL);
     }
     const token = deps.gate.unlock(parsed.data.passphrase);
     if (!token) {
-      return reply.code(401).send({ ok: false, code: "E_UNAUTHORIZED", message: "调试口令错误" });
+      return reply.code(401).send(UNLOCK_FAIL);
     }
+    unlockLimiter.reset(`dbg:${ip}`);
     return { ok: true, token, expiresInMs: TOKEN_TTL_MS };
   });
 

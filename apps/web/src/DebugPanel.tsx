@@ -4,7 +4,7 @@
  */
 import { useEffect, useState } from "react";
 import type { DebugMemory, DebugMessage, DebugNpc, DebugSnapshot } from "./debug-api.ts";
-import { fetchDebugSnapshot } from "./debug-api.ts";
+import { DebugSessionExpiredError, fetchDebugSnapshot } from "./debug-api.ts";
 
 type Tab = "mental" | "memory" | "messages" | "npcs" | "events";
 
@@ -91,9 +91,8 @@ export default function DebugPanel({ roomId, token, onClose, onExpired }: DebugP
       const s = await fetchDebugSnapshot(roomId, token);
       setSnap(s);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes("过期")) onExpired();
-      else setErr(msg);
+      if (e instanceof DebugSessionExpiredError) onExpired();
+      else setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
@@ -159,6 +158,7 @@ export default function DebugPanel({ roomId, token, onClose, onExpired }: DebugP
                   </ul>
                 ) : <p className="panel-note">暂无事件。</p>
               )}
+              {tab === "events" && <p className="panel-note">仅展示最近 300 条事件中的最后 80 条；长房间早期记录不在此列。</p>}
             </>
           )}
         </div>

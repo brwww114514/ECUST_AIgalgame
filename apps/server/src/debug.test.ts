@@ -88,6 +88,20 @@ describe("调试模式口令门", () => {
     await app.close();
   });
 
+  it("/debug/unlock 在线爆破防护：同 IP 5 次失败/分钟 → 429", async () => {
+    process.env.GALGAME_GOSSIP_SCAN_MS = "0";
+    const deps = await createApp(testConfig(PASS));
+    const app: FastifyInstance = Fastify();
+    registerRoutes(app, deps);
+    let last = 401;
+    for (let i = 0; i < 6; i++) {
+      const r = await app.inject({ method: "POST", url: "/api/v1/debug/unlock", payload: { passphrase: "wrong" } });
+      last = r.statusCode;
+    }
+    expect(last).toBe(429);
+    await app.close();
+  });
+
   it("非法 roomId 400；不存在的房间 404", async () => {
     process.env.GALGAME_GOSSIP_SCAN_MS = "0";
     const deps = await createApp(testConfig(PASS));

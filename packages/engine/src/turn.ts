@@ -83,8 +83,12 @@ export class DefaultTurn implements Turn {
    * 进程内命中优先；未命中时从 EventLog 的 turn.committed 标记重建（issue #76）。
    */
   private readonly seen = new Map<string, TurnEvent[]>();
-  /** 已重建过标记的房间：避免每个回合重复扫描整份事件日志 */
-  private readonly restoredRooms = new Set<RoomId>();
+  /**
+   * 每房间一次的标记扫描（PR #123 P1-4）：缓存 Promise 而不是布尔"已扫描"标志。
+   * 并发请求必须 await 同一个扫描，否则后来者会在扫描尚未完成时误判 seen 为空、重复结算；
+   * 扫描失败要从表里移除，让下次请求重试，不能让一次瞬时故障永久毒化这个房间。
+   */
+  private readonly restores = new Map<RoomId, Promise<void>>();
   /** 同 key 并发：后来者等待首个结算完成并重放同一结果，不重复调模型（issue #34） */
   private readonly inFlight = new Map<string, Promise<void>>();
   /** 每房间已提交回合数：只用于低频 compact 限频（进程内计数，重启后重新开始） */
@@ -94,9 +98,20 @@ export class DefaultTurn implements Turn {
    * 从 EventLog 重建 seen（#76）：只采信结构合法的 turn.committed 标记。
    * 标记与状态事件同批写入，出现即表示该逻辑回合已真正提交；坏标记跳过。
    */
-  private async restoreSeen(roomId: RoomId): Promise<void> {
-    if (this.restoredRooms.has(roomId)) return;
-    this.restoredRooms.add(roomId);
+  private restoreSeen(roomId: RoomId): Promise<void> {
+    const pending = this.restores.get(roomId);
+    if (pending) return pending;
+    const scan = this.scanSeen(roomId);
+    const tracked = scan.catch((e: unknown) => {
+      // 失败不缓存终态：后续请求必须重新扫描，而不是带着空 seen 继续结算（PR #123 P1-4）
+      this.restores.delete(roomId);
+      throw e;
+    });
+    this.restores.set(roomId, tracked);
+    return tracked;
+  }
+
+  private async scanSeen(roomId: RoomId): Promise<void> {
     for (const env of await this.deps.store.events(roomId, 0)) {
       const evidence = parseCommitEvidence(env);
       if (!evidence) continue;
@@ -220,12 +235,17 @@ export class DefaultTurn implements Turn {
         droppedByReality += first.dropped;
         const gate = await this.gate.review({ roomId: req.roomId, actorId: req.actorId, input: req.input, text: first.text });
         if (gate.kind === "blocked") {
+          // P1-3：被拦的首版叙事不能进 marker，否则跨重启重建的历史行会把它读回 /events
+          evidence.narrative = undefined;
+          evidence.facts = undefined;
           const punishArgs = { roomId: req.roomId, actorId: req.actorId, clientTurnId: req.clientTurnId };
-          for (const ev of await this.gate.punish(punishArgs, causeForBudget, gate.verdict, state, seqNow, evidence)) {
-            emit(ev);
-            yield ev;
-          }
-          this.seen.set(key, events);
+          const punishEvents = await this.gate.punish(punishArgs, causeForBudget, gate.verdict, state, seqNow, evidence);
+          for (const ev of punishEvents) emit(ev);
+          // P0-B：HTTP 消费器收到 turn.commit 即刻 break；yield 之后的代码不会执行，
+          // 幂等键必须在这里（提交已发生、第一个 yield 之前）写好。惩罚没落库时
+          // 返回的是 turn.error：不登记，让调用方重试，绝不吞掉一次该罚未罚的处置。
+          if (punishEvents.some((ev) => ev.type === "turn.commit")) this.seen.set(key, events);
+          for (const ev of punishEvents) yield ev;
           return;
         }
         if (gate.kind === "ok") {
@@ -279,17 +299,21 @@ export class DefaultTurn implements Turn {
             repairError = repaired.error; // 修复本身失败（网络/格式）：别静默吞掉，写进最终错误
           } else if (repaired) {
             usage = repaired.usage;
+            // P1-2：marker 必须记修复版产物。首版叙事/usage 已被 Arbiter 拒绝，
+            // 若留在证据里，跨重启重建的历史行会显示被拒版本（PR #123 P1-2）。
+            evidence.narrative = repaired.narrative;
+            evidence.usage = repaired.usage;
             droppedByReality += repaired.dropped;
             const gate = await this.gate.review({ roomId: req.roomId, actorId: req.actorId, input: req.input, text: repaired.text });
             if (gate.kind === "blocked") {
-              const punishArgs = { roomId: req.roomId, actorId: req.actorId, clientTurnId: req.clientTurnId };
               evidence.narrative = undefined;
               evidence.facts = undefined;
-              for (const ev of await this.gate.punish(punishArgs, causeForBudget, gate.verdict, state, this.deps.store.seq(req.roomId), evidence)) {
-                emit(ev);
-                yield ev;
-              }
-              this.seen.set(key, events);
+              const punishArgs = { roomId: req.roomId, actorId: req.actorId, clientTurnId: req.clientTurnId };
+              const punishEvents = await this.gate.punish(punishArgs, causeForBudget, gate.verdict, state, this.deps.store.seq(req.roomId), evidence);
+              for (const ev of punishEvents) emit(ev);
+              // P0-B：与首版阻断同样，必须在消费器 break 的 turn.commit 之前登记幂等键
+              if (punishEvents.some((ev) => ev.type === "turn.commit")) this.seen.set(key, events);
+              for (const ev of punishEvents) yield ev;
               return;
             }
             narrative = gate.kind === "ok" ? repaired.text : this.gate.policy.unavailableText;

@@ -8,6 +8,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { z } from "zod";
 
 /** 与 docs/09 对齐的存档条目；`formatVersion` 只在破坏性变更时 +1 */
 export interface SaveEntry {
@@ -34,20 +35,20 @@ interface SavesFile {
 /** 单账号最多保留的存档数：只是索引，超了淘汰最久未更新的（房间本身不删） */
 const MAX_SAVES = 100;
 
-function isSaveEntry(v: unknown): v is SaveEntry {
-  if (!v || typeof v !== "object") return false;
-  const e = v as Record<string, unknown>;
-  return (
-    typeof e.roomId === "string" &&
-    typeof e.scenarioId === "string" &&
-    typeof e.createdAt === "number" &&
-    typeof e.updatedAt === "number" &&
-    typeof e.lastTurnId === "string" &&
-    typeof e.lastCommittedSeq === "number" &&
-    (e.actorId === undefined || typeof e.actorId === "string") &&
-    e.formatVersion === 1
-  );
-}
+const savesFileSchema = z.object({
+  version: z.literal(1),
+  userId: z.string(),
+  saves: z.array(z.object({
+    roomId: z.string(),
+    scenarioId: z.string(),
+    createdAt: z.number().finite(),
+    updatedAt: z.number().finite(),
+    lastTurnId: z.string(),
+    lastCommittedSeq: z.number().int().nonnegative(),
+    actorId: z.string().optional(),
+    formatVersion: z.literal(1),
+  }).passthrough()),
+}).passthrough();
 
 export class SaveIndex {
   private readonly chains = new Map<string, Promise<unknown>>();
@@ -74,64 +75,67 @@ export class SaveIndex {
     await this.mutate(userId, (file) => {
       const existing = file.saves.find((s) => s.roomId === entry.roomId);
       if (existing) {
+        if (entry.lastCommittedSeq < existing.lastCommittedSeq) return false;
         existing.scenarioId = entry.scenarioId;
         existing.updatedAt = entry.updatedAt;
         existing.lastTurnId = entry.lastTurnId;
         existing.lastCommittedSeq = entry.lastCommittedSeq;
         if (entry.actorId) existing.actorId = entry.actorId;
-        return;
+        return true;
       }
       file.saves.push(entry);
       file.saves.sort((a, b) => b.updatedAt - a.updatedAt);
       file.saves = file.saves.slice(0, MAX_SAVES);
+      return true;
     });
   }
 
-  /**
-   * 回合提交后推进游标。返回 false 表示索引里没有这条（建房时没带 userId 的老房间）——
-   * 历史照常记，只是存档列表里看不到它；这不是错误。
-   */
-  async touch(userId: string, roomId: string, turnId: string, committedSeq: number): Promise<boolean> {
-    let updated = false;
-    await this.mutate(userId, (file) => {
+  /** 回合提交后推进游标。未登记的房间或迟到的较低序号返回 false。 */
+  touch(userId: string, roomId: string, turnId: string, committedSeq: number): Promise<boolean> {
+    return this.mutate(userId, (file) => {
       const entry = file.saves.find((s) => s.roomId === roomId);
-      if (!entry) return;
+      if (!entry || committedSeq < entry.lastCommittedSeq) return false;
       entry.lastTurnId = turnId;
       entry.lastCommittedSeq = committedSeq;
       entry.updatedAt = this.now();
-      updated = true;
+      return true;
     });
-    return updated;
   }
 
   /** 只删索引，不删房间：返回是否真的删掉了一条 */
-  async remove(userId: string, roomId: string): Promise<boolean> {
-    let removed = false;
-    await this.mutate(userId, (file) => {
+  remove(userId: string, roomId: string): Promise<boolean> {
+    return this.mutate(userId, (file) => {
       const before = file.saves.length;
       file.saves = file.saves.filter((s) => s.roomId !== roomId);
-      removed = file.saves.length < before;
+      return file.saves.length < before;
     });
-    return removed;
   }
 
   private async read(userId: string): Promise<SavesFile> {
+    let text: string;
     try {
-      const raw = JSON.parse(await readFile(this.file(userId), "utf8")) as Partial<SavesFile>;
-      const saves = Array.isArray(raw.saves) ? raw.saves.filter(isSaveEntry) : [];
-      return { version: 1, userId, saves };
-    } catch {
-      // 文件缺失/损坏都按"没有存档"处理：索引是可重建投影，不能把服务拖死
-      return { version: 1, userId, saves: [] };
+      text = await readFile(this.file(userId), "utf8");
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, userId, saves: [] };
+      throw Object.assign(new Error("读取存档索引失败", { cause }), { code: "E_STORE_FAULT" });
+    }
+    try {
+      // 任一条目损坏都中止，避免部分解析成功后把原始条目覆盖掉。
+      const doc: SavesFile = savesFileSchema.parse(JSON.parse(text));
+      if (doc.userId !== userId) throw new Error("存档索引归属不符");
+      return doc;
+    } catch (cause) {
+      throw Object.assign(new Error("存档索引无效", { cause }), { code: "E_STORE_FAULT" });
     }
   }
 
-  private mutate(userId: string, fn: (file: SavesFile) => void): Promise<void> {
+  private mutate(userId: string, fn: (file: SavesFile) => boolean): Promise<boolean> {
     const prev = this.chains.get(userId) ?? Promise.resolve();
     const task = prev.then(async () => {
       const file = await this.read(userId);
-      fn(file);
-      await this.write(userId, file);
+      const changed = fn(file);
+      if (changed) await this.write(userId, file);
+      return changed;
     });
     this.chains.set(userId, task.catch(() => undefined));
     return task;

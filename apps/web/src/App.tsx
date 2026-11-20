@@ -27,7 +27,8 @@ import { npcLocIdFromLinks, targetStillInScene } from "./npc-presence.ts";
 import { phaseLabel } from "./ui.ts";
 import type { Line, LineKind } from "./ui.ts";
 import type { ConversationEvent } from "../../../packages/shared/src/contract/v2.ts";
-import { detectConversation, runConversationTurn } from "./conversation-api.ts";
+import { detectConversation, fetchUtteranceModes, runConversationTurn, runConversationUtterance } from "./conversation-api.ts";
+import type { UtteranceDraft, UtteranceModeInfo } from "./conversation-api.ts";
 import {
   DEFAULT_LISTEN_TIMEOUT_MS,
   initialConversationView,
@@ -83,6 +84,8 @@ export default function App() {
    */
   const [convMode, setConvMode] = useState<"v1" | "v2">("v1");
   const [convLines, setConvLines] = useState<Line[]>([]);
+  /** v2 说话类型清单（GET /conversation/modes）；空数组 = 老流程或取清单失败 */
+  const [v2Modes, setV2Modes] = useState<UtteranceModeInfo[]>([]);
   const convView = useRef<ConversationView>(initialConversationView());
   const [waitingInterjection, setWaitingInterjection] = useState(false);
   const listenTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -99,7 +102,7 @@ export default function App() {
   /** #87：/events 回放降级提示（actorId 传错 → 不渲染私信）；空字符串 = 不显示 */
   const [eventsNotice, setEventsNotice] = useState<string>("");
   /** 最近一次玩家行动：重试时原样再发，不重复打印玩家行 */
-  const lastTurn = useRef<{ text: string; target: { id: string; name: string } | null } | null>(null);
+  const lastTurn = useRef<{ text: string; target: { id: string; name: string } | null; utterance?: UtteranceDraft } | null>(null);
   /** 断流前已收到的叙事/facts：核对到 committed 后只补历史里的差集，避免重复刷屏 */
   const pendingTurn = useRef<{ clientTurnId: string; narrative: string; facts: string[] } | null>(null);
   /** 全屏地图层：点对话页左上角的小地图打开 */
@@ -205,6 +208,7 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
     disarmListenTimer();
     setConvMode("v1");
     setConvLines([]);
+    setV2Modes([]);
     convView.current = initialConversationView();
     setView({});
     setLines([]);
@@ -334,6 +338,7 @@ const [earlier, setEarlier] = useState<EarlierState>(NO_EARLIER);
       void detectConversation(id, token.signal).then((v2) => {
         if (!current()) return;
         setConvMode(v2 ? "v2" : "v1");
+        if (v2) void fetchUtteranceModes(id, token.signal).then((modes) => { if (current()) setV2Modes(modes); });
       });
 
       // #87：历史事件回放不阻塞进房。带本人 actorId 请求；若被 403 判为传错，
@@ -485,13 +490,14 @@ const token = scopeRef.current.current();
    * 与 v1 完全并行：convMode 不是 v2 时根本不会走到这里。
    */
   const dispatchConversationTurn = useCallback(
-    async (raw: string, targetNpc: { id: string; name: string } | null, echo: boolean, reuseId?: string) => {
+    async (raw: string, targetNpc: { id: string; name: string } | null, echo: boolean, reuseId?: string, utterance?: UtteranceDraft) => {
       const base = raw.trim();
-      if (!base || busy || !roomId || !actorId) return;
+      // contentless 类型（如 signal）正文可空，只靠 action 表达；其余类型必须非空
+      if ((!base && !utterance) || busy || !roomId || !actorId) return;
       const token = scopeRef.current.current();
       const current = () => scopeRef.current.isCurrent(token.version);
       const text = targetNpc ? `对${targetNpc.name}说：${base}` : base;
-      lastTurn.current = { text: base, target: targetNpc };
+      lastTurn.current = { text: base, target: targetNpc, ...(utterance ? { utterance } : {}) };
       const tw = getTw();
       if (tw.typing) tw.skip();
       setBusy(true);
@@ -500,6 +506,10 @@ const token = scopeRef.current.current();
       setUnconfirmed(null);
       if (echo) {
         setInput("");
+        // contentless（如 signal）的正文被服务端丢弃，玩家行只该显示动作，不能拼成"对X说：<动作>"
+        const isContentless = utterance ? v2Modes.some((m) => m.id === utterance.mode && m.contentless) : false;
+        const echoChannel = isContentless ? "action" : "content";
+        const echoText = isContentless ? (utterance?.action ?? base) : text;
         // v2 的玩家行放进 convView（而不是 v1 lines），scene beat 才能按 order 锚定它
         convView.current = {
           ...convView.current,
@@ -509,7 +519,7 @@ const token = scopeRef.current.current();
               id: ++lineId,
               kind: "utterance",
               speaker: actorId,
-              parts: [{ channel: "content", text }],
+              parts: [{ channel: echoChannel, text: echoText }],
               turn: convView.current.committedTurn,
             },
           ],
@@ -540,29 +550,35 @@ const token = scopeRef.current.current();
         }
       };
 
+      const handlers = {
+        onEvent: apply,
+        onError: (code: string, message: string, retryable?: boolean) => {
+          if (!current()) return;
+          setErr(message || code);
+          setErrRetryable(retryable === true);
+        },
+        onUnconfirmed: () => {
+          if (!current()) return;
+          setUnconfirmed({ clientTurnId });
+          setErr("会话结果未确认，重试会以同一 ID 重发（服务端按 ID 去重）。");
+          setErrRetryable(true);
+        },
+      };
       try {
-        await runConversationTurn(
-          roomId,
-          actorId,
-          text,
-          clientTurnId,
-          {
-            onEvent: apply,
-            onError: (code, message, retryable) => {
-              if (!current()) return;
-              setErr(message || code);
-              setErrRetryable(retryable === true);
-            },
-            onUnconfirmed: () => {
-              if (!current()) return;
-              setUnconfirmed({ clientTurnId });
-              setErr("会话结果未确认，重试会以同一 ID 重发（服务端按 ID 去重）。");
-              setErrRetryable(true);
-            },
-          },
-          token.signal,
-          targetNpc?.id,
-        );
+        if (utterance) {
+          // demo：完整 utterance（mode/target/content/action）走规范端点
+          await runConversationUtterance(roomId, actorId, utterance, clientTurnId, handlers, token.signal);
+        } else {
+          await runConversationTurn(
+            roomId,
+            actorId,
+            text,
+            clientTurnId,
+            handlers,
+            token.signal,
+            targetNpc?.id,
+          );
+        }
       } catch (e) {
         if (!current() || token.signal.aborted) return;
         if (isUnauthorized(e)) {
@@ -582,7 +598,20 @@ const token = scopeRef.current.current();
         }
       }
     },
-    [actorId, armListenTimer, busy, disarmListenTimer, expireSession, refreshSaves, refreshState, renderConv, roomId],
+    [actorId, armListenTimer, busy, disarmListenTimer, expireSession, refreshSaves, refreshState, renderConv, roomId, v2Modes],
+  );
+
+  /** v2 demo：从 ChatPanel 的选择器提交一条完整 utterance（@谁 + 方式 + 说话/行动） */
+  const sendV2Utterance = useCallback(
+    (draft: UtteranceDraft) => {
+      if (convMode !== "v2") return;
+      const targetNpc = draft.target
+        ? { id: draft.target, name: stateRef.current?.entities[draft.target]?.name ?? draft.target }
+        : null;
+      const raw = draft.content ?? draft.action ?? "";
+      void dispatchConversationTurn(raw, targetNpc, true, undefined, draft);
+    },
+    [convMode, dispatchConversationTurn],
   );
 
   /**
@@ -755,7 +784,7 @@ await runTurn(
     if (!last) return;
     if (convMode === "v2") {
       // v2 按 clientTurnId 去重；未确认回合复用同一 ID，服务端已提交就直接回放结果
-      void dispatchConversationTurn(last.text, last.target, false, unconfirmed?.clientTurnId);
+      void dispatchConversationTurn(last.text, last.target, false, unconfirmed?.clientTurnId, last.utterance);
       return;
     }
     // NPC 可能在回合之间换场景；重发前用当前状态再核一次在场，
@@ -960,6 +989,8 @@ await runTurn(
             hasEarlier={earlier.hasEarlier}
             loadingEarlier={earlier.loading}
             onLoadEarlier={() => void loadEarlier()}
+            v2Modes={convMode === "v2" ? v2Modes : undefined}
+            onSendUtterance={convMode === "v2" ? sendV2Utterance : undefined}
           />
         )}
 

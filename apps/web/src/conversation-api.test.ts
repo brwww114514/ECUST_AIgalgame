@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  conversationModesPath,
   conversationProbePath,
   conversationTurnPath,
   detectConversation,
   dispatchConversationEvent,
+  fetchUtteranceModes,
   isConversationAvailable,
   runConversationTurn,
+  runConversationUtterance,
+  validateUtteranceDraft,
 } from "./conversation-api.ts";
 import type { ConversationStreamHandlers } from "./conversation-api.ts";
 
@@ -34,6 +38,7 @@ describe("feature detect（纯判定 + 探测退化）", () => {
   it("路径不猜错：探 conversation，回合走 conversation/turns", () => {
     expect(conversationProbePath("room 1")).toBe("/api/v1/rooms/room%201/conversation");
     expect(conversationTurnPath("room_1")).toBe("/api/v1/rooms/room_1/conversation/turns");
+    expect(conversationModesPath("room_1")).toBe("/api/v1/rooms/room_1/conversation/modes");
   });
 
   it("探测 404 → false；200 → true；fetch 抛错也当 false（不打断进房）", async () => {
@@ -116,5 +121,82 @@ describe("runConversationTurn 结局判定", () => {
       onError: (code, message) => calls.push(`${code}:${message}`),
     });
     expect(calls).toEqual(["E_CONV_NOT_FOUND:无会话"]);
+  });
+});
+
+describe("validateUtteranceDraft（提交前本地校验，对齐引擎 delivery.ts）", () => {
+  const modes = [
+    { id: "broadcast", label: "公开说", requiresTarget: false, requiresAction: false, contentless: false, targetPresence: "present" as const },
+    { id: "addressed", label: "对某人说", requiresTarget: true, requiresAction: false, contentless: false, targetPresence: "present" as const },
+    { id: "whisper", label: "悄悄话", requiresTarget: true, requiresAction: true, contentless: false, targetPresence: "present" as const },
+    { id: "signal", label: "不动声色", requiresTarget: true, requiresAction: true, contentless: true, targetPresence: "present" as const },
+  ];
+
+  it("P2-1 requiresTarget：没 @ 到目标就拦，有目标则放行", () => {
+    expect(validateUtteranceDraft({ mode: "addressed", content: "你好" }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "addressed", target: "npc_lin", content: "你好" }, modes).ok).toBe(true);
+  });
+
+  it("P2-2 requiresAction：whisper/signal 动作必填，纯空白也拦", () => {
+    expect(validateUtteranceDraft({ mode: "whisper", target: "npc_lin", content: "悄悄话" }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "whisper", target: "npc_lin", content: "悄悄话", action: "   " }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "whisper", target: "npc_lin", content: "悄悄话", action: "凑近压低声音" }, modes).ok).toBe(true);
+  });
+
+  it("P2-3 contentless：正文空不拦、只靠动作即可；有动作才通过", () => {
+    expect(validateUtteranceDraft({ mode: "signal", target: "npc_lin" }, modes).ok).toBe(false); // 动作仍必填
+    expect(validateUtteranceDraft({ mode: "signal", target: "npc_lin", action: "目光扫过桌面" }, modes).ok).toBe(true);
+  });
+
+  it("空 broadcast（正文与动作都空）被拦；仅动作也接受（引擎不强制正文）", () => {
+    expect(validateUtteranceDraft({ mode: "broadcast" }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "broadcast", action: "点点头" }, modes).ok).toBe(true);
+    expect(validateUtteranceDraft({ mode: "broadcast", content: "大家好" }, modes).ok).toBe(true);
+  });
+
+  it("未知模式 / 清单未就绪 → 拦，不让它带着坏 mode 发出去", () => {
+    expect(validateUtteranceDraft({ mode: "nope", content: "x" }, modes).ok).toBe(false);
+    expect(validateUtteranceDraft({ mode: "broadcast", content: "x" }, []).ok).toBe(false);
+  });
+});
+
+describe("fetchUtteranceModes（说话类型清单）", () => {
+  it("200 → 返回 modes 数组；坏结构/失败 → 空数组（不阻断聊天）", async () => {
+    const modes = [
+      { id: "broadcast", label: "公开说", requiresTarget: false, requiresAction: false, contentless: false, targetPresence: "present" },
+    ];
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, modes }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockRejectedValueOnce(new TypeError("offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await fetchUtteranceModes("r")).toEqual(modes);
+    expect(await fetchUtteranceModes("r")).toEqual([]);
+    expect(await fetchUtteranceModes("r")).toEqual([]);
+  });
+});
+
+describe("runConversationUtterance（规范端点 POST body 形状）", () => {
+  it("POST 到规范路径，body 带完整 utterance，speaker 由服务端覆盖故客户端不传", async () => {
+    let url = "";
+    let body: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (u: string, init: RequestInit) => {
+      url = u;
+      body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return sseResponse([
+        'event: conversation.committed\ndata: {"type":"conversation.committed","sessionId":"s","turn":1,"proposals":[],"state":{}}\n\n',
+      ]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await runConversationUtterance("r1", "plr", {
+      mode: "whisper", target: "npc_lin", content: "你叫什么", action: "凑近压低声音",
+    }, "ct-u1", {});
+    expect(url).toBe("/api/v1/rooms/r1/conversation");
+    expect(body).toEqual({
+      actorId: "plr",
+      clientTurnId: "ct-u1",
+      utterance: { mode: "whisper", target: "npc_lin", content: "你叫什么", action: "凑近压低声音" },
+    });
+    expect((body.utterance as Record<string, unknown>).speaker).toBeUndefined();
   });
 });

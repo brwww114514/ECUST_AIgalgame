@@ -5,7 +5,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { ActorId, Memory, MemoryRecord, Registry, RoomId, Store, Turn, TurnEvent, WorldState } from "../../../packages/shared/src/contract/types.ts";
-import type { ConversationEvent, GossipEvent, MessageDigest } from "../../../packages/shared/src/contract/v2.ts";
+import type { ConversationEvent, GossipEvent, MessageDigest, UtteranceModeDef } from "../../../packages/shared/src/contract/v2.ts";
 import { projectConversationEvents, type ConversationHostV2 } from "../../../packages/engine/src/v2/index.ts";
 import { DialogueBodySchema, TickBodySchema, TravelBodySchema, zodMessage } from "./map.data.ts";
 import type { MapService } from "./map.ts";
@@ -82,7 +82,7 @@ export interface AppDeps {
     subscribe(roomId: RoomId, viewer: ActorId, cb: (ev: GossipEvent) => void): () => void;
   };
   /** dev/v2：群聊会话宿主（未接线时不注册端点；会话/幂等缓存全在进程内，重启即新会话） */
-  conversation?: { host: ConversationHostV2 };
+  conversation?: { host: ConversationHostV2; modes?: Map<string, UtteranceModeDef> };
   /** 管理操作日志 */
   adminLog?: AdminLog;
   /** Cookie 写请求 CSRF 允许的 Origin（authRequired=1 时用） */
@@ -624,6 +624,23 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
       // 与另外两条 conversation 路由同口径（docs/03 §5.2.11）：探测也不能让非成员确认房间存在。
       if (!(await guardRoom(req, reply, deps, roomId, userIdOf))) return reply;
       return reply.code(200).send({ ok: true, v2: true });
+    });
+
+    // 前端 demo 的说话类型选择器（方案 A）：从引擎已加载的模式表读出 id/label 与"需要目标/动作/是否纯动作"。
+    // 与探测端点同口径（roomGate + guardRoom），不让非成员借它确认房间存在；纯读数据，不改任何状态。
+    app.get("/api/v1/rooms/:roomId/conversation/modes", async (req, reply) => {
+      const { roomId } = req.params as { roomId: string };
+      if (!(await roomGate(roomId, reply))) return reply;
+      if (!(await guardRoom(req, reply, deps, roomId, userIdOf))) return reply;
+      const modes = [...(deps.conversation?.modes?.values() ?? [])].map((m) => ({
+        id: m.id,
+        label: m.label,
+        requiresTarget: m.requiresTarget === true,
+        requiresAction: m.requiresAction === true,
+        contentless: m.contentless === true,
+        targetPresence: m.targetPresence ?? "present",
+      }));
+      return reply.code(200).send({ ok: true, modes });
     });
 
     // 规范端点（docs/03 §5.2.11）：body 是 utterance 形状

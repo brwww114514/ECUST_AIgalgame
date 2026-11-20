@@ -78,6 +78,7 @@ async function appWith(): Promise<{ app: FastifyInstance; deps: App; roomId: str
       npc: new NpcAgent({ llm, modes, policy }),
       audit: new ConversationAudit(audit, DEFAULT_AUDIT_POLICY, new AuditGate({ arbiter, store, registry: deps.registry, audit, policy: DEFAULT_AUDIT_POLICY })),
     }),
+    modes,
   };
 
   const app = Fastify();
@@ -346,6 +347,33 @@ describe("dev/v2 群聊端点（issue #85/#89 契约对齐）", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ ok: true, v2: true });
+    await app.close();
+  });
+
+  it("GET /conversation/modes 返回引擎已加载的说话类型清单（只读，字段结构对）", async () => {
+    const { app, roomId } = await appWith();
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/rooms/${roomId}/conversation/modes`,
+      headers: { "x-user-id": "u_owner" },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { ok: boolean; modes: { id: string; label: string; requiresTarget: boolean }[] };
+    expect(body.ok).toBe(true);
+    expect(body.modes.length).toBeGreaterThan(0);
+    const broadcast = body.modes.find((m) => m.id === "broadcast");
+    expect(broadcast).toMatchObject({ id: "broadcast", label: "公开说", requiresTarget: false });
+    await app.close();
+  });
+
+  it("GET /conversation/modes 同样过 guardRoom——非本房账号 403", async () => {
+    const { app, roomId } = await appWith();
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/rooms/${roomId}/conversation/modes`,
+      headers: { "x-user-id": "u_other" },
+    });
+    expect(res.statusCode).toBe(403);
     await app.close();
   });
 

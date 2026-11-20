@@ -66,13 +66,27 @@ dl { margin:0; } .row { display:flex; justify-content:space-between; font-size:1
 .line { margin:0 0 14px; white-space:pre-wrap; }
 .line.player { color:var(--accent); font-weight:600; }
 .line.system { color:var(--muted); font-size:13px; }
+/* v2 插话等待态：与普通的 … 忙碌提示区分开 */
+.line.interjection-wait { color:var(--accent); font-style:italic; }
 .line.narrative { color:var(--fg); }
 .line.npc { color:#ffd48a; }
+
+/* v2 乐观玩家行：等引擎投回本人 delivery 就替换成真行 */
+.line.pending {
+  opacity: 0.55;
+}
 .err { margin:10px 18px; padding:8px 12px; border:1px solid #7a2b34; background:#2a1418; color:#ff9aa8; border-radius:8px; font-size:13px; }
 .composer { display:flex; gap:10px; padding:14px 18px 20px; border-top:1px solid var(--line); }
 .composer input { flex:1; background:#0b0d13; border:1px solid var(--line); color:var(--fg); border-radius:10px; padding:12px 14px; font:inherit; }
 .composer button { background:var(--accent); color:#08101f; border:0; border-radius:10px; padding:0 22px; font-weight:700; cursor:pointer; }
 .composer button:disabled { opacity:.5; cursor:default; }
+/* v2 demo：说话类型选择器 + 伴随动作输入（仅在群聊端点可用时显示） */
+.v2-composer-opts { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:10px 18px 0; }
+.v2-mode { display:inline-flex; align-items:center; gap:8px; font-size:13px; color:var(--muted,#98a2b3); }
+.v2-mode select { background:#0b0d13; border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:8px 10px; font:inherit; cursor:pointer; }
+.v2-action { flex:1 1 220px; background:#0b0d13; border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:8px 12px; font:inherit; }
+.v2-hint { padding:8px 18px 0; font-size:13px; color:#e0a458; }
+.v2-contentless-note { flex:1; background:transparent; border:1px dashed var(--line); color:var(--muted,#98a2b3); border-radius:10px; padding:12px 14px; font:inherit; font-style:italic; }
 /* 每回合结束后的快捷行动建议：点一下 = 说出这句话；输入框仍然可以自由输入 */
 .suggestions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:12px 18px 0; animation: fade-in .3s ease both; }
 .suggest-chip { background:#1a2030; color:var(--fg); border:1px solid #2c3448; border-radius:999px; padding:7px 14px; font:inherit; font-size:13px; cursor:pointer; transition:border-color .15s, background .15s; }
@@ -1019,3 +1033,76 @@ dl { margin:0; } .row { display:flex; justify-content:space-between; font-size:1
 .scene-notice.unlocatable { border-color:#5a4a2b; background:#241f14; color:#e6d3a3; }
 .scene-notice .btn { padding:4px 12px; }
 .scene-notice .notice-err { color:#ff9aa8; font-style:normal; }
+
+/* 微信收件箱（issue #86）：只渲染服务端下发的收发双方消息，无「查看全部聊天」入口 */
+.inbox-page { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
+.inbox-list { flex:1; overflow:auto; padding:16px 20px; display:flex; flex-direction:column; gap:10px; }
+.inbox-msg { position:relative; max-width:min(720px, 90%); padding:10px 14px; border:1px solid #303952; border-radius:12px; background:#151b28; font-size:13px; }
+.inbox-msg.mine { align-self:flex-end; background:#183047; border-color:#33557a; }
+.inbox-msg-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:4px; }
+.inbox-msg-head .msg-kind { color:#8fb4ff; }
+.inbox-msg-head .msg-hop { color:#e6d3a3; }
+.inbox-msg-head .msg-conf { color:#9ad3a0; }
+.inbox-msg-head time { margin-left:auto; color:#7c879e; font-size:12px; }
+.inbox-msg-body { margin:0; line-height:1.6; white-space:pre-wrap; word-break:break-word; }
+.inbox-reply-ref { margin-top:4px; font-size:12px; }
+.inbox-reply-btn { margin-top:6px; padding:3px 10px; }
+.inbox-notice { flex:none; margin:0 20px 8px; }
+.inbox-composer { flex:none; padding:12px 20px 16px; border-top:1px solid #232a3b; display:flex; flex-direction:column; gap:8px; }
+.inbox-replying { display:flex; align-items:center; gap:10px; color:#9aa4ba; font-size:12px; }
+.inbox-replying .btn { padding:3px 10px; }
+.inbox-row { display:flex; gap:8px; }
+.inbox-row select, .inbox-row input { flex:1; min-width:0; padding:10px 12px; border:1px solid #303952; border-radius:8px; background:#0e1320; color:var(--fg); font:inherit; outline:none; }
+.inbox-row select { flex:0 0 160px; }
+.inbox-row input:focus, .inbox-row select:focus { border-color:#42506f; }
+.inbox-row .btn { flex:none; }
+
+/* ---------------------------------------------------------------- 收件箱手机适配（只覆盖 .inbox-*，不改游戏主界面/标题页） */
+@media (max-width: 720px) {
+  .inbox-list { padding:12px; gap:8px; }
+  /* 气泡满宽，长正文强制任意处换行，避免撑破视口 */
+  .inbox-msg { width:100%; max-width:100%; padding:10px 12px; }
+  .inbox-msg-head { gap:6px; font-size:12px; }
+  .inbox-msg-head time { flex-basis:100%; margin-left:0; text-align:right; }
+  .inbox-msg-body { overflow-wrap:anywhere; }
+  .inbox-reply-btn { min-height:44px; padding:0 16px; }
+  .inbox-notice { margin:0 12px 8px; }
+  .inbox-composer { padding:10px 12px 12px; gap:8px; }
+  .inbox-replying { flex-wrap:wrap; }
+  .inbox-replying .btn { min-height:44px; padding:0 16px; }
+  /* composer 换行：收件人/正文/发送按钮各占一整行，触摸目标 ≥44px */
+  .inbox-row { flex-wrap:wrap; }
+  .inbox-row select, .inbox-row input { flex:1 1 100%; min-height:44px; }
+  .inbox-row .btn { flex:1 1 100%; min-height:44px; }
+}
+
+/* ---------------------------------------------------------------- 调试面板（口令门解锁后挂载，平时不在 DOM） */
+.dbg-overlay { position:fixed; inset:0; z-index:1000; display:flex; align-items:center; justify-content:center; padding:24px; background:rgba(4,7,14,.82); backdrop-filter:blur(3px); }
+.dbg-window { width:min(900px,94vw); max-height:86vh; display:flex; flex-direction:column; background:#111827; border:1px solid #303952; border-radius:12px; box-shadow:0 18px 60px rgba(0,0,0,.55); overflow:hidden; }
+.dbg-unlock { width:min(420px,94vw); padding:22px 24px; gap:12px; }
+.dbg-unlock h2 { margin:0; font-size:20px; }
+.dbg-unlock input { width:100%; box-sizing:border-box; padding:10px 12px; border:1px solid #303952; border-radius:8px; background:#0e1320; color:var(--fg); font:inherit; outline:none; }
+.dbg-unlock input:focus { border-color:#42506f; }
+.dbg-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 18px; border-bottom:1px solid #232c42; }
+.dbg-header h2 { margin:0; font-size:17px; display:flex; align-items:baseline; gap:10px; }
+.dbg-header-actions { display:flex; align-items:center; gap:10px; }
+.dbg-header button { padding:6px 14px; border:1px solid #3a4666; border-radius:7px; background:#1b2438; color:var(--fg); cursor:pointer; font:inherit; }
+.dbg-header button:hover { background:#26314c; }
+.dbg-header button:disabled { opacity:.5; cursor:default; }
+.dbg-tabs { display:flex; gap:4px; padding:10px 16px 0; border-bottom:1px solid #232c42; flex-wrap:wrap; }
+.dbg-tab { padding:8px 14px; border:1px solid transparent; border-bottom:none; border-radius:8px 8px 0 0; background:transparent; color:#9aa7c2; cursor:pointer; font:inherit; }
+.dbg-tab.active { background:#1b2438; border-color:#303952; color:var(--fg); }
+.dbg-body { flex:1; overflow:auto; padding:14px 18px; }
+.dbg-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; }
+.dbg-item { padding:10px 12px; border:1px solid #232c42; border-radius:8px; background:#0d1322; }
+.dbg-item-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+.dbg-item-head strong { color:#8ec5ff; }
+.dbg-meta { color:#7f8aa5; font-size:12px; }
+.dbg-tag { padding:1px 7px; border:1px solid #3a4666; border-radius:999px; font-size:11px; color:#a9b6d0; }
+.dbg-tag-mental { border-color:#6a4f8a; color:#c9a6ff; }
+.dbg-text { font-size:14px; line-height:1.55; overflow-wrap:anywhere; }
+.dbg-tags { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:12px; color:#6fa8dc; }
+.dbg-attrs { display:flex; flex-wrap:wrap; gap:8px 16px; font-size:13px; color:#b8c2da; }
+.dbg-attrs code { color:#8ec5ff; }
+.dbg-event { display:flex; align-items:center; gap:12px; }
+.dbg-event code { color:#7fd1a8; }

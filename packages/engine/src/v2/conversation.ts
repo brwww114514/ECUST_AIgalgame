@@ -15,14 +15,16 @@ import type {
   UtteranceModeDef,
   ConversationPolicy,
   Registry,
+  Delivery,
 } from "../../../shared/src/index.ts";
 import type { EventLog } from "../store.ts";
 import type { DefaultArbiter } from "../arbiter.ts";
 import type { EventSourcedMemory } from "../memory.ts";
+import { conversationSnapshotSchema, type ConversationSnapshot, type RestoreResult } from "./conversation-snapshot.ts";
 import type { SceneManager } from "./scene.ts";
 import type { NpcAgent } from "./npc-agent.ts";
 import type { ConversationAudit } from "./audit.ts";
-import { StoreFlushError, runStep } from "./conversation.step.ts";
+import { StoreFlushError, rememberRecent, runStep, type StoreRetry } from "./conversation.step.ts";
 
 export interface ConversationDeps {
   store: EventLog;
@@ -46,6 +48,10 @@ interface PendingFlush {
   s: ConversationSessionV2;
   applied: ApplyResult;
   out: ConversationEvent[];
+  /** 本轮已审核的投递；只有重放提交成功才进入下一轮上下文 */
+  fresh: Delivery[];
+  /** 仅 arbiter 写盘失败时存在：提案从未落库，要用同一 cause/expectedSeq 重新裁决 */
+  retry?: StoreRetry;
   /** flush 失败前的 lastLocId；仅当期间未被别的回合推进时才用当前快照前移 */
   beforeLocId?: string;
 }
@@ -99,15 +105,130 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     return this.sessions.get(sessionId);
   }
 
+  /**
+   * #104：主动关闭会话（路由层淘汰 room→sessionId 映射时调用）。
+   * 标记 closed 并回收该会话的幂等缓存；pendingFlush 代表尚未落盘的提交，保留以免丢数据。
+   */
+  close(sessionId: Id): boolean {
+    const s = this.sessions.get(sessionId);
+    if (!s) return false;
+    s.status = "closed";
+    for (const [key, events] of this.seen) {
+      if (events.some((e) => "sessionId" in e && e.sessionId === sessionId)) this.seen.delete(key);
+    }
+    return true;
+  }
+
+  /** 重启后"继续同房间群聊"：取该房间最后一个仍 open 的会话 */
+  getByRoom(roomId: RoomId): ConversationSessionV2 | undefined {
+    let found: ConversationSessionV2 | undefined;
+    for (const s of this.sessions.values()) if (s.roomId === roomId && s.status === "open") found = s;
+    return found;
+  }
+
+  /**
+   * #123 P1-1：从幂等 key 里取出 sessionId。key 形如 JSON.stringify([sessionId, actorId, clientTurnId])，
+   * 只在本 host 内部写入；解析失败即跳过，不让坏 key 影响导出/恢复。
+   */
+  private seenSessionId(key: string): string | undefined {
+    try {
+      const parsed: unknown = JSON.parse(key);
+      if (Array.isArray(parsed) && typeof parsed[0] === "string") return parsed[0];
+    } catch {
+      // 非本 host 写入的 key，忽略
+    }
+    return undefined;
+  }
+
+  /** 导出会话快照（深拷贝，不写文件；落盘由调用方负责，见 conversation-snapshot.ts） */
+  exportSessions(roomId?: RoomId): ConversationSnapshot {
+    const sessions = [...this.sessions.values()]
+      .filter((s) => !roomId || s.roomId === roomId)
+      .map((s) => structuredClone(s));
+    // #123 P1-1：幂等缓存与会话一起持久化，否则重启后同 clientTurnId 会生成新回合且不计费。
+    // 按房间导出时只带该房间会话的 key，避免跨房串缓存。
+    const exportedIds = new Set(sessions.map((s) => s.id));
+    const seen = [...this.seen.entries()]
+      .filter(([key]) => {
+        const sid = this.seenSessionId(key);
+        return sid !== undefined && exportedIds.has(sid);
+      })
+      .map(([key, events]) => ({ key, events: events.map((e) => structuredClone(e)) }));
+    return { version: 1, savedAt: this.deps.now?.() ?? Date.now(), sessions, seen };
+  }
+
+  /**
+   * 导入快照（重启恢复）。坏档/版本不符 → 降级：目标房间的会话 closed，调用方须 open() 新会话。
+   * 同 id 已存在则跳过（重复导入幂等）；turn 达上限的会话强制 closed。
+   * #106：显式校验快照里的 session.roomId 与当前房间一致——不一致直接跳过并计入 degraded，
+   * 防止把别的房间的会话挂进当前 host（若 snapshot 文件被串房间写入时 fail-closed）。
+   * #123 P1-5：坏档只影响传入的 roomId，绝不连带关掉其他房间已恢复的 open 会话。
+   * #123 P1-1：快照里的幂等缓存随会话一并恢复，保证重启后同 clientTurnId 真重放。
+   */
+  restoreSessions(raw: unknown, roomId?: RoomId): RestoreResult {
+    const parsed = conversationSnapshotSchema.safeParse(raw);
+    if (!parsed.success) {
+      for (const s of this.sessions.values()) {
+        if (!roomId || s.roomId === roomId) s.status = "closed";
+      }
+      return { restored: 0, degraded: true, sessions: [], reason: "invalid" };
+    }
+    const restored: string[] = [];
+    let mismatched = false;
+    for (const s of parsed.data.sessions) {
+      // 显式校验：传入 roomId 时，会话的 roomId 必须与之完全一致，否则视为错档（#106）
+      if (roomId && s.roomId !== roomId) { mismatched = true; continue; }
+      if (this.sessions.has(s.id)) continue;
+      if (s.turn >= s.maxTurns) s.status = "closed";
+      this.sessions.set(s.id, s);
+      const n = Number(s.id.replace(/^conv_/, ""));
+      if (Number.isFinite(n) && n > this.nextId) this.nextId = n;
+      restored.push(s.id);
+    }
+    // #123 P1-1：只恢复属于本次实际导入会话的 key；重复导入不覆盖内存中更新的缓存
+    const restoredIds = new Set(restored);
+    for (const entry of parsed.data.seen ?? []) {
+      const sid = this.seenSessionId(entry.key);
+      if (sid === undefined || !restoredIds.has(sid) || this.seen.has(entry.key)) continue;
+      this.seen.set(entry.key, entry.events as ConversationEvent[]);
+    }
+    this.trim(this.seen, MAX_SEEN);
+    // 只要出现 roomId 不一致的会话就降级：调用方应告警/重新加载正确快照（不静默吞掉）
+    return {
+      restored: restored.length, degraded: mismatched, sessions: restored,
+      ...(mismatched ? { reason: "mismatched-room" as const } : {}),
+    };
+  }
+
+  /**
+   * #123 P1-1：路由层据此判定「ledger 里 committed 的 clientTurnId」是否对应 host 真重放。
+   * 只有幂等缓存里确实有一条 conversation.committed，才算真重放；否则 ledger 与缓存已失配，
+   * 不能放行（否则会生成未计费的新回合）。
+   */
+  hasCommitted(sessionId: Id, actorId: string, clientTurnId: string): boolean {
+    const key = JSON.stringify([sessionId, actorId, clientTurnId]);
+    return this.seen.get(key)?.some((e) => e.type === "conversation.committed") ?? false;
+  }
+
+  /** 同上，但按房间取当前可续聊会话后判定；路由层在 openOrReuse 之前拿不到 sessionId */
+  hasCommittedByRoom(roomId: RoomId, actorId: string, clientTurnId: string): boolean {
+    const s = this.getByRoom(roomId);
+    return s ? this.hasCommitted(s.id, actorId, clientTurnId) : false;
+  }
+
   /** 插话超时恢复；返回被恢复的会话 id（保留旧签名供 server tick 使用） */
   resumeExpired(now = this.deps.now?.() ?? Date.now()): Id[] {
     return this.resumeExpiredEvents(now).flatMap((e) => (e.type === "conversation.phase" ? [e.sessionId] : []));
   }
 
-  /** 与 resumeExpired 同源，但带回可下发给前端的 phase 事件 */
-  resumeExpiredEvents(now = this.deps.now?.() ?? Date.now()): ConversationEvent[] {
+  /**
+   * 与 resumeExpired 同源，但带回可下发给前端的 phase 事件。
+   * ④ 带 sessionId 时只恢复该会话：全局 tick 仍可扫全部，但某会话的回合流不能混入别人的超时事件。
+   */
+  resumeExpiredEvents(now = this.deps.now?.() ?? Date.now(), sessionId?: Id): ConversationEvent[] {
     const out: ConversationEvent[] = [];
     for (const s of this.sessions.values()) {
+      if (sessionId !== undefined && s.id !== sessionId) continue;
       if (s.phase === "listening" && s.listenSince !== undefined && now - s.listenSince >= this.deps.policy.listenTimeoutMs) {
         s.phase = "speaking";
         s.listenSince = undefined;
@@ -147,9 +268,24 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     // 放在幂等命中与会话校验之后：重放旧回合不应清空另一个 host 正在用的波次预算
     this.deps.budget?.beginTick(s.roomId);
 
-    // 落盘重试：apply 已完成、记忆已 ingest，这次只重试 flush，绝不重复发 Proposal
+    // 落盘重试：flush 失败时只重试 flush；arbiter 写盘失败时提案从未落库，用同一 cause 重新裁决
     const pending = this.pendingFlush.get(key);
     if (pending) {
+      let applied = pending.applied;
+      if (pending.retry) {
+        applied = await this.deps.arbiter.apply(pending.roomId, pending.retry.ops, pending.retry.cause, { expectedSeq: pending.retry.expectedSeq });
+        if (!applied.ok) {
+          const retryable = applied.error?.code === "E_STORE_FAULT";
+          if (!retryable) this.pendingFlush.delete(key);
+          return [{
+            type: "conversation.error", sessionId,
+            code: applied.error?.code ?? "E_STORE_FAULT",
+            message: applied.error?.message ?? this.deps.policy.messages.storeUnavailable,
+            retryable,
+          }];
+        }
+        for (const ev of applied.events) this.deps.memory.ingest(ev);
+      }
       try {
         await this.deps.store.flush(pending.roomId);
       } catch {
@@ -159,21 +295,29 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       if (pending.beforeLocId !== undefined && pending.s.lastLocId === pending.beforeLocId) {
         pending.s.lastLocId = (await this.deps.store.snapshot(pending.roomId)).room.scene.locId;
       }
-      const done = await this.commitWithState(pending.s, pending.applied);
+      const done = await this.commitWithState(pending.s, applied);
       const all = [...pending.out, done];
+      rememberRecent(pending.s, pending.fresh);
       this.remember(key, all);
       this.pendingFlush.delete(key);
       return all;
     }
 
-    const out: ConversationEvent[] = [...this.resumeExpiredEvents()];
+    const now = this.deps.now?.() ?? Date.now();
+    // ④ 只把本会话到期的 phase 事件塞进本回合返回流
+    const out: ConversationEvent[] = [...this.resumeExpiredEvents(now, sessionId)];
     try {
-      await runStep(this.deps, s, input, out, this.deps.now?.() ?? Date.now(), (ss, a) => this.commitWithState(ss, a));
+      await runStep(this.deps, s, input, out, now, (ss, a) => this.commitWithState(ss, a));
     } catch (e) {
       if (e instanceof StoreFlushError) {
         // 先冻结 out 再追加错误，重试时才不会重复 yield 上一轮的 E_STORE_FAULT
-        this.pendingFlush.set(key, { roomId: e.roomId, s, applied: e.applied, out: [...out], beforeLocId: s.lastLocId });
+        this.pendingFlush.set(key, {
+          roomId: e.roomId, s, applied: e.applied, out: [...out], fresh: e.fresh,
+          beforeLocId: s.lastLocId, retry: e.retry,
+        });
         this.trim(this.pendingFlush, MAX_PENDING);
+        // ③ 外部事件只在提交成功后发布：失败时只回可重试错误
+        out.length = 0;
         out.push({ type: "conversation.error", sessionId, code: "E_STORE_FAULT", message: e.message, retryable: true });
       } else {
         out.push({

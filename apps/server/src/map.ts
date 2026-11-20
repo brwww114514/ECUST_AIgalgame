@@ -351,9 +351,10 @@ export class MapService {
   ): Promise<DialogueResult> {
     const { refs } = await this.content.sceneRefs();
     const sceneRef = refs.get(sceneId);
-    // 出站脱敏（issue #61）：场景对话台词/失败文本同样可能带未认识 NPC 真名，统一过 outbound。
-    // 此处在 snapshot 之前，无 state 可传，maskTurnEvents 会回退到 store.snapshot。
-    if (!sceneRef) return this.outbound(fail("E_SCENE_NOT_FOUND", `场景 ${sceneId} 不存在`), roomId);
+    // 出站脱敏（issue #61）：场景对话台词/失败文本同样可能带未认识 NPC 真名，统一过掩码。
+    // 快照前失败（sceneId 不存在）走 maskEarlyFailure：复用按房间缓存的轻量占位表，
+    // 避免对已知房间的重复请求每次都回退 store.snapshot 回放整条事件日志（issue #66）。
+    if (!sceneRef) return this.maskEarlyFailure(fail("E_SCENE_NOT_FOUND", `场景 ${sceneId} 不存在`), roomId);
 
     const state = await this.deps.store.snapshot(roomId);
     const actor = actorId ?? playerActorId(state);

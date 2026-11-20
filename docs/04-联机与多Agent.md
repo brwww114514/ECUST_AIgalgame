@@ -91,7 +91,7 @@ interface RoomMember {
 | `clock.advanced` | 全场 | 全量 |
 | `scene.changed` | 全场 | 只发 `locationId` + 在场者 |
 | `actor.moved` | 全场 | 非在场者只发"离开了房间"粗粒度 |
-| `turn.committed` | 全场 | `{turnId, seq, actorId}` |
+| `turn.committed` | 不广播（EventLog 记账） | payload `{clientTurnId, turnId, actorId, committedSeq, narrative?, facts?, usage?}`（`packages/engine/src/turn.evidence.ts:25-33`）；`content/registry/events.json` 登记 `broadcast:false`，只进 EventLog 供存档/统计/跨重启幂等与服务器时段计数，**不作为 SSE 事件下发客户端** |
 | `room.member.joined` / `room.member.left` | 全场 | 全量 |
 | `entity.created` / `entity.tombstoned` | 全场 | 只发 `{id, kind, name}`，`attrs` 待拉取 |
 | `plot.upserted` / `plot.resolved` | 全场 | **剥掉** `leakPoints`/`forbidReveal`/`goal`，只留 `plotId`+标题级摘要 |
@@ -100,7 +100,7 @@ interface RoomMember {
 | `attr.changed`（`visibility:"private"`） | 参与者 | 该实体 owner + 有 observe 权限者；如 `guard` 默认不广播，只推"可疑细节" |
 | `link.created` / `link.removed`（`kind:"secret"`） | 参与者 | 仅两端实体；玩家间"欠人情"不广播 |
 | `memory.written` | 不广播 | 服务端内部事件；仅当影响 `guard.changed` 时对外推表现 |
-| `turn.*` 全部 / `state.sync` | 仅自己 | 回合是提交者私有的流，他人只看到 `turn.committed` + 广播事件；`state.sync` 每连接一次，payload 按 `actorId` 裁切成 `View` |
+| `turn.*` 全部 / `state.sync` | 仅自己 | 回合是提交者私有的流，他人只看到广播事件；`turn.committed` 只在服务端 EventLog 记账（§3.1 服务器据此计数推进时段），不下发给客户端；`state.sync` 每连接一次，payload 按 `actorId` 裁切成 `View` |
 | `turn.ui` / `plot.ping` | 仅自己 | 选项/面板给"当前行动者"；"夜里似乎有人说话…"只推给触发者 |
 | `presence.update` | 仅自己 | 房主收完整成员表，普通成员只收"人数变化" |
 

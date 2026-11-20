@@ -14,6 +14,8 @@ import { getMap } from "./api.ts";
 import type { MapView } from "./api.ts";
 import { interiorFor, interiorNpcSpot } from "./interior.ts";
 import { planNpcTalk } from "./npc-presence.ts";
+import { validateUtteranceDraft } from "./conversation-api.ts";
+import type { UtteranceDraft, UtteranceModeInfo } from "./conversation-api.ts";
 import { phaseLabel } from "./ui.ts";
 import type { Line, LineKind } from "./ui.ts";
 
@@ -52,10 +54,18 @@ export interface ChatPanelProps {
   /** 上一回合失败且服务端标记可重试：重发最后一次玩家输入 */
   onRetry: () => void;
   retryable: boolean;
+  /** v2 conversation.phase=listening：等待插话态（服务端 30s 自动恢复 speaking 后前端清掉） */
+  waitingForInterjection?: boolean;
   /** 还有更早的已提交历史（服务端 hasEarlier）：显示"加载更早" */
   hasEarlier: boolean;
   loadingEarlier: boolean;
   onLoadEarlier: () => void;
+  /** v2 会话：说话类型清单（来自 GET /conversation/modes）；不提供则走 v1 老流程 */
+  v2Modes?: UtteranceModeInfo[];
+  /** v2 会话：提交一条完整 utterance（mode/target/content/action），与 onSend 二选一 */
+  onSendUtterance?: (draft: UtteranceDraft) => void;
+  /** v2 回合的乐观玩家行：等引擎把自己的 delivery 投回来就清掉（避免点了发送没反应） */
+  pendingLines?: { kind: LineKind; text: string }[];
 }
 
 export default function ChatPanel({
@@ -79,9 +89,13 @@ export default function ChatPanel({
   onSkipLog,
   onRetry,
   retryable,
+  waitingForInterjection = false,
   hasEarlier,
   loadingEarlier,
   onLoadEarlier,
+  v2Modes,
+  onSendUtterance,
+  pendingLines,
 }: ChatPanelProps) {
   const [talking, setTalking] = useState<{ id: string; name: string } | null>(null);
   /** 点击时记的是占位名；对方自报姓名解锁后，用权威状态里的真名覆盖标题/输入框 */
@@ -95,6 +109,11 @@ export default function ChatPanel({
   const [inside, setInside] = useState<string | null>(null);
   /** 刚点了入口、等世界状态真的走到该场景后再切渲染 */
   const [enteringInterior, setEnteringInterior] = useState<string | null>(null);
+  /** v2 demo：当前说话类型（mode）与动作文本（action）；仅在 v2Modes 提供时显示 */
+  const [mode, setMode] = useState("broadcast");
+  const [action, setAction] = useState("");
+  // 进房后用户尚未选择说话类型/输入内容时，不提前弹校验提示（避免一进房就报"请填写说话内容或动作"）
+  const [v2Touched, setV2Touched] = useState(false);
   const logRef = useRef<HTMLDivElement | null>(null);
   // 是否"跟着最新一条走"：玩家往上翻历史时不打扰，回到底部附近后自动恢复跟随
   const stickRef = useRef(true);
@@ -113,6 +132,13 @@ export default function ChatPanel({
   useEffect(() => {
     if (stickRef.current) scrollToBottom();
   }, [lines, typing?.text]);
+
+  // v2 modes 到位后校正默认值：不硬编码 "broadcast"，服务端清单若去掉它也能落到第一个合法 mode
+  useEffect(() => {
+    if (v2Modes && v2Modes.length > 0 && !v2Modes.some((m) => m.id === mode)) {
+      setMode(v2Modes[0]!.id);
+    }
+  }, [v2Modes, mode]);
 
   // 换地点后把对话对象清掉：你走出去，就不该还挂着"和谁说话"
   useEffect(() => {
@@ -141,6 +167,8 @@ export default function ChatPanel({
   useEffect(() => {
     if (!pendingTalk || pos?.locId !== pendingTalk.locId) return;
     setTalking({ id: pendingTalk.id, name: pendingTalk.name });
+    // issue #110：选中对话目标即视为"已交互"，否则缺伴随动作时按钮禁用却无提示
+    setV2Touched(true);
     setPendingTalk(null);
     setBlocked(null);
   }, [pos?.locId, pendingTalk]);
@@ -172,6 +200,8 @@ export default function ChatPanel({
     if (plan.kind === "present") {
       setBlocked(null);
       setTalking({ id: plan.npc.id, name: plan.npc.name || fallbackName });
+      // issue #110：点选在场 NPC 与选方式/输入同等视为"已交互"，让缺参数的校验提示出现
+      setV2Touched(true);
       return;
     }
     setTalking(null);
@@ -206,6 +236,18 @@ export default function ChatPanel({
       .filter((n) => n.locId === inside)
       .map((n, i) => ({ ...n, ...interiorNpcSpot(i) }));
   }, [map, inside]);
+
+  // v2 demo：当前说话类型与本地校验（规则对齐引擎 delivery.ts，避免用户第一次点就吃 E_SCHEMA_INVALID）
+  const v2Active = Boolean(v2Modes && v2Modes.length > 0 && onSendUtterance);
+  const currentMode = v2Modes?.find((m) => m.id === mode);
+  const draft = {
+    mode,
+    ...(talking ? { target: talking.id } : {}),
+    ...(currentMode?.contentless ? {} : { content: input }),
+    ...(action ? { action } : {}),
+  };
+  const v2Check = v2Active && v2Modes ? validateUtteranceDraft(draft, v2Modes) : { ok: true };
+  const submitDisabled = busy || !state || !v2Check.ok;
 
   return (
     <div className="world-page">
@@ -343,6 +385,11 @@ export default function ChatPanel({
               {l.text}
             </p>
           ))}
+          {pendingLines?.map((l, i) => (
+            <p key={`pending-${i}`} className={`line ${l.kind} pending`}>
+              {l.text}
+            </p>
+          ))}
           {typing && (
             <p className={`line ${typing.kind} typing`}>
               {typing.text}
@@ -350,6 +397,9 @@ export default function ChatPanel({
             </p>
           )}
           {busy && !typing && <p className="line system">…</p>}
+          {waitingForInterjection && (
+            <p className="line system interjection-wait">对方说完了，等你插话…</p>
+          )}
         </div>
 
         {blocked && (
@@ -402,20 +452,83 @@ export default function ChatPanel({
           </div>
         )}
 
+        {/* v2 demo：说话类型选择 + @谁（点场景里的 NPC 即 talking）。老流程无 v2Modes 时不显示 */}
+        {v2Active && v2Modes && (
+          <div className="v2-composer-opts">
+            <label className="v2-mode">
+              <span>方式</span>
+              <select
+                value={mode}
+                onChange={(e) => {
+                  setMode(e.target.value);
+                  setV2Touched(true);
+                }}
+                disabled={busy || !state}
+              >
+                {v2Modes.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {currentMode?.requiresAction && (
+              <input
+                className="v2-action"
+                value={action}
+                onChange={(e) => {
+                  setAction(e.target.value);
+                  setV2Touched(true);
+                }}
+                placeholder="伴随动作（必填，自然语言）"
+                disabled={busy || !state}
+              />
+            )}
+          </div>
+        )}
+        {/* 本地校验提示：与引擎规则一致，拦在提交前；进房未交互时不提前打扰（等用户先动一下） */}
+        {v2Active && v2Touched && !v2Check.ok && (
+          <div className="v2-hint" role="status">
+            {v2Check.reason}
+          </div>
+        )}
         <form
           className="composer"
           onSubmit={(e) => {
             e.preventDefault();
+            if (v2Active && onSendUtterance) {
+              if (!v2Check.ok) return;
+              onSendUtterance(draft);
+              setAction("");
+              return;
+            }
             onSend(talking ? { id: talking.id, name: talkingName } : null);
           }}
         >
-          <input
-            value={input}
-            onChange={(e) => onInput(e.target.value)}
-            placeholder={talking ? `对${talkingName}说…` : "你要做什么？（也可以直接用 WASD 走动）"}
-            disabled={busy || !state}
-          />
-          <button type="submit" disabled={busy || !state}>
+          {v2Active && currentMode?.contentless ? (
+            <div className="v2-contentless-note" role="note">
+              此方式只填动作，不说话
+            </div>
+          ) : (
+            <input
+              value={input}
+              onChange={(e) => {
+                onInput(e.target.value);
+                setV2Touched(true);
+              }}
+              placeholder={
+                v2Active
+                  ? talking
+                    ? `对${talkingName}说…（自然语言）`
+                    : "公开说什么？（自然语言，点 NPC 可改为私下说）"
+                  : talking
+                    ? `对${talkingName}说…`
+                    : "你要做什么？（也可以直接用 WASD 走动）"
+              }
+              disabled={busy || !state}
+            />
+          )}
+          <button type="submit" disabled={submitDisabled}>
             行动
           </button>
         </form>

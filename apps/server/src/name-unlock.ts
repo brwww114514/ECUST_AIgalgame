@@ -10,7 +10,8 @@
  * 否则第一句"你好"就会把全场人的名字解锁。
  * 旁白里提到某人（"不远处的白晓通抬起头"）同样不算。
  */
-import type { Entity } from "../../../packages/shared/src/contract/types.ts";
+import type { ConversationEvent } from "../../../packages/shared/src/contract/v2.ts";
+import type { Entity, WorldState } from "../../../packages/shared/src/contract/types.ts";
 import { knowsNameOf } from "./view-names.ts";
 
 /** 玩家在问对方名字（与 content/modules/introduce 的 ASK_NAME_RE 同口径） */
@@ -63,4 +64,59 @@ export function namesIntroducedIn(text: string, npcs: readonly Entity[]): Entity
     }
   }
   return out;
+}
+
+/** 此刻在场、active 的 NPC 才可能被解锁（不在场的人解锁不了）。 */
+function isPresentNpc(state: WorldState, id: string): boolean {
+  const e = state.entities[id];
+  return !!e && e.kind === "npc" && e.status === "active" && state.room.scene.presentIds.includes(id);
+}
+
+/**
+ * 「玩家在问 targetId 的名字」的解锁判定（v1 `targetNpcId` / v2 `utterance.target` 共用）。
+ * 只有目标是 NPC、此刻在场、且这句话确实在问名字，才返回要解锁的 id。
+ */
+export function askedNameTargetId(
+  state: WorldState,
+  targetId: string | undefined | null,
+  input: string,
+): string | null {
+  if (!targetId || !isAskNameInput(input)) return null;
+  return isPresentNpc(state, targetId) ? targetId : null;
+}
+
+/**
+ * 「真名：台词」文本 → 本回合报出名字、且在场的 NPC id。
+ * v1 的 turn.delta/facts 与 v2 的 delivery 还原文本共用同一判定，避免两条路径口径漂移。
+ */
+export function introducedPresentIds(state: WorldState, speech: string): string[] {
+  if (!speech.trim()) return [];
+  const npcs = Object.values(state.entities).filter((e) => e.kind === "npc" && e.status === "active");
+  return namesIntroducedIn(speech, npcs)
+    .filter((n) => state.room.scene.presentIds.includes(n.id))
+    .map((n) => n.id);
+}
+
+/**
+ * v2：把「玩家实际收到的 delivery」还原成「真名：台词」。
+ * 只统计 `to === actorId`——耳语/私信给别的 NPC 的话玩家没听见，不能据此解锁；
+ * 并按 channels 取内容：不含 `content` 时不拿正文判定（玩家只看到 coverAction）。
+ */
+export function viewerSpeech(
+  state: WorldState,
+  actorId: string,
+  events: readonly ConversationEvent[],
+): string {
+  return events
+    .flatMap((ev) => {
+      if (ev.type !== "conversation.utterance") return [];
+      const d = ev.delivery;
+      if (d.to !== actorId || d.speaker === actorId) return [];
+      const speaker = state.entities[d.speaker];
+      const parts: string[] = [];
+      if (d.channels.includes("content") && typeof d.content === "string" && d.content.trim() !== "") parts.push(d.content);
+      if (d.channels.includes("action") && typeof d.action === "string" && d.action.trim() !== "") parts.push(d.action);
+      return speaker && parts.length > 0 ? [`${speaker.name}：${parts.join(" ")}`] : [];
+    })
+    .join("\n");
 }

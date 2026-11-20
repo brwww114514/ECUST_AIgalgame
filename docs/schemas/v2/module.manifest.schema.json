@@ -52,8 +52,8 @@
       "description": "模块自身语义化版本（v1 沿用 ^\\d+\\.\\d+\\.\\d+$）。"
     },
     "apiVersion": {
-      "const": 2,
-      "description": "契约版本。03 §0.4：引擎只装载 apiVersion 与自身一致的模块；v1 为 1，v2 起为 2，改契约必须 bump 此值（不是模块 version）。"
+      "const": 3,
+      "description": "契约版本。03 §0.4：引擎只装载 apiVersion 与自身一致的模块；v1 为 1，v2 群聊为 2，dev/v2（CONTRACT 3.6.0）起为 3，改契约必须 bump 此值（不是模块 version）。"
     },
     "dependsOn": {
       "type": "array",
@@ -218,7 +218,7 @@
       "name": "校园小卖部",
       "description": "课间在小卖部买卖零食与文具，收钱、交货、记账。",
       "version": "1.2.0",
-      "apiVersion": 2,
+      "apiVersion": 3,
       "dependsOn": [],
       "capabilities": {
         "intents": [
@@ -257,7 +257,7 @@
       "id": "library",
       "name": "图书馆借书",
       "version": "0.1.0",
-      "apiVersion": 2,
+      "apiVersion": 3,
       "capabilities": {
         "intents": [
           "borrow",

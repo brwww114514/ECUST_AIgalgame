@@ -9,6 +9,8 @@ import Fastify from "fastify";
 import { tempDir } from "@galgame/testkit";
 import { createApp } from "./bootstrap.ts";
 import { registerRoutes } from "./routes.ts";
+import { registerAdminRoutes } from "./admin.routes.ts";
+import type { AdminDeps } from "./admin.routes.ts";
 import { AdminTokenGate } from "./admin-token.ts";
 import type { ServerConfig } from "./config.ts";
 
@@ -170,6 +172,39 @@ describe("管理端点鉴权", () => {
     expect(second.statusCode).toBe(429);
     expect((second.json() as { code: string }).code).toBe("E_RATE_LIMITED");
     await app.close();
+  });
+
+  it("AdminDeps.gate / verdictOf 必填（编译期强制，杜绝静默退回普通比较）", () => {
+    type IsRequired<T, K extends keyof T> = {} extends Pick<T, K> ? false : true;
+    const gateRequired: IsRequired<AdminDeps, "gate"> = true;
+    const verdictRequired: IsRequired<AdminDeps, "verdictOf"> = true;
+    expect(gateRequired).toBe(true);
+    expect(verdictRequired).toBe(true);
+  });
+
+  it("漏注 gate 的装配（绕过类型检查）仍走恒定时间门：错误令牌被限流", async () => {
+    const deps = await createApp(testConfig());
+    const app = Fastify();
+    // 模拟未来有人直接构造 AdminDeps 且漏掉 gate/verdictOf：比较必须仍由 AdminTokenGate
+    // 的 sha256 + timingSafeEqual 完成，不能退回与配置令牌的 === 直接比较（前缀可测且无限流）。
+    registerAdminRoutes(app, {
+      auth: deps.auth, ledger: deps.ledger, log: deps.adminLog, adminToken: "dev-admin",
+    } as unknown as AdminDeps);
+    try {
+      const ok = await app.inject({ method: "GET", url: "/api/v1/admin/users", headers: ADMIN });
+      expect(ok.statusCode).toBe(200);
+      for (let i = 0; i < 10; i += 1) {
+        const res = await app.inject({ method: "GET", url: "/api/v1/admin/users", headers: { "x-admin-token": `wrong-${i}` } });
+        expect(res.statusCode, `attempt ${i}`).toBe(401);
+      }
+      // 兜底门同样带失败限流：这是 "=== 兜底" 绝不会有的行为，证明走的是恒定时间路径
+      const blocked = await app.inject({ method: "GET", url: "/api/v1/admin/users", headers: ADMIN });
+      expect(blocked.statusCode).toBe(429);
+      expect((blocked.json() as { code: string }).code).toBe("E_RATE_LIMITED");
+      expect(blocked.headers["retry-after"]).toBeDefined();
+    } finally {
+      await app.close();
+    }
   });
 });
 
@@ -408,6 +443,32 @@ describe("P2 草案授权收口（服务端再校验）", () => {
     // admin-token 通过授权边界，进入 map 业务校验
     const admin = await app.inject({ method: "POST", url: "/api/v1/map/drafts", headers: { ...ADMIN, ...ORIGIN }, payload: {} });
     expect(admin.json()).toMatchObject({ ok: false, code: "E_SCHEMA_INVALID" });
+    await app.close();
+  });
+
+  it("#105：草案列表/审核端点共用 AdminTokenGate —— 无会话 401，连续错误令牌 429", async () => {
+    const { app } = await makeApp();
+    // 匿名访问列表端点：登录门 401（与 POST 同口径）
+    const anon = await app.inject({ method: "GET", url: "/api/v1/map/drafts" });
+    expect(anon.statusCode).toBe(401);
+
+    // 10 次错误令牌打满 AdminTokenGate（限流按 ip 计），第 11 次起 429；
+    // 覆盖此前直接 adminTokenOf 绕过 gate 的 GET 列表与 POST /admin/* 审核面。
+    // 登录门先于 adminOnly：未带 cookie 的坏令牌请求会被 401 短路，需带玩家 cookie 才能到达 gate。
+    const { cookie } = await registerPlayer(app, "bob");
+    const BAD = { "x-admin-token": "definitely-wrong" };
+    for (let i = 0; i < 10; i++) {
+      await app.inject({ method: "GET", url: "/api/v1/map/drafts", headers: { ...BAD, cookie } });
+    }
+    const list = await app.inject({ method: "GET", url: "/api/v1/map/drafts", headers: { ...BAD, cookie } });
+    expect(list.statusCode).toBe(429);
+    expect(list.json()).toMatchObject({ ok: false, code: "E_RATE_LIMITED" });
+
+    const review = await app.inject({
+      method: "POST", url: "/api/v1/admin/map/drafts/draft_missing/review", headers: { ...BAD, ...ORIGIN, cookie }, payload: {},
+    });
+    expect(review.statusCode).toBe(429);
+    expect(review.json()).toMatchObject({ ok: false, code: "E_RATE_LIMITED" });
     await app.close();
   });
 });

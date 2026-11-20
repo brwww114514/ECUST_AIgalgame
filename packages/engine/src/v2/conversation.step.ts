@@ -3,6 +3,7 @@
  * 这里只做编排：投递 → 并行 NPC 决策 → 审核 → 一次性 Proposal；不直接写状态。
  * 每个私有步骤都控制在 50 行以内（AGENTS.md §6）；runStep 只保留顺序。
  */
+import { StoreCommitUnknownError } from "../store-write.ts";
 import type {
   ActorId, ApplyResult, ConversationEvent, ConversationSessionV2, ConversationTurnInput,
   Delivery, Envelope, Proposal, Utterance, WorldState,
@@ -244,7 +245,8 @@ async function commitStep(ctx: StepCtx, utterance?: Utterance): Promise<boolean>
   for (const ev of applied.events) memory.ingest(ev); // PR#4 P0-1：写了必须能读到
   try {
     await store.flush(s.roomId);
-  } catch {
+  } catch (error) {
+    if (error instanceof StoreCommitUnknownError) throw error;
     throw new StoreFlushError(s.roomId, applied, deps.policy.messages.storeFlushFailed, undefined, ctx.fresh);
   }
   await finish(applied);

@@ -70,6 +70,20 @@ afterEach(async () => {
   await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
 });
 
+it("同进程并发首次提交可创建新目录，同房间仍按序串行", async () => {
+  const dir = path.join(await tempDir(), "data", "rooms");
+  const other = "room_other";
+  const store = new FileStore(dir);
+  await Promise.all([
+    store.append(ROOM, [seedEnv(1)]),
+    store.append(ROOM, [seedEnv(2)]),
+    store.append(other, [{ ...seedEnv(1), roomId: other }]),
+  ]);
+  const restored = new FileStore(dir);
+  expect(await restored.load(ROOM)).toBe(2);
+  expect(await restored.load(other)).toBe(1);
+});
+
 describe("BLOCKER-1：落盘失败 → 状态不变、可安全重试", () => {
   it("目录只读时 apply 返回 E_STORE_FAULT，内存与 seq 都不变；恢复后重试只生效一次", async () => {
     const dir = await tempDir();

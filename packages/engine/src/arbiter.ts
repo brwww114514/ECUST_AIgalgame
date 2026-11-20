@@ -30,6 +30,7 @@ import type { MemoryReader, OpLimits } from "./arbiter.ops.ts";
 import { validateOp } from "./arbiter.ops.ts";
 import type { EventLog } from "./store.ts";
 import { type TurnCommitEvidence, commitMarker } from "./turn.evidence.ts";
+import { StoreCommitUnknownError } from "./store-write.ts";
 
 /** 全部来自 docs/02 §3、03 §8 与 03 §10.4 的默认值；改这里等于改玩法手感，要同步文档 */
 export type ArbiterLimits = OpLimits & {
@@ -211,12 +212,13 @@ export class DefaultArbiter {
       }
       if (sim.events.length > 0) {
         try {
-          // 写盘先行（FileStore 会 await）：失败则状态未变更，可以直接重试
+          // 安全失败可以重试。替换日志后同步失败时，必须保留结果待核对的语义。
           await this.store.append(roomId, sim.events);
         } catch (e) {
           budget.delta = deltaBackup;
           budget.xWrites = xBackup;
           budget.memSeq = memBackup;
+          if (e instanceof StoreCommitUnknownError) throw e;
           return {
             ok: false, mode, seq: seqBefore, applied: [], rejected: [], events: [],
             error: { code: "E_STORE_FAULT", message: `落盘失败：${e instanceof Error ? e.message : String(e)}` },

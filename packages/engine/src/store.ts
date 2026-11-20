@@ -12,11 +12,12 @@
  *     不要拿它做 expectedSeq 校验（重启后第一回合会假报 E_SEQ_GAP）。
  */
 
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { Envelope, RoomId, Store, WorldState } from "../../shared/src/contract/types.ts";
 import { applyEvent, createInitialState } from "./projection.ts";
 import { decodeRoomLog, projectRoomEvents } from "./room-log.ts";
+import { RoomLogWriter, StoreCommitUnknownError } from "./store-write.ts";
 
 export interface StoreOptions {
   worldId?: string;
@@ -133,19 +134,20 @@ export class EventSourcedStore implements EventLog {
 /**
  * 文件版：每房间一个 JSONL（一行一个 Envelope）。
  *
- * 写盘用「整份日志写临时文件 → rename」而不是 appendFile：rename 在同一文件系统上是原子的，
- * 崩溃只会留下完整旧文件或完整新文件，不会留下半批事件（那才是"内存已提交、磁盘只写了一半"的根源）。
- * 代价是每次提交 O(n) 重写 —— M0 房间规模（<千条事件）完全可接受，M1 换 SQLite/WAL 时这层接口不变。
+ * 每次提交整份重写（O(n)），同步新文件后替换原日志，再同步目录。
  */
 export class FileStore extends EventSourcedStore {
   private readonly loaded = new Set<RoomId>();
   private readonly loading = new Map<RoomId, Promise<void>>();
   private readonly writes = new Map<RoomId, Promise<void>>();
   private readonly dir: string;
+  private readonly writer: RoomLogWriter;
+  private readonly uncertain = new Map<RoomId, StoreCommitUnknownError>();
 
   constructor(dir = path.join(process.cwd(), "data", "rooms"), opts: StoreOptions = {}) {
     super(opts);
     this.dir = dir;
+    this.writer = new RoomLogWriter(dir);
   }
 
   private file(roomId: RoomId): string {
@@ -156,10 +158,6 @@ export class FileStore extends EventSourcedStore {
     return path.join(this.dir, `${roomId}.jsonl`);
   }
 
-  private tmpFile(roomId: RoomId): string {
-    return `${this.file(roomId)}.tmp`;
-  }
-
   /** 读取前先载入：所有读接口都经过这里，杜绝"用未载入的 seq 做校验" */
   override async load(roomId: RoomId): Promise<number> {
     await this.ensure(roomId);
@@ -167,6 +165,8 @@ export class FileStore extends EventSourcedStore {
   }
 
   private ensure(roomId: RoomId): Promise<void> {
+    const failure = this.uncertain.get(roomId);
+    if (failure) return Promise.reject(failure);
     if (this.loaded.has(roomId)) return Promise.resolve();
     const inflight = this.loading.get(roomId);
     if (inflight) return inflight;
@@ -192,19 +192,19 @@ export class FileStore extends EventSourcedStore {
     this.loaded.add(roomId);
   }
 
-  /** 原子写整份日志：tmp → rename（不要 appendFile，半批事件会撕裂存档） */
   private async writeAll(roomId: RoomId, envs: Envelope[]): Promise<void> {
-    await mkdir(this.dir, { recursive: true });
-    const body = envs.map((e) => JSON.stringify(e)).join("\n");
-    const tmp = this.tmpFile(roomId);
-    await writeFile(tmp, body.length > 0 ? `${body}\n` : "", "utf8");
-    await rename(tmp, this.file(roomId));
+    try {
+      await this.writer.write(this.file(roomId), envs);
+    } catch (error) {
+      if (error instanceof StoreCommitUnknownError) {
+        // 原文件可能已被替换，封住该房间，避免用内存里的旧投影继续结算。
+        this.uncertain.set(roomId, error);
+        console.error(`[store] 房间 ${roomId} 的提交结果待核对`, error.cause);
+      }
+      throw error;
+    }
   }
 
-  /**
-   * 写盘先行：写成功才改内存。失败（磁盘满、权限、rename 失败）→ 抛错且内存不变，
-   * Arbiter 会把这次 apply 判为 E_STORE_FAULT，Turn 据此不发 commit，重试是安全的。
-   */
   override append(roomId: RoomId, envs: Envelope[]): Promise<void> {
     if (envs.length === 0) return Promise.resolve();
     const prev = this.writes.get(roomId) ?? Promise.resolve();
@@ -229,6 +229,8 @@ export class FileStore extends EventSourcedStore {
   override async flush(roomId?: RoomId): Promise<void> {
     const waits = roomId ? [this.writes.get(roomId)] : [...this.writes.values()];
     await Promise.all(waits.filter((p): p is Promise<void> => !!p));
+    const failure = roomId ? this.uncertain.get(roomId) : this.uncertain.values().next().value;
+    if (failure) throw failure;
   }
 
   override async snapshot(roomId: RoomId): Promise<WorldState> {

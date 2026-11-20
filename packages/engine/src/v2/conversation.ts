@@ -18,6 +18,7 @@ import type {
   Delivery,
 } from "../../../shared/src/index.ts";
 import type { EventLog } from "../store.ts";
+import { StoreCommitUnknownError } from "../store-write.ts";
 import type { DefaultArbiter } from "../arbiter.ts";
 import type { EventSourcedMemory } from "../memory.ts";
 import { conversationSnapshotSchema, type ConversationSnapshot, type RestoreResult } from "./conversation-snapshot.ts";
@@ -288,8 +289,14 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       }
       try {
         await this.deps.store.flush(pending.roomId);
-      } catch {
-        return [{ type: "conversation.error", sessionId, code: "E_STORE_FAULT", message: this.deps.policy.messages.storeUnavailable, retryable: true }];
+      } catch (error) {
+        const uncertain = error instanceof StoreCommitUnknownError;
+        if (uncertain) this.pendingFlush.delete(key);
+        return [{
+          type: "conversation.error", sessionId, code: "E_STORE_FAULT",
+          message: uncertain ? error.message : this.deps.policy.messages.storeUnavailable,
+          retryable: !uncertain,
+        }];
       }
       // 用当前快照而非失败当时的快照：若期间别的回合已推进地点，不回写旧值
       if (pending.beforeLocId !== undefined && pending.s.lastLocId === pending.beforeLocId) {
@@ -309,6 +316,10 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     try {
       await runStep(this.deps, s, input, out, now, (ss, a) => this.commitWithState(ss, a));
     } catch (e) {
+      if (e instanceof StoreCommitUnknownError) {
+        // 提交结果待核对，丢弃本轮尚未发布的事件。
+        return [{ type: "conversation.error", sessionId, code: e.code, message: e.message, retryable: false }];
+      }
       if (e instanceof StoreFlushError) {
         // 先冻结 out 再追加错误，重试时才不会重复 yield 上一轮的 E_STORE_FAULT
         this.pendingFlush.set(key, {

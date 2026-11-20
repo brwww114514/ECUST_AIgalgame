@@ -139,6 +139,23 @@ interface PlotState {
   nextPair: number;
 }
 
+/**
+ * 视角化模板（docs/04 §7.4 硬规则①）：同一事实对每个 ownerId 用不同叙述，
+ * 禁止"只换前缀、正文逐字复用"。按 index 选模板（并轮换线索），保证任意两名参与者文本不同。
+ */
+const PERSPECTIVES: readonly ((hint: string) => string)[] = [
+  (hint) => `是我先把话挑明的：今晚的事先压着，线索留在「${hint}」附近，别声张。`,
+  (hint) => `有人压低声音交代我盯住「${hint}」那一带，具体内幕先别追问。`,
+  (hint) => `我负责望风，隐约听他们说线索跟「${hint}」有关，先记在心里。`,
+  (hint) => `在场的人绕着「${hint}」谈了半天，我只听个大概，细节先按下。`,
+];
+
+function perspectiveContent(plot: NormalizedPlot, index: number): string {
+  const hint = plot.leakPoints[index % Math.max(plot.leakPoints.length, 1)] ?? "现场";
+  const template = PERSPECTIVES[index % PERSPECTIVES.length];
+  return template ? template(hint) : `我参与了今晚的谈话，记得线索在「${hint}」附近，先不细说。`;
+}
+
 /** 结构化密谋落账：plot.upsert + 每名参与者一条不同视角的私忆。 */
 export function conspiracyProposals(plot: NormalizedPlot): Proposal[] {
   const proposals: Proposal[] = [
@@ -159,8 +176,7 @@ export function conspiracyProposals(plot: NormalizedPlot): Proposal[] {
   ];
   // 视角化写入三硬规则（docs/04 §7.4）：每人不同叙述、逐 ownerId 写、秘密原文不进文本。
   plot.actors.forEach((actor, index) => {
-    const hint = plot.leakPoints[index % Math.max(plot.leakPoints.length, 1)] ?? "现场";
-    const content = `第${index + 1}视角：今晚与在场者谈到一件还不能明说的事，只记得线索在「${hint}」附近，细节先压在心底。`;
+    const content = perspectiveContent(plot, index);
     const safe = scrub(plot.forbidReveal, content);
     if (!safe) return;
     proposals.push({
@@ -169,7 +185,7 @@ export function conspiracyProposals(plot: NormalizedPlot): Proposal[] {
         ownerId: actor,
         content: safe,
         tags: ["密谋", "夜间"],
-        salience: 6,
+        salience: 5,
         visibility: "private",
         about: plot.actors.filter((a) => a !== actor),
       },
@@ -203,6 +219,10 @@ export function discoveryProposals(ctx: ModuleContext, plot: NormalizedPlot, kin
     });
   });
   // NPC 态度变化可见：给每名密谋参与者叠加可配置的戒备属性（键来自模块数据，不硬编码属性名）。
+  // TODO(#96 端到端接线，独立 issue)：moduleState["npc.plot.attitudeAttr"] 目前没有任何写入方——
+  // 13 个 op 原语里没有 moduleState.set，turn/map.tick 也不写这个键；本函数又没有调用方。
+  // 在"夜间 tick 触发 npc.plot + 写 attitude 键 + 调用 discoveryProposals"接线落地前，
+  // 下面的 attr.delta 永远被跳过。保持 gated 而不硬编码 "guard"（I2），接线后无需改这里。
   const attitudeKey = typeof ctx.state.moduleState["npc.plot.attitudeAttr"] === "string"
     ? (ctx.state.moduleState["npc.plot.attitudeAttr"] as string)
     : undefined;
@@ -242,7 +262,9 @@ const director: DialogueDirector = {
   id: "npc.plot",
 
   async nextTurn(session: DialogueSession, ctx: ModuleContext): Promise<DialogueStep> {
-    const turn = session.turn + 1; // DialogueHost 已在 advance 里 +1；这里保持与占位版同口径
+    // DialogueHost.advance 已在调用本方法前执行 s.turn += 1（dialogue.ts:85）：
+    // 首步传入的 session.turn 就是 1。若这里再 +1，turn===1 分支永不命中、seed 恒空（PR #123 P0-D）。
+    const turn = session.turn;
     const base = { sessionId: session.id, turn };
     const participants = session.participants;
 
@@ -259,26 +281,41 @@ const director: DialogueDirector = {
       session.seed[PLOT_STATE_KEY] = { plot, pairs, nextPair: 1 } satisfies PlotState;
       const proposals = conspiracyProposals(plot);
       const first = pairs[0];
-      const utterances = first ? await pairSummary(ctx, first, plot) : [];
+      const utterances = first ? await pairSummary(ctx, first, plot, 0) : [];
       return { ...base, utterances, proposals, done: pairs.length <= 1 || turn >= session.maxTurns };
     }
 
     // 后续轮：每轮一对摘要；没有更多配对就收束
     const state = session.seed[PLOT_STATE_KEY] as PlotState | undefined;
     if (!state) return { ...base, utterances: [], proposals: [], done: true };
-    const pair = state.pairs[state.nextPair];
+    const pairIndex = state.nextPair;
+    const pair = state.pairs[pairIndex];
     if (!pair) return { ...base, utterances: [], proposals: [], done: true };
     state.nextPair += 1;
-    const utterances = await pairSummary(ctx, pair, state.plot);
+    const utterances = await pairSummary(ctx, pair, state.plot, pairIndex);
     return { ...base, utterances, proposals: [], done: state.nextPair >= state.pairs.length || turn >= session.maxTurns };
   },
 };
 
+/** 每对只拿到自己那部分线索（docs/04 §7.4「各自只知自己那部分」），不共享全量 leakPoints。 */
+const PAIR_LIMIT = 3;
+
+export function pairLeaks(leaks: readonly string[], pairIndex: number): string[] {
+  return leaks.filter((_, i) => i % PAIR_LIMIT === pairIndex % PAIR_LIMIT);
+}
+
 /** 每对参与者一次对话摘要；输出只作为 private dialogue，不进玩家叙事。 */
-async function pairSummary(ctx: ModuleContext, pair: [ActorId, ActorId], plot: NormalizedPlot): Promise<{ actorId: ActorId; text: string }[]> {
+async function pairSummary(
+  ctx: ModuleContext,
+  pair: [ActorId, ActorId],
+  plot: NormalizedPlot,
+  pairIndex: number,
+): Promise<{ actorId: ActorId; text: string }[]> {
+  const ownLeaks = pairLeaks(plot.leakPoints, pairIndex);
   const raw = await chatJson(ctx, [
-    { role: "system", content: "只输出 JSON：{lines:[{actorId,text}]}。每人一句压低声音的短谈，围绕 leaks，绝不说出 forbidReveal 原文。" },
-    { role: "user", content: `参与者：${pair.join(",")}；线索：${plot.leakPoints.join("；")}；不可说：${plot.forbidReveal}。` },
+    // 秘密原文不进 prompt，只在生成侧用 scrub 兜底（docs/04 §7.4 硬规则③ / AGENTS.md §5）。
+    { role: "system", content: "只输出 JSON：{lines:[{actorId,text}]}。每人一句压低声音的短谈，只围绕分给你的线索，绝不写出任何尚未公开的真相或秘密原文。" },
+    { role: "user", content: `参与者：${pair.join(",")}；你这一对知道的线索：${ownLeaks.join("；") || "无"}。别追问别人那部分。` },
   ]);
   const parsed = raw === undefined ? undefined : PairSchema.safeParse(raw);
   if (!parsed?.success) return [];

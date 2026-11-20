@@ -10,7 +10,7 @@ import type { ViewPatch, WorldState } from "../../../packages/shared/src/contrac
 import CampusMap from "./CampusMap.tsx";
 import InteriorMap from "./InteriorMap.tsx";
 import MiniMap from "./MiniMap.tsx";
-import { getMap } from "./api.ts";
+import { getMap, tick } from "./api.ts";
 import type { MapView } from "./api.ts";
 import { interiorFor, interiorNpcSpot } from "./interior.ts";
 import { planNpcTalk } from "./npc-presence.ts";
@@ -187,6 +187,27 @@ export default function ChatPanel({
     };
   }, [roomId, pos?.locId]);
 
+  // 时间推进：每 2 分钟走一个 tick，NPC 按作息换地方（否则作息表永远不生效）
+  useEffect(() => {
+    if (!roomId) return;
+    let alive = true;
+    const step = async () => {
+      try {
+        await tick(roomId, true);
+        if (!alive) return;
+        const m = await getMap(roomId);
+        if (alive) setMap(m);
+      } catch {
+        // 网络/房间忙时跳过这一拍，下个周期再试
+      }
+    };
+    const timer = window.setInterval(() => void step(), 2 * 60 * 1000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [roomId]);
+
   /**
    * 点 NPC（issue #21-1）：只有和玩家同场景的人才打开对话；
    * 在别处的人不建立对话对象，改为提示 + 一键前往（复用地图 travel）。
@@ -226,7 +247,15 @@ export default function ChatPanel({
     setPendingTalk({ id: target.id, name: target.name, locId: target.locId });
   };
 
-  const stats = (Object.values(panels ?? {})[0] ?? []).slice(0, 4);
+  /** 时段的外观：颜色和图标，让时间在画面上一眼能认出来 */
+const PHASE_META: Record<string, { name: string; icon: string; color: string }> = {
+  morning: { name: "早上", icon: "☀", color: "#ffd479" },
+  noon: { name: "中午", icon: "☀", color: "#fff3c0" },
+  afternoon: { name: "下午", icon: "⛅", color: "#ffb877" },
+  evening: { name: "傍晚", icon: "◐", color: "#ff8f63" },
+  night: { name: "夜里", icon: "☾", color: "#7ea6ff" },
+};
+const stats = (Object.values(panels ?? {})[0] ?? []).slice(0, 4);
 
   // 室内视图：当前场景是否挂了室内地图，以及馆内的 NPC（位置按索引落到馆内座位点）
   const insideInterior = inside ? interiorFor(inside) : null;
@@ -296,6 +325,15 @@ export default function ChatPanel({
         </div>
 
         <div className="world-hud-right">
+          {state && (
+            <div className="hud-clock" data-phase={state.clock.phase}>
+              <i aria-hidden="true">{PHASE_META[state.clock.phase]?.icon ?? "☀"}</i>
+              <div>
+                <b>第 {state.clock.day} 天</b>
+                <span>{PHASE_META[state.clock.phase]?.name ?? phaseLabel(state.clock.phase)}</span>
+              </div>
+            </div>
+          )}
           {stats.map((r) => (
             <span className="hud-stat" key={r.label}>
               <i>{r.label}</i>
@@ -347,8 +385,17 @@ export default function ChatPanel({
           ) : (
             <span className="muted">自由行动</span>
           )}
-          <button type="button" className="btn ghost dock-fold" onClick={onSkipLog} title="跳过打字动画">
-            ⏩
+          <button
+            type="button"
+            className="btn ghost dock-fold"
+            onClick={onSkipLog}
+            title="跳过打字动画"
+            aria-label="跳过打字动画"
+          >
+            <svg width="15" height="12" viewBox="0 0 15 12" aria-hidden="true">
+              <path d="M1 1 L6.5 6 L1 11 Z" fill="currentColor" />
+              <path d="M8 1 L13.5 6 L8 11 Z" fill="currentColor" />
+            </svg>
           </button>
         </div>
 
@@ -453,37 +500,18 @@ export default function ChatPanel({
         )}
 
         {/* v2 demo：说话类型选择 + @谁（点场景里的 NPC 即 talking）。老流程无 v2Modes 时不显示 */}
-        {v2Active && v2Modes && (
+        {v2Active && v2Modes && currentMode?.requiresAction && (
           <div className="v2-composer-opts">
-            <label className="v2-mode">
-              <span>方式</span>
-              <select
-                value={mode}
-                onChange={(e) => {
-                  setMode(e.target.value);
-                  setV2Touched(true);
-                }}
-                disabled={busy || !state}
-              >
-                {v2Modes.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {currentMode?.requiresAction && (
-              <input
-                className="v2-action"
-                value={action}
-                onChange={(e) => {
-                  setAction(e.target.value);
-                  setV2Touched(true);
-                }}
-                placeholder="伴随动作（必填，自然语言）"
-                disabled={busy || !state}
-              />
-            )}
+            <input
+              className="v2-action"
+              value={action}
+              onChange={(e) => {
+                setAction(e.target.value);
+                setV2Touched(true);
+              }}
+              placeholder="伴随动作（必填，自然语言）"
+              disabled={busy || !state}
+            />
           </div>
         )}
         {/* 本地校验提示：与引擎规则一致，拦在提交前；进房未交互时不提前打扰（等用户先动一下） */}
@@ -505,6 +533,26 @@ export default function ChatPanel({
             onSend(talking ? { id: talking.id, name: talkingName } : null);
           }}
         >
+          {/* 说话类型放在输入框左侧，只留下拉本身 */}
+          {v2Active && v2Modes && (
+            <select
+              className="v2-mode-select"
+              aria-label="说话类型"
+              title="说话类型"
+              value={mode}
+              onChange={(e) => {
+                setMode(e.target.value);
+                setV2Touched(true);
+              }}
+              disabled={busy || !state}
+            >
+              {v2Modes.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          )}
           {v2Active && currentMode?.contentless ? (
             <div className="v2-contentless-note" role="note">
               此方式只填动作，不说话

@@ -10,10 +10,12 @@ import { useEffect, useRef, useState } from "react";
 import type { MapNpc } from "./api.ts";
 import type { InteriorMap } from "./interior.ts";
 
-const SCALE = 0.55;
-const SPEED = 260;
+const SCALE = 0.85;
+const SPEED = 380;
 const TALK_DIST = 110;
 const EXIT_DIST = 130;
+/** 靠近出口满 0.5 秒自动离开 */
+const EXIT_DWELL_MS = 1500;
 const PROBE_MS = 160;
 /** 4 帧走路循环：并腿 → 迈左脚 → 并腿 → 迈右脚 */
 const WALK_SEQ = ["", "-walk1", "", "-walk2"];
@@ -57,6 +59,12 @@ export default function InteriorMap({
   const [ready, setReady] = useState(false);
   const [nearNpc, setNearNpc] = useState<{ id: string; name: string } | null>(null);
   const [nearExit, setNearExit] = useState(false);
+  /** 出口同样要"离开过一次范围"才武装，避免刚进门就触发离开 */
+  const exitArmedRef = useRef(false);
+  const exitDwellRef = useRef<{ since: number; fired: boolean }>({ since: 0, fired: false });
+  const exitRingRef = useRef<SVGCircleElement | null>(null);
+  const onExitRef = useRef(onExit);
+  onExitRef.current = onExit;
 
   // 四方向立绘
   const heroBase = heroSrc.endsWith("-down.png") ? heroSrc.slice(0, -"-down.png".length) : heroSrc.replace(/\.png$/, "");
@@ -130,10 +138,11 @@ export default function InteriorMap({
         const viewW = vp.clientWidth / SCALE;
         const viewH = vp.clientHeight / SCALE;
         const cam = camRef.current;
-        const tx = clamp(p.x - viewW / 2, 0, Math.max(0, W - viewW));
-        const ty = clamp(p.y - viewH / 2, 0, Math.max(0, H - viewH));
-        cam.x += (tx - cam.x) * 0.22;
-        cam.y += (ty - cam.y) * 0.22;
+        // 室内图比视口小时居中显示（之前会贴在左上角）
+        const tx = W > viewW ? clamp(p.x - viewW / 2, 0, W - viewW) : (W - viewW) / 2;
+        const ty = H > viewH ? clamp(p.y - viewH / 2, 0, H - viewH) : (H - viewH) / 2;
+        cam.x += (tx - cam.x) * 0.32;
+        cam.y += (ty - cam.y) * 0.32;
         const world = worldRef.current;
         if (world) world.style.transform = `translate3d(${Math.round(-cam.x * SCALE)}px, ${Math.round(-cam.y * SCALE)}px, 0)`;
         const hero = heroRef.current;
@@ -195,7 +204,44 @@ export default function InteriorMap({
         }
       }
       setNearNpc((prev) => (prev?.id === best?.id ? prev : best));
-      setNearExit(Math.hypot(interior.exit.x - p.x, interior.exit.y - p.y) < EXIT_DIST);
+
+      // 靠近出口满 1.5 秒自动离开（和大地图进室内同一套手感）
+      const near = Math.hypot(interior.exit.x - p.x, interior.exit.y - p.y) < EXIT_DIST;
+      setNearExit(near);
+      const now = Date.now();
+      const dw = exitDwellRef.current;
+      const RING_LEN = 2 * Math.PI * 17;
+      const ring = exitRingRef.current;
+
+      if (!near) {
+        exitArmedRef.current = true;
+        dw.since = 0;
+        dw.fired = false;
+        if (ring) {
+          ring.style.strokeDashoffset = String(RING_LEN);
+          ring.classList.remove("on");
+        }
+      } else if (!exitArmedRef.current) {
+        dw.since = 0;
+        dw.fired = false;
+        if (ring) {
+          ring.style.strokeDashoffset = String(RING_LEN);
+          ring.classList.remove("on");
+        }
+      } else if (!dw.since) {
+        dw.since = now;
+      } else {
+        const pct = Math.min(1, (now - dw.since) / EXIT_DWELL_MS);
+        if (ring) {
+          ring.style.strokeDashoffset = String(RING_LEN * (1 - pct));
+          ring.classList.toggle("on", pct > 0.01);
+        }
+        if (!dw.fired && pct >= 1) {
+          dw.fired = true;
+          exitArmedRef.current = false;
+          onExitRef.current();
+        }
+      }
     };
     probe();
     const timer = window.setInterval(probe, PROBE_MS);
@@ -249,10 +295,24 @@ export default function InteriorMap({
           className={`interior-exit${nearExit ? " near" : ""}`}
           style={{ left: Math.round(interior.exit.x * SCALE), top: Math.round(interior.exit.y * SCALE) }}
           onClick={onExit}
-          title="离开图书馆"
+          title="离开这里"
         >
-          <i>出</i>
-          <span>离开图书馆</span>
+          <span className="exit-ic">
+            <svg className="exit-ring" viewBox="0 0 40 40" width="40" height="40">
+              <circle className="ring-bg" cx="20" cy="20" r="17" />
+              <circle
+                className="ring-fg"
+                ref={exitRingRef}
+                cx="20"
+                cy="20"
+                r="17"
+                strokeDasharray={String(2 * Math.PI * 17)}
+                strokeDashoffset={String(2 * Math.PI * 17)}
+              />
+            </svg>
+            <i>出</i>
+          </span>
+          <span className="exit-label">离开</span>
         </button>
 
         <div className="campus-hero" ref={heroRef}>

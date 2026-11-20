@@ -24,9 +24,18 @@ export function isRoomSyncFault(error: unknown): error is StoreCommitUnknownErro
   return error instanceof StoreCommitUnknownError || error instanceof RoomStorageBlockedError;
 }
 
-async function syncDirectory(directory: string): Promise<void> {
-  const handle = await open(directory, "r");
+async function syncDirectory(directory: string, newChild?: string): Promise<void> {
+  let handle;
   try {
+    handle = await open(directory, "r");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // 运维提供的既存路径可能只允许穿越父目录。本次创建的目录不能跳过同步。
+    if (!newChild && (code === "EACCES" || code === "EPERM")) return;
+    throw error;
+  }
+  try {
+    if (newChild) await mkdir(newChild);
     await handle.sync();
   } finally {
     await handle.close();
@@ -52,8 +61,7 @@ export async function prepareDurableDirectory(dir: string): Promise<void> {
   // 已存在的最后一级也可能由刚失败的初始化或管理员脚本创建。
   await syncDirectory(path.dirname(directory));
   for (const child of missing.reverse()) {
-    await mkdir(child);
-    await syncDirectory(path.dirname(child));
+    await syncDirectory(path.dirname(child), child);
   }
 }
 

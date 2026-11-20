@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import { expect, it, vi } from "vitest";
@@ -87,6 +87,21 @@ it("初始化同步失败后，重试会补做父目录同步", async () => {
   }
 });
 
+it.skipIf(process.getuid?.() === 0)("既存数据目录的父目录仅可穿越时，服务仍能写入", async () => {
+  const root = tempDir("galgame-provisioned-parent-");
+  const parent = path.join(root, "search-only");
+  const dataDir = path.join(parent, "data");
+  await mkdir(dataDir, { recursive: true });
+  await chmod(parent, 0o111);
+  try {
+    const deps = await createApp(config(dataDir));
+    const { roomId } = await deps.createRoom("solo");
+    expect((await deps.store.events(roomId, 1)).length).toBeGreaterThan(0);
+  } finally {
+    await chmod(parent, 0o700);
+  }
+});
+
 it("区分替换前和替换后故障，只冻结结果待核对的房间", async () => {
   const dataDir = tempDir("galgame-save-sync-");
   const deps = await createApp(config(dataDir));
@@ -154,7 +169,11 @@ async function createPlayerRoom(app: FastifyInstance, userId: string) {
   return response.json() as { roomId: string; actorId: string };
 }
 
-it.each(["turn.delta", "turn.patch"])("后续同房间同步失败仍可确认先前 durable 回合（停在 %s）", async (pauseAt) => {
+it.each([
+  { pauseAt: "turn.delta", successorSucceeds: false },
+  { pauseAt: "turn.patch", successorSucceeds: false },
+  { pauseAt: "turn.patch", successorSucceeds: true },
+])("先前已落盘的回合按自身序号确认（$pauseAt，后续提交成功=$successorSucceeds）", async ({ pauseAt, successorSucceeds }) => {
   const dataDir = tempDir("galgame-save-concurrent-");
   const deps = await createApp(config(dataDir));
   const app = Fastify();
@@ -167,7 +186,7 @@ it.each(["turn.delta", "turn.patch"])("后续同房间同步失败仍可确认�
   const run = deps.turn.run.bind(deps.turn);
   vi.spyOn(deps.turn, "run").mockImplementation(async function* (req) {
     for await (const event of run(req)) {
-      if (event.type === pauseAt) {
+      if (req.clientTurnId === clientTurnId && event.type === pauseAt) {
         arrived();
         await gate;
       }
@@ -182,17 +201,28 @@ it.each(["turn.delta", "turn.patch"])("后续同房间同步失败仍可确认�
     });
     await Promise.race([paused, pending.then(() => { throw new Error("turn finished before pause point"); })]);
     const sequence = (await deps.store.events(roomId, 1)).at(-1)!.seq;
-    fault.directory = path.join(dataDir, "rooms");
-    fault.phase = "directory";
-    expect(await deps.map.tick(roomId, { advance: true })).toMatchObject({ ok: false, code: "E_STORE_FAULT" });
+    let lastCommittedSeq = sequence;
+    if (successorSucceeds) {
+      expect(await deps.map.travel(roomId, actorId, "loc_teaching_1")).toMatchObject({ ok: true });
+      lastCommittedSeq = (await deps.store.events(roomId, 1)).at(-1)!.seq;
+      expect(lastCommittedSeq).toBeGreaterThan(sequence);
+    } else {
+      fault.directory = path.join(dataDir, "rooms");
+      fault.phase = "directory";
+      expect(await deps.map.tick(roomId, { advance: true })).toMatchObject({ ok: false, code: "E_STORE_FAULT" });
+    }
     resume();
 
     const response = await pending;
     expect(response.body).toContain("turn.commit");
     expect(response.body).not.toContain("turn.error");
     expect(deps.ledger.get({ userId, roomId, clientTurnId })).toMatchObject({ state: "committed", committedSeq: sequence });
-    expect(await deps.history.readAll(roomId)).toMatchObject([{ committedSeq: sequence, clientTurnId }]);
-    expect(await deps.saves.list(userId)).toMatchObject([{ lastCommittedSeq: sequence }]);
+    const history = await deps.history.readAll(roomId);
+    expect(history[0]).toMatchObject({ committedSeq: sequence, clientTurnId });
+    expect(history.at(-1)?.committedSeq).toBe(lastCommittedSeq);
+    expect(await deps.saves.list(userId)).toMatchObject([{
+      lastCommittedSeq, lastTurnId: history.at(-1)?.turnId,
+    }]);
   } finally {
     resume();
     fault.directory = "";

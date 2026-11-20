@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  conversationModesPath,
   conversationProbePath,
   conversationTurnPath,
   detectConversation,
   dispatchConversationEvent,
+  fetchUtteranceModes,
   isConversationAvailable,
   runConversationTurn,
+  runConversationUtterance,
 } from "./conversation-api.ts";
 import type { ConversationStreamHandlers } from "./conversation-api.ts";
 
@@ -34,6 +37,7 @@ describe("feature detect（纯判定 + 探测退化）", () => {
   it("路径不猜错：探 conversation，回合走 conversation/turns", () => {
     expect(conversationProbePath("room 1")).toBe("/api/v1/rooms/room%201/conversation");
     expect(conversationTurnPath("room_1")).toBe("/api/v1/rooms/room_1/conversation/turns");
+    expect(conversationModesPath("room_1")).toBe("/api/v1/rooms/room_1/conversation/modes");
   });
 
   it("探测 404 → false；200 → true；fetch 抛错也当 false（不打断进房）", async () => {
@@ -116,5 +120,46 @@ describe("runConversationTurn 结局判定", () => {
       onError: (code, message) => calls.push(`${code}:${message}`),
     });
     expect(calls).toEqual(["E_CONV_NOT_FOUND:无会话"]);
+  });
+});
+
+describe("fetchUtteranceModes（说话类型清单）", () => {
+  it("200 → 返回 modes 数组；坏结构/失败 → 空数组（不阻断聊天）", async () => {
+    const modes = [
+      { id: "broadcast", label: "公开说", requiresTarget: false, requiresAction: false, contentless: false, targetPresence: "present" },
+    ];
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, modes }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      .mockRejectedValueOnce(new TypeError("offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await fetchUtteranceModes("r")).toEqual(modes);
+    expect(await fetchUtteranceModes("r")).toEqual([]);
+    expect(await fetchUtteranceModes("r")).toEqual([]);
+  });
+});
+
+describe("runConversationUtterance（规范端点 POST body 形状）", () => {
+  it("POST 到规范路径，body 带完整 utterance，speaker 由服务端覆盖故客户端不传", async () => {
+    let url = "";
+    let body: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (u: string, init: RequestInit) => {
+      url = u;
+      body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return sseResponse([
+        'event: conversation.committed\ndata: {"type":"conversation.committed","sessionId":"s","turn":1,"proposals":[],"state":{}}\n\n',
+      ]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await runConversationUtterance("r1", "plr", {
+      mode: "whisper", target: "npc_lin", content: "你叫什么", action: "凑近压低声音",
+    }, "ct-u1", {});
+    expect(url).toBe("/api/v1/rooms/r1/conversation");
+    expect(body).toEqual({
+      actorId: "plr",
+      clientTurnId: "ct-u1",
+      utterance: { mode: "whisper", target: "npc_lin", content: "你叫什么", action: "凑近压低声音" },
+    });
+    expect((body.utterance as Record<string, unknown>).speaker).toBeUndefined();
   });
 });

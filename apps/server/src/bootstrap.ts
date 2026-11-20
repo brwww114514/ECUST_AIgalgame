@@ -437,7 +437,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
       subscribe: (roomId, viewer, cb) => gossip.subscribe(roomId, viewer, cb),
     },
     /** dev/v2 群聊回合宿主（HTTP 接线见 routes.ts；缺省 = 不注册端点） */
-    conversation: { host: conversation },
+    conversation: { host: conversation, modes: conversationModes },
     turn,
     map,
     settings,

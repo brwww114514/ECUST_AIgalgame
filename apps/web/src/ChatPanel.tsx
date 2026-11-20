@@ -12,6 +12,7 @@ import MiniMap from "./MiniMap.tsx";
 import { getMap } from "./api.ts";
 import type { MapView } from "./api.ts";
 import { planNpcTalk } from "./npc-presence.ts";
+import type { UtteranceDraft, UtteranceModeInfo } from "./conversation-api.ts";
 import { phaseLabel } from "./ui.ts";
 import type { Line, LineKind } from "./ui.ts";
 
@@ -56,6 +57,10 @@ export interface ChatPanelProps {
   hasEarlier: boolean;
   loadingEarlier: boolean;
   onLoadEarlier: () => void;
+  /** v2 会话：说话类型清单（来自 GET /conversation/modes）；不提供则走 v1 老流程 */
+  v2Modes?: UtteranceModeInfo[];
+  /** v2 会话：提交一条完整 utterance（mode/target/content/action），与 onSend 二选一 */
+  onSendUtterance?: (draft: UtteranceDraft) => void;
 }
 
 export default function ChatPanel({
@@ -83,6 +88,8 @@ export default function ChatPanel({
   hasEarlier,
   loadingEarlier,
   onLoadEarlier,
+  v2Modes,
+  onSendUtterance,
 }: ChatPanelProps) {
   const [talking, setTalking] = useState<{ id: string; name: string } | null>(null);
   /** 点击时记的是占位名；对方自报姓名解锁后，用权威状态里的真名覆盖标题/输入框 */
@@ -92,6 +99,9 @@ export default function ChatPanel({
   const [pendingTalk, setPendingTalk] = useState<{ id: string; name: string; locId: string } | null>(null);
   const [travelling, setTravelling] = useState(false);
   const [map, setMap] = useState<MapView | null>(null);
+  /** v2 demo：当前说话类型（mode）与动作文本（action）；仅在 v2Modes 提供时显示 */
+  const [mode, setMode] = useState("broadcast");
+  const [action, setAction] = useState("");
   const logRef = useRef<HTMLDivElement | null>(null);
   // 是否"跟着最新一条走"：玩家往上翻历史时不打扰，回到底部附近后自动恢复跟随
   const stickRef = useRef(true);
@@ -363,17 +373,60 @@ export default function ChatPanel({
           </div>
         )}
 
+        {/* v2 demo：说话类型选择 + @谁（点场景里的 NPC 即 talking）。老流程无 v2Modes 时不显示 */}
+        {v2Modes && v2Modes.length > 0 && (
+          <div className="v2-composer-opts">
+            <label className="v2-mode">
+              <span>方式</span>
+              <select value={mode} onChange={(e) => setMode(e.target.value)} disabled={busy || !state}>
+                {v2Modes.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {v2Modes.find((m) => m.id === mode)?.requiresAction && (
+              <input
+                className="v2-action"
+                value={action}
+                onChange={(e) => setAction(e.target.value)}
+                placeholder="伴随动作（自然语言，可留空）"
+                disabled={busy || !state}
+              />
+            )}
+          </div>
+        )}
         <form
           className="composer"
           onSubmit={(e) => {
             e.preventDefault();
+            if (v2Modes && v2Modes.length > 0 && onSendUtterance) {
+              const current = v2Modes.find((m) => m.id === mode);
+              onSendUtterance({
+                mode,
+                ...(talking ? { target: talking.id } : {}),
+                ...(current?.contentless ? {} : { content: input }),
+                ...(action ? { action } : {}),
+              });
+              setAction("");
+              return;
+            }
             onSend(talking ? { id: talking.id, name: talkingName } : null);
           }}
         >
           <input
             value={input}
             onChange={(e) => onInput(e.target.value)}
-            placeholder={talking ? `对${talkingName}说…` : "你要做什么？（也可以直接用 WASD 走动）"}
+            placeholder={
+              v2Modes && v2Modes.length > 0
+                ? talking
+                  ? `对${talkingName}说…（自然语言）`
+                  : "公开说什么？（自然语言，点 NPC 可改为私下说）"
+                : talking
+                  ? `对${talkingName}说…`
+                  : "你要做什么？（也可以直接用 WASD 走动）"
+            }
             disabled={busy || !state}
           />
           <button type="submit" disabled={busy || !state}>

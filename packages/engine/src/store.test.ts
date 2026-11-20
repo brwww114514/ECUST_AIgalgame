@@ -196,4 +196,24 @@ describe("FileStore 读档失败不污染已载入标记（issue #7）", () => {
     expect(store.seq(ROOM)).toBe(2);
     expect((await store.snapshot(ROOM)).entities.npc_lin?.attrs.stamina).toBe(40);
   });
+
+  it("目录路径不可用（ENOTDIR）时 load 与 listRooms 都上抛，不当作空房间", async () => {
+    const base = await tempDir();
+    // 用普通文件占位目录路径：readFile("<file>/room.jsonl") 与 readdir("<file>") 都稳定抛 ENOTDIR。
+    // 与 chmod 用例不同，这条不依赖"非 root"，CI 以 root 跑时仍能覆盖「非 ENOENT 必须上抛」的分支。
+    const dir = path.join(base, "not-a-dir");
+    await writeFile(dir, "not a directory", "utf8");
+
+    const store = new FileStore(dir);
+    await expect(store.load(ROOM)).rejects.toMatchObject({ code: "ENOTDIR" });
+    await expect(store.listRooms()).rejects.toMatchObject({ code: "ENOTDIR" });
+    // 读失败不能留下"已载入"幻觉：否则后续 append 会按 seq 0 续写并覆盖真实日志
+    expect(store.seq(ROOM)).toBe(0);
+
+    // 故障解除（换回真实目录）后可正常读写
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(dir);
+    await store.append(ROOM, [env(1, "entity.created", { entity: npc })]);
+    expect(await new FileStore(dir).listRooms()).toEqual([ROOM]);
+  });
 });

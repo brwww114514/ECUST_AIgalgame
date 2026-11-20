@@ -496,14 +496,16 @@ const token = scopeRef.current.current();
       // 所以这里保留「对<展示名>说：」的兜底拼法（服务端会先换回真名再喂模型）。
       const text = targetNpc ? `对${targetNpc.name}说：${base}` : base;
       lastTurn.current = { text: base, target: targetNpc, ...(utterance ? { utterance } : {}) };
-      // 乐观行：玩家自己的 utterance 要等引擎投回（SSE 非流式），先本地显示浅色的；
-      // 纯函数会跳过「已渲染过的同一句」，重试/重发不会短暂重复。
+      // 乐观行：玩家自己的 utterance 要等引擎投回（SSE 非流式），先本地显示浅色的。
+      // 新一轮只在「本次派发之后追加的行」里查重（同一句两轮都发仍要显示）；
+      // 重试复用同一 clientTurnId，扫全部已渲染行——真行已在就不挂，避免短暂重复。
       setPendingLines(
         pendingLinesFor(
           convView.current,
           actorId,
           utterance ? (utterance.content ?? "") : text,
           utterance?.action,
+          { sinceLineIndex: reuseId ? 0 : convView.current.lines.length },
         ),
       );
       const tw = getTw();

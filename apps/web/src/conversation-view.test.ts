@@ -270,7 +270,7 @@ describe("pendingLinesFor（乐观玩家行）", () => {
     expect(pendingLinesFor(initialConversationView(), me, "   ")).toEqual([]);
   });
 
-  it("真行已渲染同一句 → 不重复挂（重试/重发场景）", () => {
+  it("真行已渲染同一句 → 不重复挂（重试复用同一 clientTurnId，扫全部已渲染行）", () => {
     const view = reduceConversationView(
       initialConversationView(),
       {
@@ -279,7 +279,23 @@ describe("pendingLinesFor（乐观玩家行）", () => {
       },
       ctx(),
     );
-    expect(pendingLinesFor(view, me, "你好啊")).toEqual([]);
-    expect(pendingLinesFor(view, me, "另一句")).toEqual([{ kind: "player", text: "另一句" }]);
+    expect(pendingLinesFor(view, me, "你好啊", undefined, { sinceLineIndex: 0 })).toEqual([]);
+    expect(pendingLinesFor(view, me, "另一句", undefined, { sinceLineIndex: 0 })).toEqual([
+      { kind: "player", text: "另一句" },
+    ]);
+  });
+
+  it("新一轮又发完全相同的一句 → 仍显示 pending（去重只看本次派发之后追加的行）", () => {
+    const view = reduceConversationView(
+      initialConversationView(),
+      {
+        type: "conversation.utterance",
+        delivery: { to: me, speaker: me, utteranceId: "u1", mode: "broadcast", channels: ["content"], content: "你好啊" },
+      },
+      ctx(),
+    );
+    expect(pendingLinesFor(view, me, "你好啊", undefined, { sinceLineIndex: view.lines.length })).toEqual([
+      { kind: "player", text: "你好啊" },
+    ]);
   });
 });

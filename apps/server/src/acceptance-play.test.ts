@@ -178,17 +178,22 @@ describe("#94 单房回合链验收", () => {
       })) events.push(ev);
       expect(events.map((e) => e.type), `第 ${i + 1} 回合`).toEqual(["turn.accepted", "turn.patch", "turn.commit"]);
       const commit = events.at(-1);
-      expect(commit?.type === "turn.commit" ? commit.seq : -1).toBe(seededSeq + i + 1);
-      expect(store.seq(roomId), `第 ${i + 1} 回合 seq`).toBe(seededSeq + i + 1);
+      // #76：commitMarker 作为同批 Envelope 落在 EventLog 末尾，故每回合 seq 增量 ≥2；
+      // 不断言绝对增量，只要求 commit.seq 等于本回合落库后的最新 seq（marker 存在与否都成立）。
+      expect(commit?.type === "turn.commit" ? commit.seq : -1).toBe(store.seq(roomId));
+      expect(store.seq(roomId), `第 ${i + 1} 回合 seq 单调递增`).toBeGreaterThan(seededSeq + i);
     }
 
+    const finalSeq = store.seq(roomId);
     const restarted = new FileStore(dir, opts);
-    expect(await restarted.load(roomId)).toBe(seededSeq + 20);
-    expect(restarted.seq(roomId)).toBe(seededSeq + 20);
+    expect(await restarted.load(roomId)).toBe(finalSeq);
+    expect(restarted.seq(roomId)).toBe(finalSeq);
     const log = await restarted.events(roomId, 1);
-    expect(log).toHaveLength(seededSeq + 20);
-    expect(log.map((e) => e.seq)).toEqual(Array.from({ length: seededSeq + 20 }, (_, i) => i + 1));
+    expect(log).toHaveLength(finalSeq);
+    expect(log.map((e) => e.seq)).toEqual(Array.from({ length: finalSeq }, (_, i) => i + 1));
     expect(log.filter((e) => e.type === "attr.changed")).toHaveLength(20);
+    // #76：每个成功回合另有 1 条 turn.committed 证据标记，跨重启后必须能重建幂等键
+    expect(log.filter((e) => e.type === "turn.committed")).toHaveLength(20);
     const replayed = await restarted.snapshot(roomId);
     expect(replayed.entities[SELF_ID]?.attrs["x.acceptance_turns"]).toBe(20);
   });

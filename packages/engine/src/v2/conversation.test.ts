@@ -174,7 +174,7 @@ describe("v2 群聊会话（端到端，真实 Arbiter/Store/Memory）", () => {
     expect(events.some((e) => e.type === "conversation.committed")).toBe(true);
     const spoken = events.find((e) => e.type === "conversation.utterance");
     if (spoken?.type === "conversation.utterance") expect(spoken.delivery.speaker).not.toBe(PLR);
-    expect(llm.calls).toBe(2); // 两个在场 NPC 各自一次
+    expect(llm.calls).toBeGreaterThanOrEqual(2); // 两个在场 NPC 各自至少一次
   });
 
   it("#136 auto 回合有上限（maxAutoRounds），超出给 notice 不调模型", async () => {

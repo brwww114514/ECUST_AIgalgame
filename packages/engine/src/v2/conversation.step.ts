@@ -319,11 +319,22 @@ async function auditStep(ctx: StepCtx, decisions: NpcResult[], utterance?: Utter
   }
 }
 
+/** reason 只取受控枚举：模型自由文本可能含私密台词（审阅 P2） */
+const OUTCOME_REASONS = new Set([
+  "llm_unavailable", "truncated", "format", "empty", "bad_utterance", "bad_mental",
+  "phase_or_cap", "no_speech", "E_LLM_FORMAT", "E_LLM_TRUNCATED",
+  "call-cap", "min-interval", "hour-cap", "listening",
+]);
+export function sanitizeReason(reason?: string): string | undefined {
+  if (!reason) return undefined;
+  return OUTCOME_REASONS.has(reason) ? reason : "other";
+}
+
 function outcomeOf(d: NpcResult, kind: NpcOutcome["kind"]): NpcOutcome {
   return {
     npcId: d.npcId,
     kind,
-    ...(d.reason ? { reason: d.reason } : {}),
+    ...(d.reason ? { reason: sanitizeReason(d.reason) } : {}),
     ...(d.finishReason ? { finishReason: d.finishReason } : {}),
     ...(d.latencyMs !== undefined ? { latencyMs: d.latencyMs } : {}),
     ...(d.usage ? { promptTokens: d.usage.promptTokens, completionTokens: d.usage.completionTokens } : {}),

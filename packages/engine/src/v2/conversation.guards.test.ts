@@ -179,7 +179,10 @@ describe("PR#51 P1 回归", () => {
     expect(first.some((e) => e.type === "conversation.error" && e.code === "E_STORE_FAULT" && e.retryable)).toBe(true);
     expect((llm as MockLlm).calls).toBe(2);
     const second = await collect(host.run(session.id, input));
-    expect(second.some((e) => e.type === "conversation.committed")).toBe(true);
+    const committed = second.find((e) => e.type === "conversation.committed");
+    expect(committed).toBeDefined();
+    // 重试也必须带回第一轮的 outcomes（审阅 P2）
+    if (committed?.type === "conversation.committed") expect((committed.outcomes ?? []).length).toBeGreaterThan(0);
     expect((llm as MockLlm).calls).toBe(2); // 重试没有再问模型
     expect((await store.events(ROOM, 0)).filter((e) => e.type === "memory.written")).toHaveLength(3); // 玩家 + NPC 发言 + 心理活动，没有重复落库
   });
@@ -343,7 +346,10 @@ describe("PR#51 二审回归", () => {
     expect(first.filter((e) => e.type === "conversation.error" && e.code === "E_STORE_FAULT")).toHaveLength(1);
     const second = await collect(host.run(session.id, input));
     expect(second.filter((e) => e.type === "conversation.error")).toHaveLength(0);
-    expect(second.some((e) => e.type === "conversation.committed")).toBe(true);
+    const committed = second.find((e) => e.type === "conversation.committed");
+    expect(committed).toBeDefined();
+    // 重试也必须带回第一轮的 outcomes（审阅 P2）
+    if (committed?.type === "conversation.committed") expect((committed.outcomes ?? []).length).toBeGreaterThan(0);
   });
 
   it("四审：flush 重试成功后前移 lastLocId，下一轮不重复唤醒同一移动", async () => {

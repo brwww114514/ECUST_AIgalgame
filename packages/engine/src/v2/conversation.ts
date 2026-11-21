@@ -55,6 +55,8 @@ interface PendingFlush {
   retry?: StoreRetry;
   /** flush 失败前的 lastLocId；仅当期间未被别的回合推进时才用当前快照前移 */
   beforeLocId?: string;
+  /** 失败回合的 NPC 决策结果；重放提交时原样带回，避免 outcomes 丢失（审阅 P2） */
+  outcomes: NpcOutcome[];
 }
 
 const MAX_SEEN = 256;
@@ -309,7 +311,7 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       if (pending.beforeLocId !== undefined && pending.s.lastLocId === pending.beforeLocId) {
         pending.s.lastLocId = this.deps.store.state(pending.roomId).room.scene.locId;
       }
-      const done = await this.commitWithState(pending.s, applied, []);
+      const done = await this.commitWithState(pending.s, applied, pending.outcomes);
       const all = [...pending.out, done];
       rememberRecent(pending.s, pending.s.turn, pending.fresh);
       this.remember(key, all);
@@ -337,7 +339,7 @@ export class ConversationHostV2 implements ConversationTurnV2 {
         // 先冻结 out 再追加错误，重试时才不会重复 yield 上一轮的 E_STORE_FAULT
         this.pendingFlush.set(key, {
           roomId: e.roomId, s, applied: e.applied, out: [...out], fresh: e.fresh,
-          beforeLocId: s.lastLocId, retry: e.retry,
+          beforeLocId: s.lastLocId, retry: e.retry, outcomes: e.outcomes,
         });
         this.trim(this.pendingFlush, MAX_PENDING);
         // ③ 外部事件只在提交成功后发布：失败时只回可重试错误

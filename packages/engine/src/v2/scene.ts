@@ -147,7 +147,8 @@ export class SceneManager {
       const tag = loc.locId ? `${loc.locName ?? ""}（${loc.locId}）` : (loc.locName ?? "");
       parts.push(`【当前场景】${tag}`.replace(/（）/g, ""));
     }
-    if (cur?.text) parts.push(cur.text);
+    // 开场时 current.text 与 memories.text 是同一段：只保留一次（审阅 P2）
+    if (cur?.text && cur.text !== mem?.text) parts.push(cur.text);
     if (mem) parts.push(`【场景·群像】（${mem.id}）`, mem.text);
     return parts.join("\n");
   }

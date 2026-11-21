@@ -815,6 +815,16 @@ describe("issue #130 引擎新行为的 HTTP 集成（#131/#136）", () => {
     await app.close();
   });
 
+  it("审阅 P2：utterance.salience 被 schema 接受（docs/03 已登记，之前 .strict() 会 400）", async () => {
+    const { app, roomId, actorId } = await appWith();
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "sal-1", utterance: { id: "u-sal", mode: "broadcast", content: "记一下", salience: 4 } },
+    });
+    expect(res.statusCode).toBe(200);
+    await app.close();
+  });
+
   it("#131/#137 NPC prompt：在场者段、这一轮段、玩家文本被 <player_input> 包裹", async () => {
     const prompts: string[] = [];
     const { app, deps, roomId, actorId } = await appWith((req) => {
@@ -830,8 +840,38 @@ describe("issue #130 引擎新行为的 HTTP 集成（#131/#136）", () => {
     const npcPrompt = prompts.find((p) => p.includes("【在场者】"));
     expect(npcPrompt).toBeTruthy();
     expect(npcPrompt).toContain("【这一轮】");
+    // #131 / 审阅 P1-a：在场者里玩家显示「玩家」，不能是实体名「你」
+    expect(npcPrompt).toMatch(/plr_[a-z0-9_]+（玩家）/);
+    expect(npcPrompt).not.toMatch(/plr_[a-z0-9_]+（你/);
     expect(npcPrompt).toContain('<player_input speaker="玩家">');
     expect(npcPrompt).toContain("大家早");
+    await app.close();
+  });
+});
+
+describe("审阅 #144 P1-b：插话后的当轮台词必须有 NPC 回应", () => {
+  const H = { "x-user-id": "u_owner" };
+  it("interject + utterance：phase 先回到 speaking，committed.outcomes 里有 speak", async () => {
+    const { app, deps, roomId, actorId } = await appWith((req) => {
+      const sys = String(req.messages?.[0]?.content ?? "");
+      const me = /【你】\s*([a-z0-9_]+)/.exec(sys)?.[1] ?? "npc_x";
+      return JSON.stringify({ kind: "speak", utterance: { id: `utt_${me}`, speaker: me, mode: "broadcast", content: "我接着说" } });
+    });
+    const st = (deps.store as EventLog).state(roomId);
+    const npc = st.room.scene.presentIds.find((id) => st.entities[id]?.kind === "npc")!;
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: {
+        actorId, clientTurnId: "int-2", interject: npc,
+        utterance: { id: "u-int2", mode: "broadcast", content: "我插一句" },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const events = sse(res.body);
+    const committed = events.find((e) => e.type === "conversation.committed");
+    const outcomes = (committed?.data.outcomes ?? []) as { kind: string; reason?: string }[];
+    expect(outcomes.some((o) => o.kind === "speak")).toBe(true);
+    expect(outcomes.every((o) => o.kind !== "silent" || o.reason !== "phase_or_cap")).toBe(true);
     await app.close();
   });
 });

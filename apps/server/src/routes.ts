@@ -130,6 +130,8 @@ const ConversationBodySchema = z
         action: z.string().max(2000).optional(),
         coverAction: z.string().max(2000).optional(),
         notice: z.string().max(2000).optional(),
+        // #135：关键台词提权（1–5）；docs/03 已登记，schema 漏了会让前端 400
+        salience: z.number().min(1).max(5).optional(),
       })
       .optional(),
   })

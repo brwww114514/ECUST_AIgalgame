@@ -106,6 +106,7 @@ const RawDecisionSchema = z.object({
 type RawDecision = z.infer<typeof RawDecisionSchema>;
 
 const PLAYER_LABEL = "玩家";
+const KIND_LABEL: Record<string, string> = { plr: "玩家", npc: "NPC" };
 
 /** 玩家原文是数据不是指令：包起来并转义结束标记，防止提示词注入（#137） */
 export function wrapPlayerText(text: string, speaker: string): string {
@@ -178,7 +179,7 @@ export function buildNpcPrompt(args: NpcPromptArgs, modes: Map<string, Utterance
   ].join("\n");
 
   const presentLine = args.present?.length
-    ? args.present.map((p) => `- ${p.id}（${p.name}，${p.kind}）`).join("\n")
+    ? args.present.map((p) => (p.kind === "plr" ? `- ${p.id}（玩家）` : `- ${p.id}（${p.name}，${KIND_LABEL[p.kind] ?? p.kind}）`)).join("\n")
     : "- （看不到别人）";
   const locText = args.loc?.locName
     ? `【当前地点】${args.loc.locName}${args.loc.locId ? `（${args.loc.locId}）` : ""}`

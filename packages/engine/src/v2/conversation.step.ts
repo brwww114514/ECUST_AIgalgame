@@ -7,7 +7,7 @@ import { isRoomSyncFault } from "../store-write.ts";
 import type { ArbiterApplyResult } from "../arbiter.ts";
 import type {
   ActorId, ConversationEvent, ConversationSessionV2, ConversationTurnInput,
-  Delivery, Envelope, Id, NpcOutcome, Proposal, Utterance, WorldState,
+  Delivery, Envelope, Id, MemoryHit, NpcOutcome, Proposal, Utterance, WorldState,
 } from "../../../shared/src/index.ts";
 import { deliver, validateUtterance } from "./delivery.ts";
 import { shouldWake, type SceneManager } from "./scene.ts";
@@ -242,6 +242,28 @@ function planCalls(ctx: StepCtx, utterance?: Utterance): { npcId: ActorId; allow
   return planned;
 }
 
+const MEMORY_LINES_MAX = 5;
+
+/**
+ * 记忆注入行（#135）：最近 1–2 条自己的话固定占位，不参与打分排序，
+ * 避免「当天刚说的话」被 5 条高分旧记忆挤出窗口（P1-c）。
+ */
+export function memoryLinesFor(hits: readonly MemoryHit[], locName?: string): string {
+  if (hits.length === 0) return "";
+  const maxTurn = hits.reduce((m, h) => Math.max(m, h.record.turn), -1);
+  const pinned = hits.filter((h) => h.record.turn === maxTurn).slice(0, 2);
+  const rest = hits.filter((h) => !pinned.includes(h));
+  return [...pinned, ...rest]
+    .slice(0, MEMORY_LINES_MAX)
+    .map((h) => {
+      const day = Math.floor(h.record.turn / 100) || 1;
+      const tag = locName && h.record.tags.includes(locName) ? `·${locName}` : "";
+      const mine = h.record.tags.includes("dialogue") ? "你说过：" : "";
+      return `- [第${day}天${tag}] ${mine}${h.record.content}`;
+    })
+    .join("\n");
+}
+
 /** ⑤ 每个在场 NPC 各自一次 LLM；玩家不在场时受 autonomousWhenPlayerAbsent 控制 */
 async function decideStep(ctx: StepCtx, utterance?: Utterance): Promise<NpcResult[]> {
   const { deps, s, state, nameOf } = ctx;
@@ -259,10 +281,7 @@ async function decideStep(ctx: StepCtx, utterance?: Utterance): Promise<NpcResul
       ...(loc.locName ? { tags: [loc.locName] } : {}),
       about: [ctx.playerId, utterance?.speaker].filter((x): x is ActorId => typeof x === "string" && x !== ""),
     });
-    const memoryText = own
-      .slice(0, 5)
-      .map((h) => `- [第${Math.floor(h.record.turn / 100) || 1}天] ${h.record.content}`)
-      .join("\n");
+    const memoryText = memoryLinesFor(own, loc.locName);
     const r = await deps.npc.decide({
       npcId,
       npcName: nameOf(npcId),
@@ -295,7 +314,8 @@ async function auditStep(ctx: StepCtx, decisions: NpcResult[], utterance?: Utter
     }
     const review = await deps.audit.review({ roomId: s.roomId, actorId: d.npcId, playerInput: utterance?.content ?? "", fields });
     if (review.kind !== "ok") {
-      ctx.outcomes.push(outcomeOf(d, "silent"));
+      // 审核拒绝/不可用要说清楚原因，不能和模型主动沉默混在一起（#132 可观测）
+      ctx.outcomes.push({ ...outcomeOf(d, "silent"), reason: review.kind === "blocked" ? "audit_blocked" : "audit_unavailable" });
       continue;
     }
     if (d.decision.kind === "speak") {
@@ -309,7 +329,7 @@ async function auditStep(ctx: StepCtx, decisions: NpcResult[], utterance?: Utter
       deps.budget?.recordSent(s.roomId, d.npcId, CHANNEL);
       for (const delivery of spoken) out.push({ type: "conversation.utterance", delivery });
       ctx.fresh.push(...spoken);
-      ctx.proposals.push(...memoryProposals(u, s.roomId, deps.modes));
+      ctx.proposals.push(...memoryProposals(u, s.roomId, deps.modes, deps.scene.location(s.id)?.locName));
       ctx.outcomes.push(outcomeOf(d, "speak"));
     } else if (d.decision.kind === "think") {
       out.push({ type: "conversation.mental", actorId: d.npcId, mental: d.decision.mental });
@@ -322,7 +342,7 @@ async function auditStep(ctx: StepCtx, decisions: NpcResult[], utterance?: Utter
 /** reason 只取受控枚举：模型自由文本可能含私密台词（审阅 P2） */
 const OUTCOME_REASONS = new Set([
   "llm_unavailable", "truncated", "format", "empty", "bad_utterance", "bad_mental",
-  "phase_or_cap", "no_speech", "E_LLM_FORMAT", "E_LLM_TRUNCATED",
+  "phase_or_cap", "no_speech", "E_LLM_FORMAT", "E_LLM_TRUNCATED", "audit_blocked", "audit_unavailable",
   "call-cap", "min-interval", "hour-cap", "listening",
 ]);
 export function sanitizeReason(reason?: string): string | undefined {
@@ -403,11 +423,15 @@ export async function runStep(
 ): Promise<void> {
   const state = await deps.store.snapshot(s.roomId);
   const present = state.room.scene.presentIds ?? [];
-  const actors: PresentActor[] = present.map((id) => ({
-    id,
-    name: state.entities[id]?.name ?? id,
-    kind: state.entities[id]?.kind ?? "unknown",
-  }));
+  const actors: PresentActor[] = present.map((id) => {
+    const e = state.entities[id];
+    return {
+      id,
+      // #131：玩家显示「玩家」，不能露出实体名「你」
+      name: e?.kind === "plr" ? "玩家" : (e?.name ?? id),
+      kind: e?.kind ?? "unknown",
+    };
+  });
   const ctx: StepCtx = {
     deps, s, input, out, now, state, present, actors,
     // 审阅 #144：玩家实体名是「你」，投递行/点名通知一律显示「玩家」
@@ -434,9 +458,11 @@ export async function runStep(
   playerMemory(ctx, player.utterance);
   ctx.fresh.push(...player.deliveries.flatMap((e) => (e.type === "conversation.utterance" ? [e.delivery] : [])));
   const listening = s.phase === "listening";
+  // #136：插话后玩家终于开口——必须先切回 speaking，否则 decideStep 把 hardCapReached
+  // 置真，NPC 只能 think/silent，末句当轮没人回应（P1-b）
+  restorePhase(ctx, player.utterance, listening);
   const decisions = await decideStep(ctx, player.utterance);
   await auditStep(ctx, decisions, player.utterance);
-  restorePhase(ctx, player.utterance, listening);
   if (await commitStep(ctx, player.utterance)) rememberRecent(s, s.turn, ctx.fresh);
 }
 

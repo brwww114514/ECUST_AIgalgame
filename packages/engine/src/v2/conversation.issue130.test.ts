@@ -7,7 +7,8 @@ import { loadConversationPolicy, loadModes } from "./delivery.ts";
 import { NpcAgent, buildNpcPrompt, formatDeliveryFor } from "./npc-agent.ts";
 import { SceneManager } from "./scene.ts";
 import { projectConversationEvents } from "./conversation.view.ts";
-import { sanitizeReason } from "./conversation.step.ts";
+import { memoryLinesFor, sanitizeReason } from "./conversation.step.ts";
+import { memoryProposals } from "./conversation.helpers.ts";
 import { TalkBudget } from "./talk-budget.ts";
 import { normalizeTurn } from "../memory.ts";
 import { createInitialState } from "../projection.ts";
@@ -238,4 +239,31 @@ describe("#135 记忆 turn 口径", () => {
     expect(Number.isNaN(normalizeTurn(Number.NaN))).toBe(true);
     expect(normalizeTurn(3, false)).toBe(3); // turnEra=2 的新事件不再做旧口径变换
   });
+});
+
+describe("审阅 P2：台词记忆带地点 tag", () => {
+  it("memoryProposals 写入 tags 含地点名（否则按地点检索零重叠）", () => {
+    const [p] = memoryProposals(
+      { id: "u1", speaker: "npc_lin", mode: "broadcast", content: "在图书馆说" },
+      "room_1",
+      modes,
+      "图书馆",
+    );
+    expect((p.args as { tags: string[] }).tags).toContain("图书馆");
+  });
+});
+
+describe("审阅 #144 P1-c：当天台词固定占位", () => {
+  const hit = (id: string, turn: number, content: string) => ({
+    record: { id, roomId: "room_1", ownerId: "npc_lin", content, tags: [], about: [], salience: 5, visibility: "public" as const, tier: "long" as const, turn, status: "current" as const, sourceRefs: [] },
+    score: 1,
+  }) as never;
+  it("5 条高分旧记忆 + 当天台词：当天台词仍进注入行", () => {
+    const hits = [hit("m1", 100, "旧1"), hit("m2", 100, "旧2"), hit("m3", 100, "旧3"), hit("m4", 100, "旧4"), hit("m5", 100, "旧5"), hit("m_today", 500, "今天刚说的话")];
+    const text = memoryLinesFor(hits);
+    expect(text).toContain("今天刚说的话");
+    expect(text.split("\n")[0]).toContain("今天刚说的话");
+    expect(text.split("\n")).toHaveLength(5);
+  });
+  it("空召回返回空串", () => expect(memoryLinesFor([])).toBe(""));
 });

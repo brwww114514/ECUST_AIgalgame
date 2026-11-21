@@ -220,9 +220,13 @@ export class EventSourcedMemory implements Memory {
     hits.sort((a, b) => Number(!!b.forced) - Number(!!a.forced) || b.score - a.score || a.record.id.localeCompare(b.record.id));
     const out: MemoryHit[] = [];
     let used = 0;
+    let forcedUsed = 0;
     for (const h of hits) {
       // forced（secret 强制注入）不占预算、不因预算被截断（docs/03 §2.6）
       if (h.forced) {
+        // 上限 3 条：secret 强制注入不占预算，但无上限会让提示词无界膨胀（审阅 P2）
+        if (forcedUsed >= 3) continue;
+        forcedUsed += 1;
         out.push(h);
         continue;
       }

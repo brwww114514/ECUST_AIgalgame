@@ -738,6 +738,40 @@ describe("dev/v2 群聊端点（issue #85/#89 契约对齐）", () => {
   });
 });
 
+describe("审阅 #144：投递行把玩家显示成「玩家」而不是「你」", () => {
+  const H = { "x-user-id": "u_owner" };
+  it("NPC 对玩家定向说话：旁听 NPC 的提示词是「→ 玩家（你是旁听）」+ notice 也是「玩家」", async () => {
+    let plr = "";
+    const prompts: string[] = [];
+    const { app, deps, roomId, actorId } = await appWith((req) => {
+      const sys = String(req.messages?.[0]?.content ?? "");
+      prompts.push(sys);
+      if (!sys.includes("【这一轮】")) return JSON.stringify({ kind: "silent", reason: "init" });
+      return JSON.stringify({
+        kind: "speak",
+        utterance: { mode: "addressed", target: plr, content: "只跟你说", action: "压低声音" },
+      });
+    });
+    plr = actorId;
+    const first = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "pl-1", utterance: { id: "u-pl1", mode: "broadcast", content: "早" } },
+    });
+    expect(first.statusCode).toBe(200);
+    const second = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "pl-2", utterance: { id: "u-pl2", mode: "broadcast", content: "然后呢" } },
+    });
+    expect(second.statusCode).toBe(200);
+    const seen = prompts.filter((p) => p.includes("【更早的对话】"));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.some((p) => p.includes("→ 玩家（你是旁听"))).toBe(true);
+    expect(seen.some((p) => p.includes("这句话是对 玩家 说的"))).toBe(true);
+    expect(seen.some((p) => p.includes("→ 你（你是旁听"))).toBe(false);
+    await app.close();
+  });
+});
+
 describe("issue #130 引擎新行为的 HTTP 集成（#131/#136）", () => {
   const H = { "x-user-id": "u_owner" };
   const npcIdsOf = (deps: App, roomId: string): string[] => {

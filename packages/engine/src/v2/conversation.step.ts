@@ -410,7 +410,12 @@ export async function runStep(
   }));
   const ctx: StepCtx = {
     deps, s, input, out, now, state, present, actors,
-    nameOf: (id) => state.entities[id]?.name ?? id,
+    // 审阅 #144：玩家实体名是「你」，投递行/点名通知一律显示「玩家」
+    nameOf: (id) => {
+      const e = state.entities[id];
+      if (!e) return id;
+      return e.kind === "plr" ? "玩家" : e.name;
+    },
     kindOf: (id) => state.entities[id]?.kind,
     playerId: present.find((id) => state.entities[id]?.kind === "plr"),
     seq: await deps.store.load(s.roomId),

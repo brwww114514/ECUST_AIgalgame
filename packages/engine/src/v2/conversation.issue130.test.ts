@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { loadConversationPolicy, loadModes } from "./delivery.ts";
-import { NpcAgent, buildNpcPrompt } from "./npc-agent.ts";
+import { NpcAgent, buildNpcPrompt, formatDeliveryFor } from "./npc-agent.ts";
 import { SceneManager } from "./scene.ts";
 import { projectConversationEvents } from "./conversation.view.ts";
 import { sanitizeReason } from "./conversation.step.ts";
@@ -25,7 +25,7 @@ function state() {
 }
 
 const present = [
-  { id: "plr_self", name: "玩家", kind: "player" },
+  { id: "plr_self", name: "你", kind: "plr" },
   { id: "npc_lin", name: "林月", kind: "npc" },
   { id: "npc_ma", name: "马骁", kind: "npc" },
 ] as const;
@@ -65,6 +65,35 @@ describe("#131 提示词上下文", () => {
       policy,
     );
     expect(text).toContain("你是旁听");
+  });
+});
+
+describe("审阅 #144：投递行里的玩家/自己标注", () => {
+  const line = (npcId: string, d: Delivery) => formatDeliveryFor(npcId, present, d);
+
+  it("目标=玩家时显示「玩家」，不显示实体名「你」，也不标成旁听", () => {
+    const d: Delivery = { to: "npc_lin", speaker: "npc_ma", utteranceId: "u1", mode: "addressed", target: "plr_self", channels: ["content", "notice"], content: "跟你说", notice: "这句话是对 玩家 说的" };
+    const text = line("npc_lin", d);
+    expect(text).toContain("马骁 → 玩家（你是旁听");
+    expect(text).toContain("这句话是对 玩家 说的");
+    expect(text).not.toContain("→ 你（你是旁听");
+  });
+
+  it("被 @ 的本人显示「→ 你」", () => {
+    const d: Delivery = { to: "npc_lin", speaker: "npc_ma", utteranceId: "u2", mode: "addressed", target: "npc_lin", channels: ["content"], content: "你来一下" };
+    expect(line("npc_lin", d)).toContain("马骁 → 你（content）");
+  });
+
+  it("自己的台词显示「你说 → X」，不再出现「你是旁听」", () => {
+    const d: Delivery = { to: "npc_lin", speaker: "npc_lin", utteranceId: "u3", mode: "addressed", target: "plr_self", channels: ["content"], content: "我说一句" };
+    const text = line("npc_lin", d);
+    expect(text).toContain("你说 → 玩家（content）：我说一句");
+    expect(text).not.toContain("你是旁听");
+  });
+
+  it("自己公开说话显示「你公开说」", () => {
+    const d: Delivery = { to: "npc_lin", speaker: "npc_lin", utteranceId: "u4", mode: "broadcast", channels: ["content"], content: "大家好" };
+    expect(line("npc_lin", d)).toContain("你公开说（content）：大家好");
   });
 });
 

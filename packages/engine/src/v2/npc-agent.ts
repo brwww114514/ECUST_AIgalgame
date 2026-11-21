@@ -121,14 +121,20 @@ function nameOf(args: NpcPromptArgs, who: ActorId): string {
 export function nameFor(present: readonly PresentActor[] | undefined, who: ActorId): string {
   if (present) {
     const hit = present.find((p) => p.id === who);
-    if (hit) return hit.name;
+    // 玩家实体名是「你」，投递行里一律显示「玩家」（审阅 #144：target=玩家 曾被渲染成「→ 你（你是旁听）」）
+    if (hit) return hit.kind === "plr" || hit.id.startsWith("plr_") ? PLAYER_LABEL : hit.name;
   }
   return who;
 }
 
 /** 投递行语义化（#131）：目标行「→ 你」、旁听行「→ 他（你是旁听）」、公开行「公开说」 */
 export function formatDeliveryFor(npcId: ActorId, present: readonly PresentActor[] | undefined, d: Delivery): string {
-  const speaker = d.speaker === PLAYER_LABEL || d.speaker.startsWith("plr_") ? PLAYER_LABEL : nameFor(present, d.speaker);
+  const speakerIsMe = d.speaker === npcId;
+  const speaker = speakerIsMe
+    ? "你"
+    : d.speaker === PLAYER_LABEL || d.speaker.startsWith("plr_")
+      ? PLAYER_LABEL
+      : nameFor(present, d.speaker);
   const body = [d.content, d.action, d.notice].filter((x): x is string => typeof x === "string" && x !== "").join(" / ");
   const text = speaker === PLAYER_LABEL ? wrapPlayerText(body, PLAYER_LABEL) : body;
   const ch = d.channels.join("+");
@@ -138,6 +144,10 @@ export function formatDeliveryFor(npcId: ActorId, present: readonly PresentActor
   }
   if (target === npcId) {
     return `${speaker} → 你（${ch}）：${text}`;
+  }
+  // 自己说的话不是「旁听」：投给玩家的密语/定向话显示「你说 → 玩家」
+  if (speakerIsMe) {
+    return `${speaker}说 → ${nameFor(present, target)}（${ch}）：${text}`;
   }
   return `${speaker} → ${nameFor(present, target)}（你是旁听，${ch}）：${text}`;
 }

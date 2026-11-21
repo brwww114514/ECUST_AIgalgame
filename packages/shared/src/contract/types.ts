@@ -532,6 +532,10 @@ export interface LlmResult {
   usage: Usage;
   model: string;
   latencyMs: number;
+  /** 上游返回的结束原因；"length" 表示被 max_tokens 截断（#132 不能当普通格式错误） */
+  finishReason?: string;
+  /** 本次调用追踪号（可选；网关/日志排查用） */
+  traceId?: string;
 }
 
 export interface LlmPort {

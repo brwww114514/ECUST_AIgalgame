@@ -16,6 +16,7 @@ import type {
   ConversationPolicy,
   Registry,
   Delivery,
+  NpcOutcome,
 } from "../../../shared/src/index.ts";
 import type { EventLog } from "../store.ts";
 import type { DefaultArbiter } from "../arbiter.ts";
@@ -54,6 +55,8 @@ interface PendingFlush {
   retry?: StoreRetry;
   /** flush 失败前的 lastLocId；仅当期间未被别的回合推进时才用当前快照前移 */
   beforeLocId?: string;
+  /** 失败回合的 NPC 决策结果；重放提交时原样带回，避免 outcomes 丢失（审阅 P2） */
+  outcomes: NpcOutcome[];
 }
 
 const MAX_SEEN = 256;
@@ -96,7 +99,12 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     this.sessions.set(session.id, session);
     this.trimSessions();
     session.sceneBeats.push(
-      await this.deps.scene.open(session.id, spec.roomId, locId ? state.entities[locId]?.name : undefined, spec.participants, locId),
+      await this.deps.scene.open(
+        session.id,
+        spec.roomId,
+        { ...(locId ? { locId } : {}), ...(locId && state.entities[locId]?.name ? { locName: state.entities[locId]!.name } : {}) },
+        spec.participants,
+      ),
     );
     return session;
   }
@@ -295,25 +303,31 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       if (pending.beforeLocId !== undefined && pending.s.lastLocId === pending.beforeLocId) {
         pending.s.lastLocId = (await this.deps.store.snapshot(pending.roomId)).room.scene.locId;
       }
-      const done = await this.commitWithState(pending.s, applied);
+      const done = await this.commitWithState(pending.s, applied, pending.outcomes);
       const all = [...pending.out, done];
-      rememberRecent(pending.s, pending.fresh);
+      rememberRecent(pending.s, pending.s.turn, pending.fresh);
       this.remember(key, all);
       this.pendingFlush.delete(key);
       return all;
     }
 
     const now = this.deps.now?.() ?? Date.now();
+    // #136：玩家沉默期的 NPC-NPC 自主推进，最多 maxAutoRounds 轮
+    if (input.auto) {
+      if (!input.utterance && (s.autoRounds ?? 0) >= this.deps.policy.maxAutoRounds) {
+        return [{ type: "conversation.notice", text: this.deps.policy.messages.autoLimit }];
+      }
+    }
     // ④ 只把本会话到期的 phase 事件塞进本回合返回流
     const out: ConversationEvent[] = [...this.resumeExpiredEvents(now, sessionId)];
     try {
-      await runStep(this.deps, s, input, out, now, (ss, a) => this.commitWithState(ss, a));
+      await runStep(this.deps, s, input, out, now, (ss, a, outcomes) => this.commitWithState(ss, a, outcomes));
     } catch (e) {
       if (e instanceof StoreFlushError) {
         // 先冻结 out 再追加错误，重试时才不会重复 yield 上一轮的 E_STORE_FAULT
         this.pendingFlush.set(key, {
           roomId: e.roomId, s, applied: e.applied, out: [...out], fresh: e.fresh,
-          beforeLocId: s.lastLocId, retry: e.retry,
+          beforeLocId: s.lastLocId, retry: e.retry, outcomes: e.outcomes,
         });
         this.trim(this.pendingFlush, MAX_PENDING);
         // ③ 外部事件只在提交成功后发布：失败时只回可重试错误
@@ -327,6 +341,9 @@ export class ConversationHostV2 implements ConversationTurnV2 {
           message: e instanceof Error ? e.message : String(e),
         });
       }
+    }
+    if (input.auto && !input.utterance && out.some((e) => e.type === "conversation.committed")) {
+      s.autoRounds = (s.autoRounds ?? 0) + 1;
     }
     if (!out.some((e) => e.type === "conversation.error" && e.retryable)) this.remember(key, out);
     return out;
@@ -357,7 +374,11 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     this.trim(this.seen, MAX_SEEN);
   }
 
-  private async commitWithState(s: ConversationSessionV2, applied: ApplyResult): Promise<ConversationEvent> {
+  private async commitWithState(
+    s: ConversationSessionV2,
+    applied: ApplyResult,
+    outcomes: import("../../../shared/src/index.ts").NpcOutcome[],
+  ): Promise<ConversationEvent> {
     const turn = ++s.turn;
     if (turn >= s.maxTurns) s.status = "closed";
     return {
@@ -366,6 +387,7 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       turn,
       proposals: applied.applied,
       state: await this.deps.store.snapshot(s.roomId),
+      ...(outcomes.length ? { outcomes } : {}),
     };
   }
 }

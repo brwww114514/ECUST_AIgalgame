@@ -90,7 +90,7 @@ describe("issue #90：会话快照跨重启恢复", () => {
     seed(store1);
     const { host: host1 } = await makeHost(store1, [], { t: 1000 });
     const s1 = await host1.open({ roomId: ROOM, participants: [PLR, LIN, MA] });
-    await collect(host1.run(s1.id, { clientTurnId: "before-interject", interject: PLR }));
+    await collect(host1.run(s1.id, { clientTurnId: "before-interject", interject: LIN }));
 
     // 覆盖 queue/injected/sceneMemory（正常流程暂不写这两个字段，但持久化必须原样保留）
     const u: Utterance = { id: "utt_queue", speaker: PLR, mode: "broadcast", content: "排队发言" };
@@ -263,4 +263,28 @@ describe("issue #90：MessageIndex rebuild 幂等 / msg.sent 回放不重复", (
     expect(index.byMessageId("msg_a")?.seq).toBe(6);
     expect(index.chain(ROOM, "msg_a")).toHaveLength(0); // 无 rootId，链为空
   });
+
+  it("#136 回归：autoRounds 进快照，重启后仍受 maxAutoRounds 限制", async () => {
+    const store1 = new EventSourcedStore({ worldId: "w1", locId: GATE });
+    seed(store1);
+    const { host: host1 } = await makeHost(store1, [speak("u1", "一"), speak("u2", "二"), speak("u3", "三"), speak("u4", "四"), speak("u5", "五")], { t: 1000 });
+    const s1 = await host1.open({ roomId: ROOM, participants: [PLR, LIN, MA] });
+    await collect(host1.run(s1.id, { clientTurnId: "auto-1", auto: true }));
+    await collect(host1.run(s1.id, { clientTurnId: "auto-2", auto: true }));
+    expect(host1.getByRoom(ROOM)?.autoRounds).toBe(2);
+
+    const store2 = new EventSourcedStore({ worldId: "w1", locId: GATE });
+    store2.append(ROOM, await store1.events(ROOM, 0));
+    const { host: host2 } = await makeHost(store2, [speak("u6", "六"), speak("u7", "七"), speak("u8", "八")], { t: 1000 });
+    expect(host2.restoreSessions(host1.exportSessions(ROOM), ROOM).restored).toBe(1);
+    const s2 = host2.getByRoom(ROOM)!;
+    expect(s2.autoRounds).toBe(2);
+
+    // 第 3 轮仍允许，第 4 轮应被 maxAutoRounds 拦住（且不调模型）
+    const third = await collect(host2.run(s2.id, { clientTurnId: "auto-3", auto: true }));
+    expect(third.some((e) => e.type === "conversation.committed")).toBe(true);
+    const fourth = await collect(host2.run(s2.id, { clientTurnId: "auto-4", auto: true }));
+    expect(fourth.some((e) => e.type === "conversation.notice")).toBe(true);
+  });
 });
+

@@ -118,16 +118,23 @@ export class OpenAiCompatClient implements LlmPort {
 
     const content = readContent(payload);
     const usage = readUsage(payload);
+    const finishReason = readFinishReason(payload);
     const result: LlmResult = {
       raw: content,
       usage,
       model: readModel(payload) ?? model,
       latencyMs: Date.now() - startedAt,
+      finishReason,
+      traceId: readTraceId(payload),
     };
 
     if (wantJson) {
       const parsed = safeParseJson(content);
       if (!parsed.ok) {
+        // 先区分"被截断"和"格式不合法"：截断要重试更大的 max_tokens，不能当格式错误
+        if (finishReason === "length") {
+          throw new LlmError("E_LLM_TRUNCATED", "LLM 输出被 max_tokens 截断");
+        }
         // 解析失败也走可重试路径：空 content（U+0020 坑）与半截 JSON 都能靠重试救回
         throw new LlmError(parsed.code, `LLM 未返回合法 JSON：${parsed.message}`);
       }
@@ -189,6 +196,18 @@ function readContent(payload: unknown): string {
     throw new LlmError("E_LLM_FORMAT", "LLM 响应缺少 choices[0].message.content");
   }
   return content;
+}
+
+function readFinishReason(payload: unknown): string | undefined {
+  const choices = asRecord(payload)?.choices;
+  const first = Array.isArray(choices) ? asRecord(choices[0]) : undefined;
+  const reason = first?.finish_reason;
+  return typeof reason === "string" && reason !== "" ? reason : undefined;
+}
+
+function readTraceId(payload: unknown): string | undefined {
+  const id = asRecord(payload)?.id;
+  return typeof id === "string" && id !== "" ? id : undefined;
 }
 
 function readModel(payload: unknown): string | undefined {

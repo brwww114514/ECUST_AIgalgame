@@ -15,9 +15,9 @@ function messages(input: string, loc: string, day = 1, phase = "morning"): { rol
   ];
 }
 
-const SCENES = new Map([
-  ["loc_library", { name: "图书馆", desc: "旧馆三层，四层书架把光切成一条一条。流通台后面是过刊室。" }],
-  ["loc_canteen", { name: "一食堂", desc: "队伍一直排到门口。价目表被人用笔改过。" }],
+const SCENES = new Map<string, string>([
+  ["图书馆", "旧馆三层，四层书架把光切成一条一条。流通台后面是过刊室。"],
+  ["一食堂", "队伍一直排到门口。价目表被人用笔改过。"],
 ]);
 
 describe("parsePromptContext", () => {

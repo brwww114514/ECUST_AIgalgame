@@ -13,9 +13,7 @@
   "wakeOnLocationChange": true,
   "llm": {
     "temperature": 0.7,
-    "maxTokens": 600,
-    "thinkMaxTokens": 400,
-    "retryMaxTokens": 1600
+    "maxTokens": 600
   },
   "messages": {
     "unknownMode": "unknown utterance mode",
@@ -32,8 +30,7 @@
     "sessionNotFound": "会话不存在或已关闭",
     "storeUnavailable": "落盘仍不可用，可安全重试",
     "memoryRejected": "本轮记忆写入被拒，发言未落库",
-    "storeFlushFailed": "落盘失败，稍后可安全重试",
-    "autoLimit": "自主推进已达上限，等玩家说话"
+    "storeFlushFailed": "落盘失败，稍后可安全重试"
   },
   "autonomy": {
     "minReplyIntervalMs": 30000,
@@ -42,6 +39,5 @@
     "maxTurnsPerTick": 2,
     "idleTimeoutMs": 300000,
     "playerPresentGraceMs": 60000
-  },
-  "maxAutoRounds": 3
+  }
 }

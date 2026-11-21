@@ -47,9 +47,9 @@ function setup(responses: string[], now = () => 1_000_000): Ctx {
     policy: { minReplyIntervalMs: 120000, maxMessagesPerNpcPerHour: 12, maxNpcCallsPerTick: 4, maxHops: 6, confidenceDecay: 0.8,
       messages: { system: "protocol {version}", format: "json", rules: "content only", untrusted: "data", inboxEmpty: "无消息则 ignore", replyFormat: "输出 JSON" } },
     conversation: {
-      autonomousWhenPlayerAbsent: true, npcHardCap: 0, maxTurns: 40, maxAutoRounds: 3, listenTimeoutMs: 30000, defaultMode: "broadcast",
+      autonomousWhenPlayerAbsent: true, npcHardCap: 0, maxTurns: 40, listenTimeoutMs: 30000, defaultMode: "broadcast",
       wakeOnMultiTarget: true, wakeOnLocationChange: true, maxContent: 400, maxAction: 120, maxThought: 300, maxPlan: 200,
-      llm: { temperature: 0.7, maxTokens: 600, thinkMaxTokens: 400, retryMaxTokens: 1600 }, autonomy: { minReplyIntervalMs: 30_000, maxMessagesPerNpcPerHour: 12, maxNpcCallsPerTick: 4, maxTurnsPerTick: 2, idleTimeoutMs: 300000, playerPresentGraceMs: 60000 },
+      llm: { temperature: 0.7, maxTokens: 600 }, autonomy: { minReplyIntervalMs: 30_000, maxMessagesPerNpcPerHour: 12, maxNpcCallsPerTick: 4, maxTurnsPerTick: 2, idleTimeoutMs: 300000, playerPresentGraceMs: 60000 },
       messages: {} as never,
     },
   });
@@ -137,7 +137,7 @@ describe("v2 微信私信引擎", () => {
       store: ctx.store,
       arbiter: new DefaultArbiter({ store: ctx.store, registry: emptyRegistry(), memories: ctx.memory, now: () => 1_000_000 }),
       messages: ctx.messages, budget: new TalkBudget({ ...DEFAULT_CONVERSATION_POLICY, autonomy: { ...DEFAULT_CONVERSATION_POLICY.autonomy!, minReplyIntervalMs: 0 } } as never, () => 1_000_000),
-      agent: new GossipAgent({ llm: ctx.llm, policy: gp, conversation: { llm: { temperature: 0.7, maxTokens: 600, thinkMaxTokens: 400, retryMaxTokens: 1600 }, autonomy: { idleTimeoutMs: 300000, playerPresentGraceMs: 0, maxTurnsPerTick: 2 } } as never }),
+      agent: new GossipAgent({ llm: ctx.llm, policy: gp, conversation: { llm: { temperature: 0.7, maxTokens: 600 }, autonomy: { idleTimeoutMs: 300000, playerPresentGraceMs: 0, maxTurnsPerTick: 2 } } as never }),
       policy: gp, now: () => 1_000_000,
     });
     const out = await fast.step(ROOM);
@@ -169,7 +169,7 @@ describe("v2 微信私信引擎", () => {
         llm: ctx.llm,
         policy: { minReplyIntervalMs: 0, maxMessagesPerNpcPerHour: 12, maxNpcCallsPerTick: 4, maxHops: 6, confidenceDecay: 0.8,
           messages: { system: "protocol {version}", format: "json", rules: "content only", untrusted: "data", inboxEmpty: "无", replyFormat: "JSON" } },
-        conversation: { llm: { temperature: 0.7, maxTokens: 600, thinkMaxTokens: 400, retryMaxTokens: 1600 } } as never,
+        conversation: { llm: { temperature: 0.7, maxTokens: 600 } } as never,
       }),
       policy: { minReplyIntervalMs: 0, maxMessagesPerNpcPerHour: 12, maxNpcCallsPerTick: 4, maxHops: 6, confidenceDecay: 0.8,
         messages: { system: "protocol {version}", format: "json", rules: "content only", untrusted: "data", inboxEmpty: "无", replyFormat: "JSON" } },
@@ -221,7 +221,7 @@ describe("v2 微信私信引擎", () => {
     let now = 1_000_000;
     const ctx = setup([relay("a"), relay("b")], () => now);
     for (let i = 0; i < 12; i += 1) {
-      ctx.budget.recordSent(ROOM, WU, "gossip");
+      ctx.budget.recordSent(ROOM, WU);
     }
     await ctx.host.send(ROOM, PLR, WU, "第 13 条");
     const out = await ctx.host.step(ROOM);

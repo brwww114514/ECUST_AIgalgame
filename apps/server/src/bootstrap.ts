@@ -55,7 +55,7 @@ import { SessionStore } from "./sessions.ts";
 import { AuthService } from "./auth.ts";
 import { TurnLedger } from "./quota.ts";
 import { AdminLog } from "./admin-log.ts";
-import { loadSceneDescs, offlineNarrative, sceneByName } from "./offline-narrator.ts";
+import { loadSceneDescs, offlineNarrative } from "./offline-narrator.ts";
 import { LlmSwitch } from "./llm-switch.ts";
 import { LlmSettings, loadPersistedLlmSettings } from "./settings.ts";
 import { appearanceById, loadScenarios } from "./scenarios.ts";
@@ -371,10 +371,8 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   // 恢复（独立文件、不进 EventLog）；坏档/缺档降级为新会话（旧会话 closed），不拖垮启动。
   const conversationModes = await loadModes(path.join(contentRoot, "v2", "utterance-modes.json"));
   const conversationScene: SceneAgentPort = {
-    async describe({ locId, locName }) {
-      const byId = locId ? sceneDescs.get(locId) : undefined;
-      const byName = locName ? sceneByName(sceneDescs, locName) : undefined;
-      return (byId ?? byName)?.desc ?? "";
+    async describe({ locName }) {
+      return locName ? (sceneDescs.get(locName) ?? "") : "";
     },
     async summarize({ recent }) {
       return recent.slice(-3).join(" / ");
@@ -430,20 +428,6 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
         }
       })();
     }, gossipScanMs);
-    timer.unref?.();
-  }
-
-  // #136：插话超时恢复（listening → speaking）。没这个 tick，玩家点了插话又不说话，
-  // 会话会一直卡在 listening；原来的 resumeExpired() 没有任何调用方。
-  const conversationTickMs = Number(process.env.GALGAME_CONVERSATION_TICK_MS ?? 5_000);
-  if (conversationTickMs > 0) {
-    const timer = setInterval(() => {
-      try {
-        conversation.resumeExpired(now());
-      } catch (e) {
-        console.warn("[conversation] 插话超时恢复失败：", e instanceof Error ? e.message : e);
-      }
-    }, conversationTickMs);
     timer.unref?.();
   }
 

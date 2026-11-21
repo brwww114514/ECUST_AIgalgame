@@ -56,8 +56,7 @@ export function memoryProposals(u: Utterance, roomId: RoomId, modes: Map<string,
     ownerId: u.speaker,
     content: fitMemoryContent(text),
     tags: ["dialogue", u.mode],
-    // #135：关键线索可让模型通过 utterance.salience 提权（1–5 → 20–100 分），缺省 3
-    salience: typeof u.salience === "number" ? Math.min(5, Math.max(1, Math.round(u.salience))) * 20 : 60,
+    salience: 60,
     visibility,
   };
   if (u.target && u.target !== "all") args.about = Array.isArray(u.target) ? u.target : [u.target];

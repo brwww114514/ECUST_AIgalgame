@@ -19,6 +19,15 @@ describe("OpenAiCompatClient traceId（审阅 P3）", () => {
     expect(r.traceId).toBe("req-123");
   });
 
+  it("支持 DeepSeek 网关的 x-ds-trace-id", async () => {
+    const client = new OpenAiCompatClient({
+      baseUrl: "https://example.invalid", model: "m", apiKey: "k",
+      fetchImpl: async () => new Response(okBody(), { status: 200, headers: { "x-ds-trace-id": "ds-456" } }),
+    });
+    const r = await client.chat({ messages: [{ role: "user", content: "hi" }] });
+    expect(r.traceId).toBe("ds-456");
+  });
+
   it("没有响应头时退回 payload.id", async () => {
     const client = new OpenAiCompatClient({
       baseUrl: "https://example.invalid", model: "m", apiKey: "k",

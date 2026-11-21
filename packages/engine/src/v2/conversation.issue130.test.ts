@@ -281,4 +281,10 @@ describe("审阅 #144 P1-c：当天台词固定占位", () => {
     expect(text.split("\n")).toHaveLength(5);
   });
   it("空召回返回空串", () => expect(memoryLinesFor([])).toBe(""));
+  it("带 action 的自己台词与召回行按同一拼法去重（不重复占位）", () => {
+    const own = ownSpeechLines([{ turn: 100, deliveries: [{ speaker: "npc_lin", to: "npc_lin", channels: ["content", "action"], content: "第1句台词", action: "抬眼" }] as never }], "npc_lin");
+    const recalled = memoryLinesFor([hit("m_today", 100, "第1句台词 (抬眼)")], "图书馆");
+    const text = mergeMemoryText(own, recalled);
+    expect(text.match(/第1句台词/g)).toHaveLength(1);
+  });
 });

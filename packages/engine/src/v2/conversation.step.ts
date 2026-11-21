@@ -255,7 +255,8 @@ export function ownSpeechLines(rounds: readonly Round[], npcId: ActorId): string
   for (const r of rounds) {
     for (const d of r.deliveries) {
       if (d.speaker !== npcId) continue;
-      const text = (d.content ?? d.action ?? "").trim();
+      // 与 memoryProposals 同一拼法（content + " (action)"），否则和召回行按正文去重失效
+      const text = `${d.content ?? ""}${d.action ? ` (${d.action})` : ""}`.trim();
       if (!text || seen.has(text)) continue;
       seen.add(text);
       out.push(`- [第${Math.floor(r.turn / 100) || 1}天] 你说过：${text}`);
@@ -267,10 +268,11 @@ export function ownSpeechLines(rounds: readonly Round[], npcId: ActorId): string
 /** 自己的台词固定前置；与记忆召回行按「正文」去重，避免同一句出现两次 */
 export function mergeMemoryText(own: string, recalled: string): string {
   const ownLines = own.split("\n").filter(Boolean);
-  const key = (line: string) => {
-    const i = line.indexOf("：");
-    return (i >= 0 ? line.slice(i + 1) : line).trim();
-  };
+  // 去掉「- [第N天·地点] 」与可选的「你说过：」前缀再比，避免任一来源缺前缀时去重失效
+  const key = (line: string) => line
+    .replace(/^-\s*\[[^\]]*\]\s*/, "")
+    .replace(/^你说过：/, "")
+    .trim();
   const ownKeys = new Set(ownLines.map(key));
   const rest = recalled.split("\n").filter((l) => l && !ownKeys.has(key(l)));
   return [...ownLines, ...rest].slice(0, MEMORY_LINES_MAX + 2).join("\n");

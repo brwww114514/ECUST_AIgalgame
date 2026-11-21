@@ -22,7 +22,8 @@
 - `offline-narrator` 的场景名匹配改比「命中的别名长度」（`pickSceneByInput` 可单测），修「食堂二楼被一食堂截胡」。
 - `E_LLM_TRUNCATED` 确认在 `RETRYABLE`（docs/03 §7 同口径），配合 `NpcAgent` 一次 `retryMaxTokens` 重试。
 - 合并 `resolveSceneDesc` 上方重复 JSDoc。
-- 验证：`tsc` 0；`vitest` 102 文件 **815 例**；`check:contract` 8/8（3.7.0）。
+- 复审补充：notice-only 只在 `auto` 回合按 `failed` 释放额度，审核拦截仍 `unconfirmed`（docs/03 §5.2.11 写明两条语义）；`ownSpeechLines` 与 `memoryProposals` 同拼法（`content (action)`）并按前缀去重；`traceId` 增认 `x-ds-trace-id`。
+- 验证：`tsc` 0；`vitest` 102 文件 **817 例**；`check:contract` 8/8（3.7.0）。
 
 ### 修复（PR #144 定向复审 P1/P2，790d518 之后）
 - **P1-a 在场者显示**：`runStep` 构造 `PresentActor` 时把 `kind==="plr"` 的名字置为「玩家」；`presentLine` 玩家行输出 `- plr_x（玩家）`，其余显示中文 `NPC`。

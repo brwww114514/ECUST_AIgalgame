@@ -728,8 +728,9 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
                 }
               }
             } else if (errored) ledger.transition(turnScope, "failed");
-            else if (out.some((e) => e.type === "conversation.notice")) {
-              // auto 超上限只是提示，既没调模型也没写世界：不能按 unconfirmed 占额度
+            else if (body.auto && out.some((e) => e.type === "conversation.notice")) {
+              // 只限 auto 超上限：既没调模型也没写世界，不能按 unconfirmed 占额度。
+              // 审核拦截（blocked）也只回 notice，但那是真实发生过的一次审核调用，维持 unconfirmed 原语义。
               ledger.transition(turnScope, "failed");
             } else ledger.transition(turnScope, "unconfirmed");
           }

@@ -3,7 +3,7 @@
  * 观察类不重复场景描述、缺失场景的兜底、缺失数据文件不炸启动。
  */
 import { describe, expect, it } from "vitest";
-import { loadSceneDescs, offlineNarrative, parsePromptContext, resolveSceneDesc } from "./offline-narrator.ts";
+import { pickSceneByInput, loadSceneDescs, offlineNarrative, parsePromptContext, resolveSceneDesc } from "./offline-narrator.ts";
 
 function messages(input: string, loc: string, day = 1, phase = "morning"): { role?: string; content?: string }[] {
   return [
@@ -84,5 +84,18 @@ describe("resolveSceneDesc（#134 canon 名 → 地图点位 id 回退）", () =
 
   it("都查不到时返回空串，不抛错", () => {
     expect(resolveSceneDesc(descs, canon, { locName: "不存在的地方" })).toBe("");
+  });
+});
+
+describe("审阅 P3：场景名匹配取最长别名", () => {
+  const descs = new Map([
+    ["loc_a", { name: "一食堂", desc: "A" }],
+    ["loc_b", { name: "食堂二楼", desc: "B" }],
+  ]);
+  it("输入「食堂二楼」命中长名，不被「一食堂」的短别名截胡", () => {
+    expect(pickSceneByInput(descs, "去食堂二楼吃饭")?.desc).toBe("B");
+  });
+  it("输入「一食堂」仍命中自己", () => {
+    expect(pickSceneByInput(descs, "去一食堂")?.desc).toBe("A");
   });
 });

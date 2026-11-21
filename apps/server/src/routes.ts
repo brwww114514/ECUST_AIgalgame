@@ -728,7 +728,10 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
                 }
               }
             } else if (errored) ledger.transition(turnScope, "failed");
-            else ledger.transition(turnScope, "unconfirmed");
+            else if (out.some((e) => e.type === "conversation.notice")) {
+              // auto 超上限只是提示，既没调模型也没写世界：不能按 unconfirmed 占额度
+              ledger.transition(turnScope, "failed");
+            } else ledger.transition(turnScope, "unconfirmed");
           }
         } catch (e) {
           // #104：异常路径按失败回收额度（未 committed），与 v1 /turns 的 catch 同口径；重放命中不结算

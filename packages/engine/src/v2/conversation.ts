@@ -57,6 +57,8 @@ interface PendingFlush {
   beforeLocId?: string;
   /** 失败回合的 NPC 决策结果；重放提交时原样带回，避免 outcomes 丢失（审阅 P2） */
   outcomes: NpcOutcome[];
+  /** 失败的是玩家沉默期的 auto 回合：重试成功后要补记 autoRounds */
+  auto?: boolean;
 }
 
 const MAX_SEEN = 256;
@@ -310,6 +312,8 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       }
       const done = await this.commitWithState(pending.s, applied, pending.outcomes);
       const all = [...pending.out, done];
+      // 落盘重试成功后也要记账，否则同一轮 auto 会被重复放行
+      if (pending.auto) pending.s.autoRounds = (pending.s.autoRounds ?? 0) + 1;
       rememberRecent(pending.s, pending.s.turn, pending.fresh);
       this.remember(key, all);
       this.pendingFlush.delete(key);
@@ -339,6 +343,7 @@ export class ConversationHostV2 implements ConversationTurnV2 {
         this.pendingFlush.set(key, {
           roomId: e.roomId, s, applied: e.applied, out: [...out], fresh: e.fresh,
           beforeLocId: s.lastLocId, retry: e.retry, outcomes: e.outcomes,
+          auto: !!input.auto && !input.utterance,
         });
         this.trim(this.pendingFlush, MAX_PENDING);
         // ③ 外部事件只在提交成功后发布：失败时只回可重试错误

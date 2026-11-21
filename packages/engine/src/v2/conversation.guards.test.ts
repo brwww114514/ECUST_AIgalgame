@@ -373,6 +373,27 @@ describe("PR#51 二审回归", () => {
     expect(again.some((e) => e.type === "conversation.scene")).toBe(false);
   });
 
+  it("P3：auto 回合落盘重试成功后也补记 autoRounds（同一轮不被重复放行）", async () => {
+    const store = new FailOnceStore({ worldId: "w1", locId: GATE });
+    store.append(ROOM, [
+      env(1, "entity.created", { entity: entity(GATE, "loc", "图书馆") }),
+      env(2, "entity.created", { entity: entity(PLR, "plr", "我") }),
+      env(3, "entity.created", { entity: entity(LIN, "npc", "林月") }),
+      env(4, "entity.created", { entity: entity(MA, "npc", "马骁") }),
+      env(5, "scene.changed", { locId: GATE, presentIds: [PLR, LIN, MA] }),
+    ]);
+    const { host, session } = await setup({ store, responses: [
+      JSON.stringify({ kind: "speak", utterance: { id: "a1", mode: "broadcast", content: "我先说" } }),
+      JSON.stringify({ kind: "speak", utterance: { id: "a2", mode: "broadcast", content: "我接着说" } }),
+    ] });
+    const input = { clientTurnId: "t-auto-retry", auto: true as const };
+    const first = await collect(host.run(session.id, input));
+    expect(first.some((e) => e.type === "conversation.error" && e.code === "E_STORE_FAULT")).toBe(true);
+    const retry = await collect(host.run(session.id, input));
+    expect(retry.some((e) => e.type === "conversation.committed")).toBe(true);
+    expect(host.get(session.id)?.autoRounds).toBe(1);
+  });
+
   it("五审：会话淘汰跳过仍有 pendingFlush 的会话", async () => {
     const { host } = await setup({ responses: [] });
     const internal = host as unknown as {

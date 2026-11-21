@@ -86,6 +86,7 @@ export class OpenAiCompatClient implements LlmPort {
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
     let payload: unknown = undefined;
+    let headerTraceId: string | undefined;
     try {
       const res = await this.fetchImpl(`${baseUrl}/chat/completions`, {
         method: "POST",
@@ -100,6 +101,8 @@ export class OpenAiCompatClient implements LlmPort {
       if (res.status === 429) {
         throw new LlmError("E_RATE_LIMITED", `LLM 限流（HTTP 429）：${await snippet(res)}`);
       }
+      // 响应头优先：网关会回 x-request-id，拿它串日志比 payload.id 可靠
+      headerTraceId = res.headers.get("x-request-id") ?? res.headers.get("x-trace-id") ?? res.headers.get("trace-id") ?? undefined;
       if (!res.ok) {
         // 非 2xx 统一归入可重试的格式错误：网关层没有更细的错误码（见 03 §7）
         throw new LlmError("E_LLM_FORMAT", `LLM 请求失败（HTTP ${res.status}）：${await snippet(res)}`);
@@ -125,7 +128,7 @@ export class OpenAiCompatClient implements LlmPort {
       model: readModel(payload) ?? model,
       latencyMs: Date.now() - startedAt,
       finishReason,
-      traceId: readTraceId(payload),
+      traceId: headerTraceId ?? readTraceId(payload),
     };
 
     if (wantJson) {

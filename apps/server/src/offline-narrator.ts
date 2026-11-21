@@ -57,7 +57,6 @@ export async function loadSceneDescs(file: string): Promise<Map<string, SceneDes
   }
 }
 
-/** 名字反查（离线叙述器按玩家输入里的场景名找描述） */
 /**
  * 场景描述解析（#134）：优先 locId；名字回退时先经 canon 名→id 解析，再做同名匹配。
  * canon 的「图书馆」与地图的「图文信息中心」名字不同但 id 对齐，只按名字找会全 miss。
@@ -106,6 +105,18 @@ function firstSentence(text: string): string {
   return s.length > 80 ? `${s.slice(0, 78)}…` : s;
 }
 
+/** 从输入里认出目标场景：取最长命中别名（比场景名长度更准） */
+export function pickSceneByInput(descs: Map<string, SceneDesc>, input: string): SceneDesc | undefined {
+  let named: SceneDesc | undefined;
+  let namedHit = 0;
+  for (const d of descs.values()) {
+    for (const alias of aliases(d.name)) {
+      if (input.includes(alias) && alias.length > namedHit) { named = d; namedHit = alias.length; }
+    }
+  }
+  return named;
+}
+
 /** 场景名的别名（"一食堂" → 也认"食堂"；"宿舍 3 号楼" → 也认"宿舍"），用于从输入里认出目标 */
 function aliases(name: string): string[] {
   const out = new Set<string>([name]);
@@ -137,12 +148,7 @@ export function offlineNarrative(messages: { content?: string }[], descs: Map<st
   const looking = /看|观察|环顾|四周|地图|在哪/.test(ctx.input);
 
   // 输入里出现场景名/别名 → 用那个场景；否则用当前地点。取最长匹配，避免"食堂"截胡"一食堂"以外的更长名字
-  let named: SceneDesc | undefined;
-  for (const d of descs.values()) {
-    for (const alias of aliases(d.name)) {
-      if (ctx.input.includes(alias) && (!named || alias.length > named.name.length)) named = d;
-    }
-  }
+  const named = pickSceneByInput(descs, ctx.input);
   const target = moving && named ? named : sceneByName(descs, ctx.locName);
   const desc = target?.desc ?? "";
 

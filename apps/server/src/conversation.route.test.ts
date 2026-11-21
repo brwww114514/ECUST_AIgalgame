@@ -333,14 +333,14 @@ describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
     const { app, roomId, actorId } = await appWith();
     const url = `/api/v1/rooms/${roomId}/conversation`;
     const withoutActor = await app.inject({
-      method: "POST", url, headers: { "x-user-id": "u_owner" }, payload: { clientTurnId: "intercept-1", interject: "npc_x" },
+      method: "POST", url, headers: { "x-user-id": "u_owner" }, payload: { clientTurnId: "intercept-1", interject: "npc_lin" },
     });
     expect(withoutActor.statusCode).toBe(400);
 
     // 带本人 actorId 时插话只切 phase，不推进回合；引擎收到的 interject 是 NPC id 而非玩家 id
     const withActor = await app.inject({
       method: "POST", url, headers: { "x-user-id": "u_owner" },
-      payload: { actorId, clientTurnId: "intercept-2", interject: "npc_x" },
+      payload: { actorId, clientTurnId: "intercept-2", interject: "npc_lin" },
     });
     expect(withActor.statusCode).toBe(200);
     expect(sse(withActor.body).map((e) => e.type)).toContain("conversation.phase");
@@ -364,7 +364,7 @@ describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
     //    不崩且 200。显式锁住该行为，避免后续把两者同时给当成非法输入而误改（#106 记文档口径）。
     const both = await app.inject({
       method: "POST", url, headers: H,
-      payload: { actorId, clientTurnId: "boundary-both", interject: "npc_x", utterance: { mode: "broadcast", content: "大家好" } },
+      payload: { actorId, clientTurnId: "boundary-both", interject: "npc_lin", utterance: { mode: "broadcast", content: "大家好" } },
     });
     expect(both.statusCode).toBe(200);
     expect(both.headers["content-type"]).toContain("text/event-stream");

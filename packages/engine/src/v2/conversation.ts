@@ -15,6 +15,7 @@ import type {
   ConversationPolicy,
   Registry,
   Delivery,
+  NpcOutcome,
 } from "../../../shared/src/index.ts";
 import type { EventLog } from "../store.ts";
 import { isRoomSyncFault } from "../store-write.ts";
@@ -96,7 +97,12 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     this.sessions.set(session.id, session);
     this.trimSessions();
     session.sceneBeats.push(
-      await this.deps.scene.open(session.id, spec.roomId, locId ? state.entities[locId]?.name : undefined, spec.participants, locId),
+      await this.deps.scene.open(
+        session.id,
+        spec.roomId,
+        { ...(locId ? { locId } : {}), ...(locId && state.entities[locId]?.name ? { locName: state.entities[locId]!.name } : {}) },
+        spec.participants,
+      ),
     );
     return session;
   }
@@ -303,19 +309,25 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       if (pending.beforeLocId !== undefined && pending.s.lastLocId === pending.beforeLocId) {
         pending.s.lastLocId = this.deps.store.state(pending.roomId).room.scene.locId;
       }
-      const done = await this.commitWithState(pending.s, applied);
+      const done = await this.commitWithState(pending.s, applied, []);
       const all = [...pending.out, done];
-      rememberRecent(pending.s, pending.fresh);
+      rememberRecent(pending.s, pending.s.turn, pending.fresh);
       this.remember(key, all);
       this.pendingFlush.delete(key);
       return all;
     }
 
     const now = this.deps.now?.() ?? Date.now();
+    // #136：玩家沉默期的 NPC-NPC 自主推进，最多 maxAutoRounds 轮
+    if (input.auto) {
+      if (!input.utterance && (s.autoRounds ?? 0) >= this.deps.policy.maxAutoRounds) {
+        return [{ type: "conversation.notice", text: this.deps.policy.messages.autoLimit }];
+      }
+    }
     // ④ 只把本会话到期的 phase 事件塞进本回合返回流
     const out: ConversationEvent[] = [...this.resumeExpiredEvents(now, sessionId)];
     try {
-      await runStep(this.deps, s, input, out, now, (ss, a) => this.commitWithState(ss, a));
+      await runStep(this.deps, s, input, out, now, (ss, a, outcomes) => this.commitWithState(ss, a, outcomes));
     } catch (e) {
       if (isRoomSyncFault(e)) {
         // 提交结果待核对，丢弃本轮尚未发布的事件。
@@ -339,6 +351,9 @@ export class ConversationHostV2 implements ConversationTurnV2 {
           message: e instanceof Error ? e.message : String(e),
         });
       }
+    }
+    if (input.auto && !input.utterance && out.some((e) => e.type === "conversation.committed")) {
+      s.autoRounds = (s.autoRounds ?? 0) + 1;
     }
     if (!out.some((e) => e.type === "conversation.error" && e.retryable)) this.remember(key, out);
     return out;
@@ -369,7 +384,11 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     this.trim(this.seen, MAX_SEEN);
   }
 
-  private async commitWithState(s: ConversationSessionV2, applied: ArbiterApplyResult): Promise<ConversationEvent> {
+  private async commitWithState(
+    s: ConversationSessionV2,
+    applied: ArbiterApplyResult,
+    outcomes: NpcOutcome[],
+  ): Promise<ConversationEvent> {
     const turn = ++s.turn;
     if (turn >= s.maxTurns) s.status = "closed";
     return {
@@ -378,6 +397,7 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       turn,
       proposals: applied.applied,
       state: applied.stateAfter ?? await this.deps.store.snapshot(s.roomId),
+      ...(outcomes.length ? { outcomes } : {}),
     };
   }
 }

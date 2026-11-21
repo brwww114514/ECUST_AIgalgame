@@ -118,6 +118,8 @@ const ConversationBodySchema = z
     clientTurnId: z.string().min(1).max(120),
     userId: z.string().optional(),
     interject: z.string().min(1).optional(),
+    /** #136：玩家沉默时推进一轮 NPC-NPC 自主对话（与 utterance 互斥，由引擎裁决） */
+    auto: z.boolean().optional(),
     utterance: z
       .object({
         id: z.string().min(1).optional(),
@@ -701,6 +703,7 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
             clientTurnId: body.clientTurnId,
             ...(utterance ? { utterance } : {}),
             ...(body.interject ? { interject: body.interject } : {}),
+            ...(body.auto ? { auto: true } : {}),
             ...(access.userId ? { userId: access.userId } : {}),
           })) out.push(ev);
           // #104：结算与事件流同源——只有真的 committed 才记 committed；

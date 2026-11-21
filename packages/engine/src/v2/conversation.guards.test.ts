@@ -213,7 +213,7 @@ describe("PR#51 P1 回归", () => {
   it("②listenTimeoutMs 到期可恢复，resumeExpired 返回会话 id", async () => {
     let now = 1000;
     const { host, session } = await setup({ now: () => now, responses: [] });
-    await collect(host.run(session.id, { clientTurnId: "i1", interject: PLR }));
+    await collect(host.run(session.id, { clientTurnId: "i1", interject: LIN }));
     expect(host.get(session.id)?.phase).toBe("listening");
     now = 1000 + 31_000;
     expect(host.resumeExpired()).toContain(session.id);
@@ -272,7 +272,7 @@ describe("PR#51 P2 回归", () => {
   it("幂等缓存有上限（≤256），不会无限增长", async () => {
     const { host, session } = await setup({});
     for (let i = 0; i < 260; i++) {
-      await collect(host.run(session.id, { clientTurnId: `i${i}`, interject: PLR }));
+      await collect(host.run(session.id, { clientTurnId: `i${i}`, interject: LIN }));
     }
     expect(host.idempotencySize).toBeLessThanOrEqual(256);
   });
@@ -310,7 +310,7 @@ describe("PR#51 二审回归", () => {
   it("H：resumeExpiredEvents 带回 phase 事件", async () => {
     let now = 1000;
     const { host, session } = await setup({ now: () => now, responses: [] });
-    await collect(host.run(session.id, { clientTurnId: "i1", interject: PLR }));
+    await collect(host.run(session.id, { clientTurnId: "i1", interject: LIN }));
     now += 31_000;
     const evs = host.resumeExpiredEvents();
     expect(evs.some((e) => e.type === "conversation.phase" && e.phase === "speaking")).toBe(true);

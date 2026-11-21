@@ -43,6 +43,12 @@ export function estimateTokens(text: string): number {
 }
 
 /** 历史数据 salience 是 0~100，契约 3.1.0 起是 1~5：读时收敛，不丢信息 */
+/** 记忆 turn 口径统一为 day*100+tick；旧存档的"第几天"（<100）乘 100 归一 */
+export function normalizeTurn(raw: number): number {
+  if (!Number.isFinite(raw) || raw <= 0) return raw;
+  return raw < 100 ? raw * 100 : raw;
+}
+
 export function normalizeSalience(v: unknown): number {
   const n = typeof v === "number" && Number.isFinite(v) ? v : 3;
   const clamped = n > 5 ? Math.round(n / 20) : Math.round(n);
@@ -124,7 +130,8 @@ export class EventSourcedMemory implements Memory {
         about: Array.isArray(p.about) ? (p.about as string[]).filter((t): t is string => typeof t === "string") : [],
         visibility: normalizeVisibility(p.visibility),
         tier: normalizeTier(p.tier),
-        turn: typeof p.turn === "number" ? p.turn : typeof p.at === "number" ? p.at : 0,
+        // #135：旧存档写的是"第几天"（如 3），新口径是 day*100+tick；<100 一律视为旧值
+        turn: normalizeTurn(typeof p.turn === "number" ? p.turn : typeof p.at === "number" ? p.at : 0),
         createdAt: env.ts,
         status,
       };

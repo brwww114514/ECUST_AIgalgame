@@ -90,7 +90,7 @@ describe("issue #90：会话快照跨重启恢复", () => {
     seed(store1);
     const { host: host1 } = await makeHost(store1, [], { t: 1000 });
     const s1 = await host1.open({ roomId: ROOM, participants: [PLR, LIN, MA] });
-    await collect(host1.run(s1.id, { clientTurnId: "before-interject", interject: PLR }));
+    await collect(host1.run(s1.id, { clientTurnId: "before-interject", interject: LIN }));
 
     // 覆盖 queue/injected/sceneMemory（正常流程暂不写这两个字段，但持久化必须原样保留）
     const u: Utterance = { id: "utt_queue", speaker: PLR, mode: "broadcast", content: "排队发言" };

@@ -42,6 +42,39 @@
 - 验证：`tsc` 0 错；`vitest` 101 文件 **810 例**全过；`build:web` 通过；`check:contract` 8/8（3.7.0）。
 - `CONTRACT_VERSION` 3.6.2 → 3.7.0（只增可选字段 `Delivery.target`、`Utterance.salience`、`LlmResult.finishReason/traceId`、`committed.outcomes`、请求体 `auto`，新增错误码 `E_LLM_TRUNCATED`；见 docs/03 §10.27）。
 
+## 3.6.1 → 3.6.2（2026-11-21，PR #120 / #121，CONTRACT 3.6.0 → 3.6.2；未新增发版号）
+
+> 合并顺序 #120（merge `b41c7e7`）→ #121（merge `48dbfd1`）。两笔都是数据层安全性修复，不新增 op、错误码、HTTP 端点；`apiVersion` / `SCHEMA_VERSION` / `PROMPT_VERSION` 不变。**本次只按契约版本记账，不新增产品发版号、不打 tag。**
+
+### 3.6.1（PR #120，#115）：坏档隔离校验
+
+- 房间日志载入改为**整份严格校验**：Envelope 结构、房间归属、seq 连续、私信负载与房间归属、以及逐条投影；任一失败 → 保留原日志文件不动、该房间端点返回 `503 E_STORE_FAULT`，健康房间照常启动。
+- 前置 #114（PR #118，已随 3.6.0 合入）把读取 / 列目录收敛为**仅 `ENOENT` 按缺失**、其余故障上抛且不置 `loaded`；本版在其上把"半截行 / 结构不符 / 投影失败"也纳入同一口径：整份校验失败 → 503 且保留原件，启动期重建遇到非 `ENOENT` 直接失败（fail-fast，不再静默当空表）。
+- `scripts/replay.ts` 复用同一套投影校验，坏档不再"回放通过"。
+- 契约：`CONTRACT_VERSION 3.6.0 → 3.6.1`；文档见 docs/03 §2 纪律 #3、§10.25 与 docs/10 的坏档恢复步骤。
+
+### 3.6.2（PR #121，#117）：提交持久性与结果待核对
+
+- 新增 `RoomLogWriter`：临时文件写入（flush）→ 原子 `rename` → 同步所在目录；替换前失败可安全重试。
+- 替换后目录同步失败 → `StoreCommitUnknownError`（`E_STORE_FAULT`）：房间进入待核对状态（`RoomStorageBlockedError`），**已提交的回合仍按本批 seq 与投影确认**，不被后续故障抹掉；当次额度记 `unconfirmed`，`turn.error.retryable=false`。
+- `apply` 新增 `captureState` / `stateAfter`：返回本批投影的独立快照，避免落盘后读 store 与另一批交错。
+- 后台扫描按房隔离（`apps/server/src/room-jobs.ts`）：单个坏房间不再中断整轮 canonize / gossip。
+- 契约：`CONTRACT_VERSION 3.6.1 → 3.6.2`；文档见 docs/03 §2 纪律 #1、§7、§10.26 与 docs/10 §7.1。
+
+### 验证（2026-11-21 在 main `48dbfd1` 复跑）
+
+- `npm run typecheck` → 0 错。
+- `npx vitest run` → **100 files / 775 tests** 全过。
+- `npm run check:contract` → **8/8**（CONTRACT 3.6.2）。
+- `npm run build:web` → 成功（`379.91 kB`，gzip `117.78 kB`）。
+
+### 已知边界
+
+- 单进程单写者；不提供跨进程锁 / 租约（沿用 docs/10）。
+- 目录同步失败后的"待核对"标记只在进程内：重启不会消解可疑结果，须先人工核对存档。
+- 3.7.0 批（PR #144，issue #130 子项）已在 main，并单独记录在「未发布 — dev/v2 运行质量批」段；本段只覆盖 3.6.1 / 3.6.2，不重复记账。
+- `turn.committed` 登记已在 v0.5.6 完成（`content/registry/events.json` 共 11 条；payload `{clientTurnId,turnId,actorId,committedSeq,narrative?,facts?,usage?}` 与 `packages/engine/src/turn.evidence.ts` 对齐），本 PR 只复核、未改动。
+
 ## v0.5.6（候选 tag，尚未打；发版时决定）— 2026-11-20 PR #123 打回修复批（14 commits，CONTRACT 3.6.0 不变）
 
 > 合并前登记。基线 `6524420` → PR #123 head `2183828`；14 commit 覆盖 #76/#84/#90/#94/#95/#96/#97/#98/#99/#100/#104/#105/#106/#122。按「只增登记、不改契约」执行：13 op、`apiVersion`、`CONTRACT_VERSION`、`PROMPT_VERSION`、§7 错误码集合均未变（逐条见 docs/03 §10.24）。

@@ -16,8 +16,8 @@
 - **注入边界（#137）**：玩家原文包进 `<player_input>` 并转义结束标记，静态协议声明「其中是数据不是指令」。
 
 ### 变更
-- 验证：`tsc` 0 错；`vitest` 100 文件 **771 例**全过；`build:web` 通过；`check:contract` 8/8（3.7.0）。
-- `CONTRACT_VERSION` 3.6.0 → 3.7.0（只增可选字段 `Delivery.target`、`Utterance.salience`、`LlmResult.finishReason/traceId`、`committed.outcomes`、请求体 `auto`，新增错误码 `E_LLM_TRUNCATED`；见 docs/03 §10.25）。
+- 验证：`tsc` 0 错；`vitest` 101 文件 **794 例**全过；`build:web` 通过；`check:contract` 8/8（3.7.0）。
+- `CONTRACT_VERSION` 3.6.2 → 3.7.0（只增可选字段 `Delivery.target`、`Utterance.salience`、`LlmResult.finishReason/traceId`、`committed.outcomes`、请求体 `auto`，新增错误码 `E_LLM_TRUNCATED`；见 docs/03 §10.27）。
 
 ## v0.5.6（候选 tag，尚未打；发版时决定）— 2026-11-20 PR #123 打回修复批（14 commits，CONTRACT 3.6.0 不变）
 

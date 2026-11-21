@@ -56,7 +56,9 @@ afterAll(() => {
   else process.env.GALGAME_CONVERSATION_MAX_SESSIONS = prevMax;
 });
 
-async function appWith(): Promise<{ app: FastifyInstance; deps: App; roomId: string; actorId: string; llm: MockLlm }> {
+type LlmHandler = (req: { messages?: { role: string; content: string }[] }) => string;
+
+async function appWith(handler?: LlmHandler): Promise<{ app: FastifyInstance; deps: App; roomId: string; actorId: string; llm: MockLlm }> {
   process.env.GALGAME_GOSSIP_SCAN_MS = "0";
   const deps = await createApp(testConfig());
   const { roomId, actorId } = await deps.createRoom("solo", "u_owner");
@@ -65,7 +67,7 @@ async function appWith(): Promise<{ app: FastifyInstance; deps: App; roomId: str
   const modes = await loadModes(MODES);
   const policy = await loadConversationPolicy(POLICY);
   const scene: SceneAgentPort = { describe: async () => "test scene", summarize: async () => "test summary" };
-  const llm = new MockLlm({ handler: () => JSON.stringify({ kind: "silent", reason: "test" }) });
+  const llm = new MockLlm({ handler: handler ?? (() => JSON.stringify({ kind: "silent", reason: "test" })) });
   const audit = new NoopAudit();
   const store = deps.store as EventLog;
   const arbiter = deps.arbiter;
@@ -732,6 +734,70 @@ describe("dev/v2 群聊端点（issue #85/#89 契约对齐）", () => {
     });
     expect(res.statusCode).toBe(200);
     expect((await deps.store.snapshot(roomId)).entities[npcId]!.attrs.knows_name).toBe(true);
+    await app.close();
+  });
+});
+
+describe("issue #130 引擎新行为的 HTTP 集成（#131/#136）", () => {
+  const H = { "x-user-id": "u_owner" };
+  const npcIdsOf = (deps: App, roomId: string): string[] => {
+    const st = (deps.store as EventLog).state(roomId);
+    return st.room.scene.presentIds.filter((id) => st.entities[id]?.kind === "npc");
+  };
+
+  it("#136 auto 轮：玩家沉默也能推进 NPC 决策，且回放里没有玩家台词", async () => {
+    const { app, deps, roomId, actorId, llm } = await appWith(() => JSON.stringify({ kind: "speak", utterance: { mode: "broadcast", content: "我先说" } }));
+    expect(npcIdsOf(deps, roomId).length).toBeGreaterThan(0);
+    const callsBefore = llm.calls;
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "auto-1", auto: true },
+    });
+    expect(res.statusCode).toBe(200);
+    const events = sse(res.body);
+    expect(events.some((e) => e.type === "conversation.committed")).toBe(true);
+    expect(llm.calls).toBeGreaterThan(callsBefore);
+    expect(events.some((e) => e.type === "conversation.utterance" && (e.data.delivery as { speaker: string }).speaker === actorId)).toBe(false);
+    await app.close();
+  });
+
+  it("#136 interject + 同请求台词：台词不丢，phase listening → speaking", async () => {
+    const { app, deps, roomId, actorId } = await appWith();
+    const npc = npcIdsOf(deps, roomId)[0]!;
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: {
+        actorId, clientTurnId: "int-1", interject: npc,
+        utterance: { id: "u-int", mode: "broadcast", content: "等一下" },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const events = sse(res.body);
+    const contents = events.filter((e) => e.type === "conversation.utterance").map((e) => (e.data.delivery as { content?: string }).content);
+    expect(contents).toContain("等一下");
+    const phases = events.filter((e) => e.type === "conversation.phase").map((e) => e.data.phase);
+    expect(phases).toContain("listening");
+    expect(phases).toContain("speaking");
+    await app.close();
+  });
+
+  it("#131/#137 NPC prompt：在场者段、这一轮段、玩家文本被 <player_input> 包裹", async () => {
+    const prompts: string[] = [];
+    const { app, deps, roomId, actorId } = await appWith((req) => {
+      prompts.push(String(req.messages?.[0]?.content ?? ""));
+      return JSON.stringify({ kind: "silent", reason: "capture" });
+    });
+    expect(npcIdsOf(deps, roomId).length).toBeGreaterThan(0);
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "p-131", utterance: { id: "u-131", mode: "broadcast", content: "大家早" } },
+    });
+    expect(res.statusCode).toBe(200);
+    const npcPrompt = prompts.find((p) => p.includes("【在场者】"));
+    expect(npcPrompt).toBeTruthy();
+    expect(npcPrompt).toContain("【这一轮】");
+    expect(npcPrompt).toContain('<player_input speaker="玩家">');
+    expect(npcPrompt).toContain("大家早");
     await app.close();
   });
 });

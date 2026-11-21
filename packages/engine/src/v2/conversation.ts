@@ -273,9 +273,6 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     if (!s || s.status === "closed") {
       return [{ type: "conversation.error", sessionId, code: "E_DIALOGUE_NOT_FOUND", message: this.deps.policy.messages.sessionNotFound }];
     }
-    // 放在幂等命中与会话校验之后：重放旧回合不应清空另一个 host 正在用的波次预算
-    this.deps.budget?.beginTick(s.roomId);
-
     // 落盘重试：flush 失败时只重试 flush；arbiter 写盘失败时提案从未落库，用同一 cause 重新裁决
     const pending = this.pendingFlush.get(key);
     if (pending) {
@@ -319,6 +316,8 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       return all;
     }
 
+    // 放在幂等命中、会话校验与落盘重试之后：重放/重试旧回合不应清空另一个 host 正在用的波次预算
+    this.deps.budget?.beginTick(s.roomId);
     const now = this.deps.now?.() ?? Date.now();
     // #136：玩家沉默期的 NPC-NPC 自主推进，最多 maxAutoRounds 轮
     if (input.auto) {

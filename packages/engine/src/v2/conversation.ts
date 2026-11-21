@@ -4,7 +4,6 @@
  * 世界状态的所有变更仍只有一条路（I1）；本文件不碰 store.append、不碰文件。
  */
 import type {
-  ApplyResult,
   ConversationEvent,
   ConversationSessionV2,
   ConversationSpecV2,
@@ -18,7 +17,8 @@ import type {
   Delivery,
 } from "../../../shared/src/index.ts";
 import type { EventLog } from "../store.ts";
-import type { DefaultArbiter } from "../arbiter.ts";
+import { isRoomSyncFault } from "../store-write.ts";
+import type { ArbiterApplyResult, DefaultArbiter } from "../arbiter.ts";
 import type { EventSourcedMemory } from "../memory.ts";
 import { conversationSnapshotSchema, type ConversationSnapshot, type RestoreResult } from "./conversation-snapshot.ts";
 import type { SceneManager } from "./scene.ts";
@@ -46,7 +46,7 @@ export interface ConversationDeps {
 interface PendingFlush {
   roomId: RoomId;
   s: ConversationSessionV2;
-  applied: ApplyResult;
+  applied: ArbiterApplyResult;
   out: ConversationEvent[];
   /** 本轮已审核的投递；只有重放提交成功才进入下一轮上下文 */
   fresh: Delivery[];
@@ -273,7 +273,9 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     if (pending) {
       let applied = pending.applied;
       if (pending.retry) {
-        applied = await this.deps.arbiter.apply(pending.roomId, pending.retry.ops, pending.retry.cause, { expectedSeq: pending.retry.expectedSeq });
+        applied = await this.deps.arbiter.apply(pending.roomId, pending.retry.ops, pending.retry.cause, {
+          expectedSeq: pending.retry.expectedSeq, captureState: true,
+        });
         if (!applied.ok) {
           const retryable = applied.error?.code === "E_STORE_FAULT";
           if (!retryable) this.pendingFlush.delete(key);
@@ -288,12 +290,18 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       }
       try {
         await this.deps.store.flush(pending.roomId);
-      } catch {
-        return [{ type: "conversation.error", sessionId, code: "E_STORE_FAULT", message: this.deps.policy.messages.storeUnavailable, retryable: true }];
+      } catch (error) {
+        const uncertain = isRoomSyncFault(error);
+        if (uncertain) this.pendingFlush.delete(key);
+        return [{
+          type: "conversation.error", sessionId, code: "E_STORE_FAULT",
+          message: uncertain ? error.message : this.deps.policy.messages.storeUnavailable,
+          retryable: !uncertain,
+        }];
       }
       // 用当前快照而非失败当时的快照：若期间别的回合已推进地点，不回写旧值
       if (pending.beforeLocId !== undefined && pending.s.lastLocId === pending.beforeLocId) {
-        pending.s.lastLocId = (await this.deps.store.snapshot(pending.roomId)).room.scene.locId;
+        pending.s.lastLocId = this.deps.store.state(pending.roomId).room.scene.locId;
       }
       const done = await this.commitWithState(pending.s, applied);
       const all = [...pending.out, done];
@@ -309,6 +317,10 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     try {
       await runStep(this.deps, s, input, out, now, (ss, a) => this.commitWithState(ss, a));
     } catch (e) {
+      if (isRoomSyncFault(e)) {
+        // 提交结果待核对，丢弃本轮尚未发布的事件。
+        return [{ type: "conversation.error", sessionId, code: e.code, message: e.message, retryable: false }];
+      }
       if (e instanceof StoreFlushError) {
         // 先冻结 out 再追加错误，重试时才不会重复 yield 上一轮的 E_STORE_FAULT
         this.pendingFlush.set(key, {
@@ -357,7 +369,7 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     this.trim(this.seen, MAX_SEEN);
   }
 
-  private async commitWithState(s: ConversationSessionV2, applied: ApplyResult): Promise<ConversationEvent> {
+  private async commitWithState(s: ConversationSessionV2, applied: ArbiterApplyResult): Promise<ConversationEvent> {
     const turn = ++s.turn;
     if (turn >= s.maxTurns) s.status = "closed";
     return {
@@ -365,7 +377,7 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       sessionId: s.id,
       turn,
       proposals: applied.applied,
-      state: await this.deps.store.snapshot(s.roomId),
+      state: applied.stateAfter ?? await this.deps.store.snapshot(s.roomId),
     };
   }
 }

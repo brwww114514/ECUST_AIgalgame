@@ -62,6 +62,8 @@ import { appearanceById, loadScenarios } from "./scenarios.ts";
 import { createDebugGate } from "./debug.ts";
 import type { AppDeps } from "./routes.ts";
 import { isStoreFault } from "./store-fault.ts";
+import { prepareDurableDirectory } from "../../../packages/engine/src/store-write.ts";
+import { scanRoomJobs } from "./room-jobs.ts";
 
 interface CanonWorld {
   worldId: string;
@@ -257,6 +259,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   // 续玩（issue #7）：历史和存档索引都是"投影"，写失败不影响已提交的回合。
   // 历史挂在 Turn 外层（而不是 HTTP 路由里），这样 map.travel 这类内部回合也能被记录。
   const dataRoot = path.resolve(cfg.dataDir);
+  await prepareDurableDirectory(dataRoot);
   const history = new TurnHistory(path.join(dataRoot, "history"), cfg.historyLimitMax ?? 200);
   const saves = new SaveIndex(path.join(dataRoot, "users"));
   const users = new AuthStore(path.join(dataRoot, "auth", "auth.json"));
@@ -339,16 +342,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   const scanMinutes = canonizeCfg?.scanMinutes ?? 0;
   if (canonizeCfg?.enabled !== false && scanMinutes > 0) {
     const timer = setInterval(() => {
-      void (async () => {
-        try {
-          for (const roomId of await store.listRooms()) {
-            if (roomId === worldRoom || !(await loadRoomForIndex(store, roomId))) continue;
-            await canonize.retireRoom(roomId);
-          }
-        } catch (e) {
-          console.warn("[canonize] 定时补扫失败：", e instanceof Error ? e.message : e);
-        }
-      })();
+      void scanRoomJobs(store, worldRoom, "canonize", (roomId) => canonize.retireRoom(roomId));
     }, Math.max(1, scanMinutes) * 60_000);
     timer.unref?.();
   }
@@ -424,16 +418,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   const gossipScanMs = Number(process.env.GALGAME_GOSSIP_SCAN_MS ?? 30_000);
   if (gossipScanMs > 0) {
     const timer = setInterval(() => {
-      void (async () => {
-        try {
-          for (const roomId of await store.listRooms()) {
-            if (roomId === worldRoom || !(await loadRoomForIndex(store, roomId))) continue;
-            await gossip.step(roomId);
-          }
-        } catch (e) {
-          console.warn("[gossip] 定时波次失败：", e instanceof Error ? e.message : e);
-        }
-      })();
+      void scanRoomJobs(store, worldRoom, "gossip", (roomId) => gossip.step(roomId));
     }, gossipScanMs);
     timer.unref?.();
   }

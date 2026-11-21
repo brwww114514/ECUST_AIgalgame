@@ -22,6 +22,7 @@ import type {
   WorldState,
 } from "../../shared/src/index.ts";
 import type { EventLog } from "./store.ts";
+import { isRoomSyncFault } from "./store-write.ts";
 import type { AuditPolicy, AuditPort } from "./audit.ts";
 import { codeOf, errMessage } from "./turn.parse.ts";
 import { RETRYABLE } from "../../shared/src/index.ts";
@@ -273,14 +274,14 @@ export class DefaultTurn implements Turn {
       // 两阶段兜底：记忆写坏了不该毁掉整回合（玩家行动本身是合法的），去掉记忆重提一次。
       const applyBatch = async (ops: Proposal[], expectedSeq: number) => {
         let result = await this.deps.arbiter.apply(req.roomId, ops, causeForBudget, {
-          expectedSeq, turnBudget, commitEvidence: evidence,
+          expectedSeq, turnBudget, commitEvidence: evidence, captureState: true,
         });
         if (!result.ok && memoryProposals.length > 0 && result.rejected.length > 0) {
           const onlyMemory = result.rejected.every((r) => memoryProposals.includes(r.proposal));
           if (onlyMemory) {
             memoryRejected = true;
             result = await this.deps.arbiter.apply(req.roomId, [...moduleProposals, ...llmProposals], causeForBudget, {
-              expectedSeq, turnBudget, commitEvidence: evidence,
+              expectedSeq, turnBudget, commitEvidence: evidence, captureState: true,
             });
           }
         }
@@ -396,8 +397,8 @@ export class DefaultTurn implements Turn {
       // 落库成功才更新记忆索引：读路径与写路径共用同一份事件日志（可回放）
       for (const ev of applied.events) this.deps.memory.ingest(ev);
 
-      const after = await this.deps.store.snapshot(req.roomId);
       if (applied.events.length > 0) {
+        const after = applied.stateAfter ?? await this.deps.store.snapshot(req.roomId);
         yield emit({ type: "turn.patch", state: after, ops: applied.applied });
       }
 
@@ -405,11 +406,12 @@ export class DefaultTurn implements Turn {
       try {
         await this.deps.store.flush(req.roomId);
       } catch (e) {
+        if (isRoomSyncFault(e)) throw e;
         yield emit({ type: "turn.error", code: "E_STORE_FAULT", message: `落盘失败：${errMessage(e)}`, retryable: true });
         return;
       }
 
-      const seq = this.deps.store.seq(req.roomId);
+      const seq = applied.seq;
       // issue #34：apps/server 的消费者在收到 turn.commit 后立即 `break` 生成器，
       // yield 之后的语句不会执行；所有提交记账必须在 yield 之前完成。
       this.seen.set(key, events);
@@ -425,6 +427,7 @@ export class DefaultTurn implements Turn {
       }
       yield emit({ type: "turn.commit", turnId, seq, usage });
     } catch (e) {
+      if (isRoomSyncFault(e)) throw e;
       const code = codeOf(e);
       // 可重试 = 契约 RETRYABLE（格式/超时/限流）+ E_STORE_FAULT（写盘失败，本回合未 commit，重试安全，docs/03 §7）；
       // E_MODULE_FAULT 这类硬失败重试也没用，不该给前端重试按钮（issue #21-3 / PR #23 复审）

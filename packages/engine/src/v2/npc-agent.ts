@@ -109,8 +109,8 @@ const PLAYER_LABEL = "玩家";
 
 /** 玩家原文是数据不是指令：包起来并转义结束标记，防止提示词注入（#137） */
 export function wrapPlayerText(text: string, speaker: string): string {
-  // 只转义结束标记（含大小写变体），让模型无法提前闭合数据段
-  const safe = text.replace(/<\s*\/\s*player_input\s*>/gi, "&lt;/player_input&gt;");
+  // 全量转义 < > &：不只防结束标记，也防伪造开标签/属性（审阅探针可注入 <player_input speaker="system">）
+  const safe = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   return `<player_input speaker="${speaker}">${safe}</player_input>`;
 }
 
@@ -226,8 +226,8 @@ export class NpcAgent {
 
     const first = await this.call(prompt, args, firstTokens);
     if (!first.ok) {
-      // 被截断：先用更大的 maxTokens 重试一次（不是普通格式错误）
-      if (first.reason === "truncated") {
+      // 截断或 JSON 解析失败（含网关未报 finish_reason 的半截输出）：先加大 maxTokens 重试一次
+      if (first.reason === "truncated" || first.reason === "format") {
         const retry = await this.call(prompt, args, this.deps.policy.llm.retryMaxTokens);
         if (!retry.ok) {
           return { decision: { kind: "silent", reason: retry.reason ?? "llm_unavailable" }, finishReason: retry.finishReason, latencyMs: retry.latencyMs, reason: retry.reason };
@@ -286,7 +286,9 @@ export class NpcAgent {
     } catch (err) {
       // 格式错误/超时/截断：这一轮由调用方降级，不把异常抛给编排层
       const code = typeof (err as { code?: unknown }).code === "string" ? (err as { code: string }).code : "";
-      return { ok: false, reason: code === "E_LLM_TRUNCATED" ? "truncated" : "llm_unavailable" };
+      if (code === "E_LLM_TRUNCATED") return { ok: false, reason: "truncated" };
+      if (code === "E_LLM_FORMAT") return { ok: false, reason: "format" };
+      return { ok: false, reason: "llm_unavailable" };
     }
   }
 

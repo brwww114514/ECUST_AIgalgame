@@ -56,6 +56,7 @@ const sessionSchema = z.object({
   sceneBeats: z.array(sceneBeatSchema),
   sceneMemory: sceneMemorySchema.optional(),
   npcSpeechStreak: z.number().int().nonnegative(),
+  autoRounds: z.number().int().nonnegative().optional(),
   listenSince: z.number().optional(),
   lastLocId: z.string().optional(),
   visibility: z.enum(["private", "scene", "public"]),

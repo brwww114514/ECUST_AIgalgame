@@ -339,6 +339,7 @@ export function validateOp(
             payload: {
               memoryId, ownerId: "mem_world", content, tags, salience: 5, visibility, about, aboutUserIds,
               tier, worldId, sourceRefs, contentHash, status, at, turn: ctx.state.clock.day * 100 + ctx.state.clock.tick,
+              turnEra: 2,
             },
           },
         };
@@ -376,6 +377,7 @@ export function validateOp(
           type: "memory.written",
           payload: {
             memoryId, ownerId: owner.id, content, tags, salience, visibility, about, tier, at, turn: ctx.state.clock.day * 100 + ctx.state.clock.tick,
+              turnEra: 2,
             ...(userId ? { userId } : {}),
             ...(isStr(a.worldId) ? { worldId: a.worldId } : {}),
             ...(aboutUserIds.length > 0 ? { aboutUserIds } : {}),

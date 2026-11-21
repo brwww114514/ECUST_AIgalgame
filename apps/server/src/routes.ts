@@ -118,6 +118,8 @@ const ConversationBodySchema = z
     clientTurnId: z.string().min(1).max(120),
     userId: z.string().optional(),
     interject: z.string().min(1).optional(),
+    /** #136：玩家沉默时推进一轮 NPC-NPC 自主对话（与 utterance 互斥，由引擎裁决） */
+    auto: z.boolean().optional(),
     utterance: z
       .object({
         id: z.string().min(1).optional(),
@@ -128,6 +130,8 @@ const ConversationBodySchema = z
         action: z.string().max(2000).optional(),
         coverAction: z.string().max(2000).optional(),
         notice: z.string().max(2000).optional(),
+        // #135：关键台词提权（1–5）；docs/03 已登记，schema 漏了会让前端 400
+        salience: z.number().min(1).max(5).optional(),
       })
       .optional(),
   })
@@ -701,6 +705,7 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
             clientTurnId: body.clientTurnId,
             ...(utterance ? { utterance } : {}),
             ...(body.interject ? { interject: body.interject } : {}),
+            ...(body.auto ? { auto: true } : {}),
             ...(access.userId ? { userId: access.userId } : {}),
           })) out.push(ev);
           // #104：结算与事件流同源——只有真的 committed 才记 committed；
@@ -723,7 +728,11 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
                 }
               }
             } else if (errored) ledger.transition(turnScope, "failed");
-            else ledger.transition(turnScope, "unconfirmed");
+            else if (body.auto && out.some((e) => e.type === "conversation.notice")) {
+              // 只限 auto 超上限：既没调模型也没写世界，不能按 unconfirmed 占额度。
+              // 审核拦截（blocked）也只回 notice，但那是真实发生过的一次审核调用，维持 unconfirmed 原语义。
+              ledger.transition(turnScope, "failed");
+            } else ledger.transition(turnScope, "unconfirmed");
           }
         } catch (e) {
           // #104：异常路径按失败回收额度（未 committed），与 v1 /turns 的 catch 同口径；重放命中不结算

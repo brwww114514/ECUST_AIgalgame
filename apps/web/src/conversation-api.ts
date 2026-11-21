@@ -180,6 +180,25 @@ export async function runConversationTurn(
   );
 }
 
+/**
+ * 让在场 NPC 自己聊一轮（#136 方案 a）：玩家不说话，服务端推进一次自主轮。
+ * 受服务端 `maxAutoRounds` 限制，超限返回 conversation.notice(autoLimit)，不报错。
+ */
+export async function runConversationAuto(
+  roomId: string,
+  actorId: string,
+  clientTurnId: string,
+  h: ConversationStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  await postConversationStream(
+    `/api/v1/rooms/${encodeURIComponent(roomId)}/conversation`,
+    { actorId, clientTurnId, auto: true },
+    h,
+    signal,
+  );
+}
+
 /** 用户在选择器里填的一条说话/行动内容（mode 来自 GET /conversation/modes）。 */
 export interface UtteranceDraft {
   mode: string;

@@ -28,7 +28,7 @@ import { npcLocIdFromLinks, targetStillInScene } from "./npc-presence.ts";
 import { phaseLabel } from "./ui.ts";
 import type { Line, LineKind } from "./ui.ts";
 import type { ConversationEvent } from "../../../packages/shared/src/contract/v2.ts";
-import { detectConversation, fetchUtteranceModes, runConversationTurn, runConversationUtterance } from "./conversation-api.ts";
+import { detectConversation, fetchUtteranceModes, runConversationAuto, runConversationTurn, runConversationUtterance } from "./conversation-api.ts";
 import type { UtteranceDraft, UtteranceModeInfo } from "./conversation-api.ts";
 import { DEFAULT_LISTEN_TIMEOUT_MS, initialConversationView, isListeningExpired, linesFromView, pendingLinesFor, reduceConversationView } from "./conversation-view.ts";
 import type { ConversationView } from "./conversation-view.ts";
@@ -569,10 +569,10 @@ const token = scopeRef.current.current();
    * 与 v1 完全并行：convMode 不是 v2 时根本不会走到这里。
    */
   const dispatchConversationTurn = useCallback(
-    async (raw: string, targetNpc: { id: string; name: string } | null, echo: boolean, reuseId?: string, utterance?: UtteranceDraft) => {
+    async (raw: string, targetNpc: { id: string; name: string } | null, echo: boolean, reuseId?: string, utterance?: UtteranceDraft, auto = false) => {
       const base = raw.trim();
       // contentless 类型（如 signal）正文可空，只靠 action 表达；其余类型必须非空
-      if ((!base && !utterance) || busy || !roomId || !actorId) return;
+      if ((!base && !utterance && !auto) || busy || !roomId || !actorId) return;
       const token = scopeRef.current.current();
       const current = () => scopeRef.current.isCurrent(token.version);
       // 没有完整 utterance 时退回 #85 别名端点：它只收自然语言 input，目标靠 targetNpcId 传，
@@ -648,7 +648,10 @@ const token = scopeRef.current.current();
         },
       };
       try {
-        if (utterance) {
+        if (auto) {
+          // #136：玩家不说话，让在场 NPC 自己聊一轮（受服务端 maxAutoRounds 限制）
+          await runConversationAuto(roomId, actorId, clientTurnId, handlers, token.signal);
+        } else if (utterance) {
           // demo：完整 utterance（mode/target/content/action）走规范端点
           await runConversationUtterance(roomId, actorId, utterance, clientTurnId, handlers, token.signal);
         } else {
@@ -684,6 +687,12 @@ const token = scopeRef.current.current();
     },
     [actorId, armListenTimer, busy, disarmListenTimer, expireSession, refreshSaves, refreshState, renderConv, roomId, v2Modes],
   );
+
+  /** #136：让在场 NPC 自己聊一轮（玩家不说话）；服务端按 maxAutoRounds 限流 */
+  const autoRound = useCallback(() => {
+    if (convMode !== "v2" || busy) return;
+    void dispatchConversationTurn("", null, false, undefined, undefined, true);
+  }, [busy, convMode, dispatchConversationTurn]);
 
   /** v2 demo：从 ChatPanel 的选择器提交一条完整 utterance（@谁 + 方式 + 说话/行动） */
   const sendV2Utterance = useCallback(
@@ -1103,6 +1112,7 @@ await runTurn(
             onLoadEarlier={() => void loadEarlier()}
             v2Modes={convMode === "v2" ? v2Modes : undefined}
             onSendUtterance={convMode === "v2" ? sendV2Utterance : undefined}
+            onAutoRound={convMode === "v2" ? autoRound : undefined}
             pendingLines={pendingLines}
           />
         )}

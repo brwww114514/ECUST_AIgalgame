@@ -55,7 +55,7 @@ import { SessionStore } from "./sessions.ts";
 import { AuthService } from "./auth.ts";
 import { TurnLedger } from "./quota.ts";
 import { AdminLog } from "./admin-log.ts";
-import { loadSceneDescs, offlineNarrative } from "./offline-narrator.ts";
+import { loadSceneDescs, offlineNarrative, resolveSceneDesc, sceneByName } from "./offline-narrator.ts";
 import { LlmSwitch } from "./llm-switch.ts";
 import { LlmSettings, loadPersistedLlmSettings } from "./settings.ts";
 import { appearanceById, loadScenarios } from "./scenarios.ts";
@@ -166,6 +166,9 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
 
   // 离线叙述用到的场景描述（内容数据，缺文件也不影响启动）
   const sceneDescs = await loadSceneDescs(path.join(contentDir, "modules", "map", "data", "world_map.json"));
+  // canon 名 → locId：地图点位与 canon 的**名字**并不一致（图书馆 vs 图文信息中心），
+  // 但 id 是对齐的；名字回退时先经 canon 解析成 id，避免 5 个地点全 miss（#134）。
+  const canonLocIdByName = new Map(canon.locs.map((loc) => [loc.name, loc.id]));
 
   // 模型端口用开关包一层：Turn/Map/Dialogue 都持有同一个 LlmSwitch，
   // 玩家在界面里提交 key 后，设置服务替换内部实现即可生效，不用重启。
@@ -372,8 +375,8 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   // 恢复（独立文件、不进 EventLog）；坏档/缺档降级为新会话（旧会话 closed），不拖垮启动。
   const conversationModes = await loadModes(path.join(contentRoot, "v2", "utterance-modes.json"));
   const conversationScene: SceneAgentPort = {
-    async describe({ locName }) {
-      return locName ? (sceneDescs.get(locName) ?? "") : "";
+    async describe({ locId, locName }) {
+      return resolveSceneDesc(sceneDescs, canonLocIdByName, { locId, locName });
     },
     async summarize({ recent }) {
       return recent.slice(-3).join(" / ");
@@ -420,6 +423,20 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
     const timer = setInterval(() => {
       void scanRoomJobs(store, worldRoom, "gossip", (roomId) => gossip.step(roomId));
     }, gossipScanMs);
+    timer.unref?.();
+  }
+
+  // #136：插话超时恢复（listening → speaking）。没这个 tick，玩家点了插话又不说话，
+  // 会话会一直卡在 listening；原来的 resumeExpired() 没有任何调用方。
+  const conversationTickMs = Number(process.env.GALGAME_CONVERSATION_TICK_MS ?? 5_000);
+  if (conversationTickMs > 0) {
+    const timer = setInterval(() => {
+      try {
+        conversation.resumeExpired(now());
+      } catch (e) {
+        console.warn("[conversation] 插话超时恢复失败：", e instanceof Error ? e.message : e);
+      }
+    }, conversationTickMs);
     timer.unref?.();
   }
 

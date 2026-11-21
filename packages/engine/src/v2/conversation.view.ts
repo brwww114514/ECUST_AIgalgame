@@ -85,7 +85,11 @@ export function projectConversationEvents(
       case "conversation.mental":
         break;
       case "conversation.utterance":
-        if (allowed && ev.delivery.to === viewer) out.push(ev);
+        if (allowed && ev.delivery.to === viewer) {
+          // 只有被指名的那一方能看到 target；旁听者拿到 target 等于泄露"谁在跟谁说悄悄话"
+          const { target, ...rest } = ev.delivery;
+          out.push({ ...ev, delivery: viewer === target ? ev.delivery : rest });
+        }
         break;
       case "conversation.committed":
         out.push({

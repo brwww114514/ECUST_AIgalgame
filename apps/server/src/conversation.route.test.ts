@@ -816,12 +816,19 @@ describe("issue #130 引擎新行为的 HTTP 集成（#131/#136）", () => {
   });
 
   it("审阅 P2：utterance.salience 被 schema 接受（docs/03 已登记，之前 .strict() 会 400）", async () => {
-    const { app, roomId, actorId } = await appWith();
+    const { app, deps, roomId, actorId } = await appWith();
     const res = await app.inject({
       method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
       payload: { actorId, clientTurnId: "sal-1", utterance: { id: "u-sal", mode: "broadcast", content: "记一下", salience: 4 } },
     });
     expect(res.statusCode).toBe(200);
+    // 端到端：salience 4 必须落成 memory.write.salience=80（不是只验证「不 400」）
+    const envs = await (deps.store as EventLog).events(roomId, 0);
+    const written = envs.filter((e) => e.type === "memory.written")
+      .map((e) => e.payload as { content?: string; salience?: number })
+      .filter((p) => (p.content ?? "").includes("记一下"));
+    // docs/03 约定 salience 是 1–5 档（打分权重 salience/5），引擎内部归一后仍是 4
+    expect(written.at(-1)?.salience).toBe(4);
     await app.close();
   });
 

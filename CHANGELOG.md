@@ -29,7 +29,7 @@
 - **投递行玩家标注**：`nameFor` 把 `kind === "plr"` 的实体显示为「玩家」（不再露出实体名「你」）；自己的台词显示「你说 → X」/「你公开说」，不再误标「你是旁听」；定向通知里的 `nameOf` 同步走该映射，`{target}` 替换为「玩家」。
 
 ### 变更
-- 验证：`tsc` 0 错；`vitest` 101 文件 **809 例**全过；`build:web` 通过；`check:contract` 8/8（3.7.0）。
+- 验证：`tsc` 0 错；`vitest` 101 文件 **810 例**全过；`build:web` 通过；`check:contract` 8/8（3.7.0）。
 - `CONTRACT_VERSION` 3.6.2 → 3.7.0（只增可选字段 `Delivery.target`、`Utterance.salience`、`LlmResult.finishReason/traceId`、`committed.outcomes`、请求体 `auto`，新增错误码 `E_LLM_TRUNCATED`；见 docs/03 §10.27）。
 
 ## v0.5.6（候选 tag，尚未打；发版时决定）— 2026-11-20 PR #123 打回修复批（14 commits，CONTRACT 3.6.0 不变）

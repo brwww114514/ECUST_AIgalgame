@@ -7,7 +7,7 @@ import { loadConversationPolicy, loadModes } from "./delivery.ts";
 import { NpcAgent, buildNpcPrompt, formatDeliveryFor } from "./npc-agent.ts";
 import { SceneManager } from "./scene.ts";
 import { projectConversationEvents } from "./conversation.view.ts";
-import { memoryLinesFor, sanitizeReason } from "./conversation.step.ts";
+import { memoryLinesFor, mergeMemoryText, ownSpeechLines, sanitizeReason } from "./conversation.step.ts";
 import { memoryProposals } from "./conversation.helpers.ts";
 import { TalkBudget } from "./talk-budget.ts";
 import { normalizeTurn } from "../memory.ts";
@@ -238,6 +238,21 @@ describe("#135 记忆 turn 口径", () => {
     expect(normalizeTurn(0)).toBe(0);
     expect(Number.isNaN(normalizeTurn(Number.NaN))).toBe(true);
     expect(normalizeTurn(3, false)).toBe(3); // turnEra=2 的新事件不再做旧口径变换
+  });
+});
+
+describe("审阅 P1-c 同日：自己刚说的话固定置顶（tick 恒 0 场景）", () => {
+  const hit = (id: string, turn: number, content: string, salience = 100) => ({
+    record: { id, roomId: "room_1", ownerId: "npc_lin", content, tags: ["dialogue"], about: [], salience, visibility: "public" as const, tier: "long" as const, turn, status: "current" as const, sourceRefs: [] },
+    score: 1,
+  }) as never;
+  it("同日 5 条 100 分旧记忆 + 自己刚说的 60 分台词：自己的话仍在前两行", () => {
+    const old = [hit("m1", 100, "旧1"), hit("m2", 100, "旧2"), hit("m3", 100, "旧3"), hit("m4", 100, "旧4"), hit("m5", 100, "旧5")];
+    const own = ownSpeechLines([{ turn: 100, deliveries: [{ speaker: "npc_lin", to: "npc_lin", channels: ["content"], content: "今天刚说的话" }] as never }], "npc_lin");
+    const text = mergeMemoryText(own, memoryLinesFor([...old, hit("m_today", 100, "今天刚说的话", 60)], "图书馆"));
+    const lines = text.split("\n");
+    expect(lines[0]).toContain("今天刚说的话");
+    expect(text.match(/今天刚说的话/g)).toHaveLength(1);
   });
 });
 

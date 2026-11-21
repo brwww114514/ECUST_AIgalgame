@@ -248,6 +248,34 @@ const MEMORY_LINES_MAX = 5;
  * 记忆注入行（#135）：最近 1–2 条自己的话固定占位，不参与打分排序，
  * 避免「当天刚说的话」被 5 条高分旧记忆挤出窗口（P1-c）。
  */
+/** 最近 1–2 条自己的台词（来自本会话已发生的投递；同日 tick 恒 0 时比 maxTurn 可靠） */
+export function ownSpeechLines(rounds: readonly Round[], npcId: ActorId): string {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const r of rounds) {
+    for (const d of r.deliveries) {
+      if (d.speaker !== npcId) continue;
+      const text = (d.content ?? d.action ?? "").trim();
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      out.push(`- [第${Math.floor(r.turn / 100) || 1}天] 你说过：${text}`);
+    }
+  }
+  return out.slice(-2).join("\n");
+}
+
+/** 自己的台词固定前置；与记忆召回行按「正文」去重，避免同一句出现两次 */
+export function mergeMemoryText(own: string, recalled: string): string {
+  const ownLines = own.split("\n").filter(Boolean);
+  const key = (line: string) => {
+    const i = line.indexOf("：");
+    return (i >= 0 ? line.slice(i + 1) : line).trim();
+  };
+  const ownKeys = new Set(ownLines.map(key));
+  const rest = recalled.split("\n").filter((l) => l && !ownKeys.has(key(l)));
+  return [...ownLines, ...rest].slice(0, MEMORY_LINES_MAX + 2).join("\n");
+}
+
 export function memoryLinesFor(hits: readonly MemoryHit[], locName?: string): string {
   if (hits.length === 0) return "";
   const maxTurn = hits.reduce((m, h) => Math.max(m, h.record.turn), -1);
@@ -281,7 +309,10 @@ async function decideStep(ctx: StepCtx, utterance?: Utterance): Promise<NpcResul
       ...(loc.locName ? { tags: [loc.locName] } : {}),
       about: [ctx.playerId, utterance?.speaker].filter((x): x is ActorId => typeof x === "string" && x !== ""),
     });
-    const memoryText = memoryLinesFor(own, loc.locName);
+    const memoryText = mergeMemoryText(
+      ownSpeechLines(recentBySession.get(s) ?? [], npcId),
+      memoryLinesFor(own, loc.locName),
+    );
     const r = await deps.npc.decide({
       npcId,
       npcName: nameOf(npcId),

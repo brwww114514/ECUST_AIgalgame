@@ -9,6 +9,7 @@ import {
   isConversationAvailable,
   runConversationTurn,
   runConversationUtterance,
+  runConversationAuto,
   validateUtteranceDraft,
 } from "./conversation-api.ts";
 import type { ConversationStreamHandlers } from "./conversation-api.ts";
@@ -198,5 +199,23 @@ describe("runConversationUtterance（规范端点 POST body 形状）", () => {
       utterance: { mode: "whisper", target: "npc_lin", content: "你叫什么", action: "凑近压低声音" },
     });
     expect((body.utterance as Record<string, unknown>).speaker).toBeUndefined();
+  });
+});
+
+describe("runConversationAuto（#136 自主轮 POST body）", () => {
+  it("POST /conversation，body 只有 actorId/clientTurnId/auto，不伪造 utterance", async () => {
+    let url = "";
+    let body: Record<string, unknown> = {};
+    const fetchMock = vi.fn(async (u: string, init: RequestInit) => {
+      url = u;
+      body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return sseResponse([
+        'event: conversation.committed\ndata: {"type":"conversation.committed","sessionId":"s","turn":2,"proposals":[],"state":{}}\n\n',
+      ]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await runConversationAuto("r1", "plr", "ct-auto", {});
+    expect(url).toBe("/api/v1/rooms/r1/conversation");
+    expect(body).toEqual({ actorId: "plr", clientTurnId: "ct-auto", auto: true });
   });
 });

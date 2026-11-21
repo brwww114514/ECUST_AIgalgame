@@ -60,6 +60,8 @@ export interface ChatPanelProps {
   onLoadEarlier: () => void;
   /** v2 会话：说话类型清单（来自 GET /conversation/modes）；不提供则走 v1 老流程 */
   v2Modes?: UtteranceModeInfo[];
+  /** v2 会话：让在场 NPC 自己聊一轮（玩家不说话）；不提供则不显示按钮 */
+  onAutoRound?: () => void;
   /** v2 会话：提交一条完整 utterance（mode/target/content/action），与 onSend 二选一 */
   onSendUtterance?: (draft: UtteranceDraft) => void;
   /** v2 回合的乐观玩家行：等引擎把自己的 delivery 投回来就清掉（避免点了发送没反应） */
@@ -93,6 +95,7 @@ export default function ChatPanel({
   onLoadEarlier,
   v2Modes,
   onSendUtterance,
+  onAutoRound,
   pendingLines,
 }: ChatPanelProps) {
   const [talking, setTalking] = useState<{ id: string; name: string } | null>(null);
@@ -427,6 +430,17 @@ export default function ChatPanel({
                 ))}
               </select>
             </label>
+            {onAutoRound && (
+              <button
+                type="button"
+                className="v2-auto-round"
+                onClick={onAutoRound}
+                disabled={busy || !state}
+                title="让在场 NPC 自己聊一轮（玩家不说话）"
+              >
+                让他们继续聊
+              </button>
+            )}
             {currentMode?.requiresAction && (
               <input
                 className="v2-action"

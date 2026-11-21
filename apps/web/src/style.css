@@ -1029,3 +1029,15 @@ dl { margin:0; } .row { display:flex; justify-content:space-between; font-size:1
 .dbg-attrs code { color:#8ec5ff; }
 .dbg-event { display:flex; align-items:center; gap:12px; }
 .dbg-event code { color:#7fd1a8; }
+
+.v2-auto-round {
+  align-self: center;
+  padding: 4px 10px;
+  border: 1px dashed var(--line, #c9c4b8);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.v2-auto-round:disabled { opacity: 0.5; cursor: not-allowed; }

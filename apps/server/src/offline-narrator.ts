@@ -58,6 +58,21 @@ export async function loadSceneDescs(file: string): Promise<Map<string, SceneDes
 }
 
 /** 名字反查（离线叙述器按玩家输入里的场景名找描述） */
+/**
+ * 场景描述解析（#134）：优先 locId；名字回退时先经 canon 名→id 解析，再做同名匹配。
+ * canon 的「图书馆」与地图的「图文信息中心」名字不同但 id 对齐，只按名字找会全 miss。
+ */
+export function resolveSceneDesc(
+  descs: Map<string, SceneDesc>,
+  canonIdByName: Map<string, string>,
+  q: { locId?: string; locName?: string },
+): string {
+  const byId = q.locId ? descs.get(q.locId) : undefined;
+  const viaCanon = !byId && q.locName ? descs.get(canonIdByName.get(q.locName) ?? "") : undefined;
+  const byName = q.locName ? sceneByName(descs, q.locName) : undefined;
+  return (byId ?? viaCanon ?? byName)?.desc ?? "";
+}
+
 export function sceneByName(descs: Map<string, SceneDesc>, name: string): SceneDesc | undefined {
   for (const d of descs.values()) if (d.name === name) return d;
   return undefined;

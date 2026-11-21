@@ -3,7 +3,7 @@
  * 观察类不重复场景描述、缺失场景的兜底、缺失数据文件不炸启动。
  */
 import { describe, expect, it } from "vitest";
-import { loadSceneDescs, offlineNarrative, parsePromptContext } from "./offline-narrator.ts";
+import { loadSceneDescs, offlineNarrative, parsePromptContext, resolveSceneDesc } from "./offline-narrator.ts";
 
 function messages(input: string, loc: string, day = 1, phase = "morning"): { role?: string; content?: string }[] {
   return [
@@ -61,5 +61,28 @@ describe("loadSceneDescs", () => {
   it("文件不存在返回空表，不抛错", async () => {
     const map = await loadSceneDescs("C:/nonexistent/world_map.json");
     expect(map.size).toBe(0);
+  });
+});
+
+describe("resolveSceneDesc（#134 canon 名 → 地图点位 id 回退）", () => {
+  const descs = new Map([
+    ["loc_library", { name: "图文信息中心", desc: "图文信息中心的旧馆三层。" }],
+  ]);
+  const canon = new Map([["图书馆", "loc_library"]]);
+
+  it("给 locId 直接命中", () => {
+    expect(resolveSceneDesc(descs, canon, { locId: "loc_library" })).toContain("旧馆三层");
+  });
+
+  it("只给 canon 名（图书馆）也能经 id 解析命中，而不是按名字全 miss", () => {
+    expect(resolveSceneDesc(descs, canon, { locName: "图书馆" })).toContain("旧馆三层");
+  });
+
+  it("名字与地图一致时仍走同名匹配", () => {
+    expect(resolveSceneDesc(descs, canon, { locName: "图文信息中心" })).toContain("旧馆三层");
+  });
+
+  it("都查不到时返回空串，不抛错", () => {
+    expect(resolveSceneDesc(descs, canon, { locName: "不存在的地方" })).toBe("");
   });
 });

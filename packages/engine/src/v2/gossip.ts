@@ -223,7 +223,7 @@ export class GossipHost {
   /** 一次后台波次：每个有未读消息的 NPC 独立决策；先预算后调用 */
   step(roomId: RoomId, viewer?: ActorId): Promise<GossipEvent[]> {
     return this.serial(roomId, async () => {
-      this.deps.budget.beginTick(roomId);
+      this.deps.budget.beginTick(roomId, "gossip");
       const state: WorldState = this.deps.store.state(roomId);
       const out: GossipEvent[] = [];
       const proposals: { op: "msg.send" | "memory.write"; args: Record<string, unknown>; reason: string; by: string }[] = [];
@@ -251,12 +251,12 @@ export class GossipHost {
             return fresh;
           });
         if (inbox.length === 0) continue;
-        const reason = this.deps.budget.canSpeak(roomId, npc.id, this.now());
+        const reason = this.deps.budget.canSpeak(roomId, npc.id, "gossip", this.now());
         if (reason !== "ok") {
-          out.push({ type: "gossip.dropped", id: npc.id, reason, nextAt: this.deps.budget.nextEligible(roomId, npc.id, this.now()) });
+          out.push({ type: "gossip.dropped", id: npc.id, reason, nextAt: this.deps.budget.nextEligible(roomId, npc.id, "gossip", this.now()) });
           continue;
         }
-        this.deps.budget.recordCall(roomId);
+        this.deps.budget.recordCall(roomId, npc.id, "gossip");
         calls += 1;
         const prompt = buildGossipPrompt({
           npcId: npc.id, npcName: npc.name, inbox,
@@ -332,7 +332,7 @@ export class GossipHost {
       }
       this.deps.messages.ingest(result.events);
       for (const m of recordsOf(result.events)) {
-        this.deps.budget.recordSent(roomId, m.from);
+        this.deps.budget.recordSent(roomId, m.from, "gossip");
         if (viewer === undefined || viewer === m.from || viewer === m.to) out.push({ type: "gossip.message", message: m });
       }
       await this.deps.store.flush(roomId);

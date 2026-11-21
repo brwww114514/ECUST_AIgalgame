@@ -56,7 +56,9 @@ afterAll(() => {
   else process.env.GALGAME_CONVERSATION_MAX_SESSIONS = prevMax;
 });
 
-async function appWith(): Promise<{ app: FastifyInstance; deps: App; roomId: string; actorId: string; llm: MockLlm }> {
+type LlmHandler = (req: { messages?: { role: string; content: string }[] }) => string;
+
+async function appWith(handler?: LlmHandler): Promise<{ app: FastifyInstance; deps: App; roomId: string; actorId: string; llm: MockLlm }> {
   process.env.GALGAME_GOSSIP_SCAN_MS = "0";
   const deps = await createApp(testConfig());
   const { roomId, actorId } = await deps.createRoom("solo", "u_owner");
@@ -65,7 +67,7 @@ async function appWith(): Promise<{ app: FastifyInstance; deps: App; roomId: str
   const modes = await loadModes(MODES);
   const policy = await loadConversationPolicy(POLICY);
   const scene: SceneAgentPort = { describe: async () => "test scene", summarize: async () => "test summary" };
-  const llm = new MockLlm({ handler: () => JSON.stringify({ kind: "silent", reason: "test" }) });
+  const llm = new MockLlm({ handler: handler ?? (() => JSON.stringify({ kind: "silent", reason: "test" })) });
   const audit = new NoopAudit();
   const store = deps.store as EventLog;
   const arbiter = deps.arbiter;
@@ -333,14 +335,14 @@ describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
     const { app, roomId, actorId } = await appWith();
     const url = `/api/v1/rooms/${roomId}/conversation`;
     const withoutActor = await app.inject({
-      method: "POST", url, headers: { "x-user-id": "u_owner" }, payload: { clientTurnId: "intercept-1", interject: "npc_x" },
+      method: "POST", url, headers: { "x-user-id": "u_owner" }, payload: { clientTurnId: "intercept-1", interject: "npc_lin" },
     });
     expect(withoutActor.statusCode).toBe(400);
 
     // 带本人 actorId 时插话只切 phase，不推进回合；引擎收到的 interject 是 NPC id 而非玩家 id
     const withActor = await app.inject({
       method: "POST", url, headers: { "x-user-id": "u_owner" },
-      payload: { actorId, clientTurnId: "intercept-2", interject: "npc_x" },
+      payload: { actorId, clientTurnId: "intercept-2", interject: "npc_lin" },
     });
     expect(withActor.statusCode).toBe(200);
     expect(sse(withActor.body).map((e) => e.type)).toContain("conversation.phase");
@@ -364,7 +366,7 @@ describe("dev/v2 群聊 HTTP 端点（issue #89）", () => {
     //    不崩且 200。显式锁住该行为，避免后续把两者同时给当成非法输入而误改（#106 记文档口径）。
     const both = await app.inject({
       method: "POST", url, headers: H,
-      payload: { actorId, clientTurnId: "boundary-both", interject: "npc_x", utterance: { mode: "broadcast", content: "大家好" } },
+      payload: { actorId, clientTurnId: "boundary-both", interject: "npc_lin", utterance: { mode: "broadcast", content: "大家好" } },
     });
     expect(both.statusCode).toBe(200);
     expect(both.headers["content-type"]).toContain("text/event-stream");
@@ -732,6 +734,151 @@ describe("dev/v2 群聊端点（issue #85/#89 契约对齐）", () => {
     });
     expect(res.statusCode).toBe(200);
     expect((await deps.store.snapshot(roomId)).entities[npcId]!.attrs.knows_name).toBe(true);
+    await app.close();
+  });
+});
+
+describe("审阅 #144：投递行把玩家显示成「玩家」而不是「你」", () => {
+  const H = { "x-user-id": "u_owner" };
+  it("NPC 对玩家定向说话：旁听 NPC 的提示词是「→ 玩家（你是旁听）」+ notice 也是「玩家」", async () => {
+    let plr = "";
+    const prompts: string[] = [];
+    const { app, deps, roomId, actorId } = await appWith((req) => {
+      const sys = String(req.messages?.[0]?.content ?? "");
+      prompts.push(sys);
+      if (!sys.includes("【这一轮】")) return JSON.stringify({ kind: "silent", reason: "init" });
+      return JSON.stringify({
+        kind: "speak",
+        utterance: { mode: "addressed", target: plr, content: "只跟你说", action: "压低声音" },
+      });
+    });
+    plr = actorId;
+    const first = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "pl-1", utterance: { id: "u-pl1", mode: "broadcast", content: "早" } },
+    });
+    expect(first.statusCode).toBe(200);
+    const second = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "pl-2", utterance: { id: "u-pl2", mode: "broadcast", content: "然后呢" } },
+    });
+    expect(second.statusCode).toBe(200);
+    const seen = prompts.filter((p) => p.includes("【更早的对话】"));
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.some((p) => p.includes("→ 玩家（你是旁听"))).toBe(true);
+    expect(seen.some((p) => p.includes("这句话是对 玩家 说的"))).toBe(true);
+    expect(seen.some((p) => p.includes("→ 你（你是旁听"))).toBe(false);
+    await app.close();
+  });
+});
+
+describe("issue #130 引擎新行为的 HTTP 集成（#131/#136）", () => {
+  const H = { "x-user-id": "u_owner" };
+  const npcIdsOf = (deps: App, roomId: string): string[] => {
+    const st = (deps.store as EventLog).state(roomId);
+    return st.room.scene.presentIds.filter((id) => st.entities[id]?.kind === "npc");
+  };
+
+  it("#136 auto 轮：玩家沉默也能推进 NPC 决策，且回放里没有玩家台词", async () => {
+    const { app, deps, roomId, actorId, llm } = await appWith(() => JSON.stringify({ kind: "speak", utterance: { mode: "broadcast", content: "我先说" } }));
+    expect(npcIdsOf(deps, roomId).length).toBeGreaterThan(0);
+    const callsBefore = llm.calls;
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "auto-1", auto: true },
+    });
+    expect(res.statusCode).toBe(200);
+    const events = sse(res.body);
+    expect(events.some((e) => e.type === "conversation.committed")).toBe(true);
+    expect(llm.calls).toBeGreaterThan(callsBefore);
+    expect(events.some((e) => e.type === "conversation.utterance" && (e.data.delivery as { speaker: string }).speaker === actorId)).toBe(false);
+    await app.close();
+  });
+
+  it("#136 interject + 同请求台词：台词不丢，phase listening → speaking", async () => {
+    const { app, deps, roomId, actorId } = await appWith();
+    const npc = npcIdsOf(deps, roomId)[0]!;
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: {
+        actorId, clientTurnId: "int-1", interject: npc,
+        utterance: { id: "u-int", mode: "broadcast", content: "等一下" },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const events = sse(res.body);
+    const contents = events.filter((e) => e.type === "conversation.utterance").map((e) => (e.data.delivery as { content?: string }).content);
+    expect(contents).toContain("等一下");
+    const phases = events.filter((e) => e.type === "conversation.phase").map((e) => e.data.phase);
+    expect(phases).toContain("listening");
+    expect(phases).toContain("speaking");
+    await app.close();
+  });
+
+  it("审阅 P2：utterance.salience 被 schema 接受（docs/03 已登记，之前 .strict() 会 400）", async () => {
+    const { app, deps, roomId, actorId } = await appWith();
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "sal-1", utterance: { id: "u-sal", mode: "broadcast", content: "记一下", salience: 4 } },
+    });
+    expect(res.statusCode).toBe(200);
+    // 端到端：salience 4 必须落成 memory.write.salience=80（不是只验证「不 400」）
+    const envs = await (deps.store as EventLog).events(roomId, 0);
+    const written = envs.filter((e) => e.type === "memory.written")
+      .map((e) => e.payload as { content?: string; salience?: number })
+      .filter((p) => (p.content ?? "").includes("记一下"));
+    // docs/03 约定 salience 是 1–5 档（打分权重 salience/5），引擎内部归一后仍是 4
+    expect(written.at(-1)?.salience).toBe(4);
+    await app.close();
+  });
+
+  it("#131/#137 NPC prompt：在场者段、这一轮段、玩家文本被 <player_input> 包裹", async () => {
+    const prompts: string[] = [];
+    const { app, deps, roomId, actorId } = await appWith((req) => {
+      prompts.push(String(req.messages?.[0]?.content ?? ""));
+      return JSON.stringify({ kind: "silent", reason: "capture" });
+    });
+    expect(npcIdsOf(deps, roomId).length).toBeGreaterThan(0);
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: { actorId, clientTurnId: "p-131", utterance: { id: "u-131", mode: "broadcast", content: "大家早" } },
+    });
+    expect(res.statusCode).toBe(200);
+    const npcPrompt = prompts.find((p) => p.includes("【在场者】"));
+    expect(npcPrompt).toBeTruthy();
+    expect(npcPrompt).toContain("【这一轮】");
+    // #131 / 审阅 P1-a：在场者里玩家显示「玩家」，不能是实体名「你」
+    expect(npcPrompt).toMatch(/plr_[a-z0-9_]+（玩家）/);
+    expect(npcPrompt).not.toMatch(/plr_[a-z0-9_]+（你/);
+    expect(npcPrompt).toContain('<player_input speaker="玩家">');
+    expect(npcPrompt).toContain("大家早");
+    await app.close();
+  });
+});
+
+describe("审阅 #144 P1-b：插话后的当轮台词必须有 NPC 回应", () => {
+  const H = { "x-user-id": "u_owner" };
+  it("interject + utterance：phase 先回到 speaking，committed.outcomes 里有 speak", async () => {
+    const { app, deps, roomId, actorId } = await appWith((req) => {
+      const sys = String(req.messages?.[0]?.content ?? "");
+      const me = /【你】\s*([a-z0-9_]+)/.exec(sys)?.[1] ?? "npc_x";
+      return JSON.stringify({ kind: "speak", utterance: { id: `utt_${me}`, speaker: me, mode: "broadcast", content: "我接着说" } });
+    });
+    const st = (deps.store as EventLog).state(roomId);
+    const npc = st.room.scene.presentIds.find((id) => st.entities[id]?.kind === "npc")!;
+    const res = await app.inject({
+      method: "POST", url: `/api/v1/rooms/${roomId}/conversation`, headers: H,
+      payload: {
+        actorId, clientTurnId: "int-2", interject: npc,
+        utterance: { id: "u-int2", mode: "broadcast", content: "我插一句" },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const events = sse(res.body);
+    const committed = events.find((e) => e.type === "conversation.committed");
+    const outcomes = (committed?.data.outcomes ?? []) as { kind: string; reason?: string }[];
+    expect(outcomes.some((o) => o.kind === "speak")).toBe(true);
+    expect(outcomes.every((o) => o.kind !== "silent" || o.reason !== "phase_or_cap")).toBe(true);
     await app.close();
   });
 });

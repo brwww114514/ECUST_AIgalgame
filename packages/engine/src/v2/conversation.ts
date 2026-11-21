@@ -4,7 +4,6 @@
  * 世界状态的所有变更仍只有一条路（I1）；本文件不碰 store.append、不碰文件。
  */
 import type {
-  ApplyResult,
   ConversationEvent,
   ConversationSessionV2,
   ConversationSpecV2,
@@ -16,9 +15,11 @@ import type {
   ConversationPolicy,
   Registry,
   Delivery,
+  NpcOutcome,
 } from "../../../shared/src/index.ts";
 import type { EventLog } from "../store.ts";
-import type { DefaultArbiter } from "../arbiter.ts";
+import { isRoomSyncFault } from "../store-write.ts";
+import type { ArbiterApplyResult, DefaultArbiter } from "../arbiter.ts";
 import type { EventSourcedMemory } from "../memory.ts";
 import { conversationSnapshotSchema, type ConversationSnapshot, type RestoreResult } from "./conversation-snapshot.ts";
 import type { SceneManager } from "./scene.ts";
@@ -46,7 +47,7 @@ export interface ConversationDeps {
 interface PendingFlush {
   roomId: RoomId;
   s: ConversationSessionV2;
-  applied: ApplyResult;
+  applied: ArbiterApplyResult;
   out: ConversationEvent[];
   /** 本轮已审核的投递；只有重放提交成功才进入下一轮上下文 */
   fresh: Delivery[];
@@ -54,6 +55,10 @@ interface PendingFlush {
   retry?: StoreRetry;
   /** flush 失败前的 lastLocId；仅当期间未被别的回合推进时才用当前快照前移 */
   beforeLocId?: string;
+  /** 失败回合的 NPC 决策结果；重放提交时原样带回，避免 outcomes 丢失（审阅 P2） */
+  outcomes: NpcOutcome[];
+  /** 失败的是玩家沉默期的 auto 回合：重试成功后要补记 autoRounds */
+  auto?: boolean;
 }
 
 const MAX_SEEN = 256;
@@ -96,7 +101,12 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     this.sessions.set(session.id, session);
     this.trimSessions();
     session.sceneBeats.push(
-      await this.deps.scene.open(session.id, spec.roomId, locId ? state.entities[locId]?.name : undefined, spec.participants, locId),
+      await this.deps.scene.open(
+        session.id,
+        spec.roomId,
+        { ...(locId ? { locId } : {}), ...(locId && state.entities[locId]?.name ? { locName: state.entities[locId]!.name } : {}) },
+        spec.participants,
+      ),
     );
     return session;
   }
@@ -265,15 +275,14 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     if (!s || s.status === "closed") {
       return [{ type: "conversation.error", sessionId, code: "E_DIALOGUE_NOT_FOUND", message: this.deps.policy.messages.sessionNotFound }];
     }
-    // 放在幂等命中与会话校验之后：重放旧回合不应清空另一个 host 正在用的波次预算
-    this.deps.budget?.beginTick(s.roomId);
-
     // 落盘重试：flush 失败时只重试 flush；arbiter 写盘失败时提案从未落库，用同一 cause 重新裁决
     const pending = this.pendingFlush.get(key);
     if (pending) {
       let applied = pending.applied;
       if (pending.retry) {
-        applied = await this.deps.arbiter.apply(pending.roomId, pending.retry.ops, pending.retry.cause, { expectedSeq: pending.retry.expectedSeq });
+        applied = await this.deps.arbiter.apply(pending.roomId, pending.retry.ops, pending.retry.cause, {
+          expectedSeq: pending.retry.expectedSeq, captureState: true,
+        });
         if (!applied.ok) {
           const retryable = applied.error?.code === "E_STORE_FAULT";
           if (!retryable) this.pendingFlush.delete(key);
@@ -288,32 +297,53 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       }
       try {
         await this.deps.store.flush(pending.roomId);
-      } catch {
-        return [{ type: "conversation.error", sessionId, code: "E_STORE_FAULT", message: this.deps.policy.messages.storeUnavailable, retryable: true }];
+      } catch (error) {
+        const uncertain = isRoomSyncFault(error);
+        if (uncertain) this.pendingFlush.delete(key);
+        return [{
+          type: "conversation.error", sessionId, code: "E_STORE_FAULT",
+          message: uncertain ? error.message : this.deps.policy.messages.storeUnavailable,
+          retryable: !uncertain,
+        }];
       }
       // 用当前快照而非失败当时的快照：若期间别的回合已推进地点，不回写旧值
       if (pending.beforeLocId !== undefined && pending.s.lastLocId === pending.beforeLocId) {
-        pending.s.lastLocId = (await this.deps.store.snapshot(pending.roomId)).room.scene.locId;
+        pending.s.lastLocId = this.deps.store.state(pending.roomId).room.scene.locId;
       }
-      const done = await this.commitWithState(pending.s, applied);
+      const done = await this.commitWithState(pending.s, applied, pending.outcomes);
       const all = [...pending.out, done];
-      rememberRecent(pending.s, pending.fresh);
+      // 落盘重试成功后也要记账，否则同一轮 auto 会被重复放行
+      if (pending.auto) pending.s.autoRounds = (pending.s.autoRounds ?? 0) + 1;
+      rememberRecent(pending.s, pending.s.turn, pending.fresh);
       this.remember(key, all);
       this.pendingFlush.delete(key);
       return all;
     }
 
+    // 放在幂等命中、会话校验与落盘重试之后：重放/重试旧回合不应清空另一个 host 正在用的波次预算
+    this.deps.budget?.beginTick(s.roomId);
     const now = this.deps.now?.() ?? Date.now();
+    // #136：玩家沉默期的 NPC-NPC 自主推进，最多 maxAutoRounds 轮
+    if (input.auto) {
+      if (!input.utterance && (s.autoRounds ?? 0) >= this.deps.policy.maxAutoRounds) {
+        return [{ type: "conversation.notice", text: this.deps.policy.messages.autoLimit }];
+      }
+    }
     // ④ 只把本会话到期的 phase 事件塞进本回合返回流
     const out: ConversationEvent[] = [...this.resumeExpiredEvents(now, sessionId)];
     try {
-      await runStep(this.deps, s, input, out, now, (ss, a) => this.commitWithState(ss, a));
+      await runStep(this.deps, s, input, out, now, (ss, a, outcomes) => this.commitWithState(ss, a, outcomes));
     } catch (e) {
+      if (isRoomSyncFault(e)) {
+        // 提交结果待核对，丢弃本轮尚未发布的事件。
+        return [{ type: "conversation.error", sessionId, code: e.code, message: e.message, retryable: false }];
+      }
       if (e instanceof StoreFlushError) {
         // 先冻结 out 再追加错误，重试时才不会重复 yield 上一轮的 E_STORE_FAULT
         this.pendingFlush.set(key, {
           roomId: e.roomId, s, applied: e.applied, out: [...out], fresh: e.fresh,
-          beforeLocId: s.lastLocId, retry: e.retry,
+          beforeLocId: s.lastLocId, retry: e.retry, outcomes: e.outcomes,
+          auto: !!input.auto && !input.utterance,
         });
         this.trim(this.pendingFlush, MAX_PENDING);
         // ③ 外部事件只在提交成功后发布：失败时只回可重试错误
@@ -327,6 +357,9 @@ export class ConversationHostV2 implements ConversationTurnV2 {
           message: e instanceof Error ? e.message : String(e),
         });
       }
+    }
+    if (input.auto && !input.utterance && out.some((e) => e.type === "conversation.committed")) {
+      s.autoRounds = (s.autoRounds ?? 0) + 1;
     }
     if (!out.some((e) => e.type === "conversation.error" && e.retryable)) this.remember(key, out);
     return out;
@@ -357,7 +390,11 @@ export class ConversationHostV2 implements ConversationTurnV2 {
     this.trim(this.seen, MAX_SEEN);
   }
 
-  private async commitWithState(s: ConversationSessionV2, applied: ApplyResult): Promise<ConversationEvent> {
+  private async commitWithState(
+    s: ConversationSessionV2,
+    applied: ArbiterApplyResult,
+    outcomes: NpcOutcome[],
+  ): Promise<ConversationEvent> {
     const turn = ++s.turn;
     if (turn >= s.maxTurns) s.status = "closed";
     return {
@@ -365,7 +402,8 @@ export class ConversationHostV2 implements ConversationTurnV2 {
       sessionId: s.id,
       turn,
       proposals: applied.applied,
-      state: await this.deps.store.snapshot(s.roomId),
+      state: applied.stateAfter ?? await this.deps.store.snapshot(s.roomId),
+      ...(outcomes.length ? { outcomes } : {}),
     };
   }
 }

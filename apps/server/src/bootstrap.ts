@@ -55,12 +55,15 @@ import { SessionStore } from "./sessions.ts";
 import { AuthService } from "./auth.ts";
 import { TurnLedger } from "./quota.ts";
 import { AdminLog } from "./admin-log.ts";
-import { loadSceneDescs, offlineNarrative } from "./offline-narrator.ts";
+import { loadSceneDescs, offlineNarrative, resolveSceneDesc, sceneByName } from "./offline-narrator.ts";
 import { LlmSwitch } from "./llm-switch.ts";
 import { LlmSettings, loadPersistedLlmSettings } from "./settings.ts";
 import { appearanceById, loadScenarios } from "./scenarios.ts";
 import { createDebugGate } from "./debug.ts";
 import type { AppDeps } from "./routes.ts";
+import { isStoreFault } from "./store-fault.ts";
+import { prepareDurableDirectory } from "../../../packages/engine/src/store-write.ts";
+import { scanRoomJobs } from "./room-jobs.ts";
 
 interface CanonWorld {
   worldId: string;
@@ -114,6 +117,18 @@ export type App = AppDeps & {
   adminLog: AdminLog;
 };
 
+async function loadRoomForIndex(store: FileStore, roomId: string): Promise<boolean> {
+  try {
+    await store.load(roomId);
+    return true;
+  } catch (error) {
+    if (!isStoreFault(error)) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[store] 房间 ${roomId} 暂不可读：${message}`);
+    return false;
+  }
+}
+
 export async function createApp(cfg: ServerConfig): Promise<App> {
   const contentDir = path.resolve(cfg.contentDir);
   const canon = JSON.parse(await readFile(path.join(contentDir, "canon", "world.json"), "utf8")) as CanonWorld;
@@ -151,6 +166,9 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
 
   // 离线叙述用到的场景描述（内容数据，缺文件也不影响启动）
   const sceneDescs = await loadSceneDescs(path.join(contentDir, "modules", "map", "data", "world_map.json"));
+  // canon 名 → locId：地图点位与 canon 的**名字**并不一致（图书馆 vs 图文信息中心），
+  // 但 id 是对齐的；名字回退时先经 canon 解析成 id，避免 5 个地点全 miss（#134）。
+  const canonLocIdByName = new Map(canon.locs.map((loc) => [loc.name, loc.id]));
 
   // 模型端口用开关包一层：Turn/Map/Dialogue 都持有同一个 LlmSwitch，
   // 玩家在界面里提交 key 后，设置服务替换内部实现即可生效，不用重启。
@@ -244,6 +262,7 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   // 续玩（issue #7）：历史和存档索引都是"投影"，写失败不影响已提交的回合。
   // 历史挂在 Turn 外层（而不是 HTTP 路由里），这样 map.travel 这类内部回合也能被记录。
   const dataRoot = path.resolve(cfg.dataDir);
+  await prepareDurableDirectory(dataRoot);
   const history = new TurnHistory(path.join(dataRoot, "history"), cfg.historyLimitMax ?? 200);
   const saves = new SaveIndex(path.join(dataRoot, "users"));
   const users = new AuthStore(path.join(dataRoot, "auth", "auth.json"));
@@ -326,34 +345,19 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   const scanMinutes = canonizeCfg?.scanMinutes ?? 0;
   if (canonizeCfg?.enabled !== false && scanMinutes > 0) {
     const timer = setInterval(() => {
-      void (async () => {
-        try {
-          for (const roomId of await store.listRooms()) {
-            if (roomId === worldRoom) continue;
-            await canonize.retireRoom(roomId);
-          }
-        } catch (e) {
-          console.warn("[canonize] 定时补扫失败：", e instanceof Error ? e.message : e);
-        }
-      })();
+      void scanRoomJobs(store, worldRoom, "canonize", (roomId) => canonize.retireRoom(roomId));
     }, Math.max(1, scanMinutes) * 60_000);
     timer.unref?.();
   }
 
-  // ---------------------------------------------------------------- 启动重建记忆索引
-  // 事件日志是唯一真源，Memory 只是投影：不重建的话，重启后所有召回为 0（审阅 P0-1/P0-3）。
-  // 房间与世界层都要重建；世界层必须单独 rebuild，因为 Turn 只 sync 自己那个房间。
-  for (const roomId of await store.listRooms()) {
-    memory.rebuild(roomId, await store.events(roomId, 0));
-  }
-  await store.load(worldRoom);
-  memory.rebuild(worldRoom, await store.events(worldRoom, 0));
-
-
-  // ---------------------------------------------------------------- dev/v2 微信私信宿主
+  // 世界层和普通房间分别回放，避免单个坏档阻断其他房间启动。
   const messageIndex = new MessageIndex();
-  for (const roomId of await store.listRooms()) {
-    messageIndex.rebuild(roomId, await store.events(roomId, 0));
+  const roomIds = new Set([...(await store.listRooms()), worldRoom]);
+  for (const roomId of roomIds) {
+    if (!(await loadRoomForIndex(store, roomId))) continue;
+    const events = await store.events(roomId, 0);
+    memory.rebuild(roomId, events);
+    messageIndex.rebuild(roomId, events);
   }
   const contentRoot = path.resolve(cfg.contentDir);
   const gossipPolicy = await loadGossipPolicy(path.join(contentRoot, "v2", "gossip-policy.json"));
@@ -371,8 +375,8 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   // 恢复（独立文件、不进 EventLog）；坏档/缺档降级为新会话（旧会话 closed），不拖垮启动。
   const conversationModes = await loadModes(path.join(contentRoot, "v2", "utterance-modes.json"));
   const conversationScene: SceneAgentPort = {
-    async describe({ locName }) {
-      return locName ? (sceneDescs.get(locName) ?? "") : "";
+    async describe({ locId, locName }) {
+      return resolveSceneDesc(sceneDescs, canonLocIdByName, { locId, locName });
     },
     async summarize({ recent }) {
       return recent.slice(-3).join(" / ");
@@ -417,17 +421,22 @@ export async function createApp(cfg: ServerConfig): Promise<App> {
   const gossipScanMs = Number(process.env.GALGAME_GOSSIP_SCAN_MS ?? 30_000);
   if (gossipScanMs > 0) {
     const timer = setInterval(() => {
-      void (async () => {
-        try {
-          for (const roomId of await store.listRooms()) {
-            if (roomId === worldRoom) continue;
-            await gossip.step(roomId);
-          }
-        } catch (e) {
-          console.warn("[gossip] 定时波次失败：", e instanceof Error ? e.message : e);
-        }
-      })();
+      void scanRoomJobs(store, worldRoom, "gossip", (roomId) => gossip.step(roomId));
     }, gossipScanMs);
+    timer.unref?.();
+  }
+
+  // #136：插话超时恢复（listening → speaking）。没这个 tick，玩家点了插话又不说话，
+  // 会话会一直卡在 listening；原来的 resumeExpired() 没有任何调用方。
+  const conversationTickMs = Number(process.env.GALGAME_CONVERSATION_TICK_MS ?? 5_000);
+  if (conversationTickMs > 0) {
+    const timer = setInterval(() => {
+      try {
+        conversation.resumeExpired(now());
+      } catch (e) {
+        console.warn("[conversation] 插话超时恢复失败：", e instanceof Error ? e.message : e);
+      }
+    }, conversationTickMs);
     timer.unref?.();
   }
 

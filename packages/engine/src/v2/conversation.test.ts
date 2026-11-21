@@ -142,7 +142,7 @@ describe("v2 群聊会话（端到端，真实 Arbiter/Store/Memory）", () => {
 
   it("插话：phase 切 listening，NPC 本轮只听不说；玩家发言后恢复 speaking", async () => {
     const { host, session } = await setup([think("等他说完"), think("先听着")]);
-    const a = await collect(host.run(session.id, { clientTurnId: "t5", interject: PLR }));
+    const a = await collect(host.run(session.id, { clientTurnId: "t5", interject: LIN }));
     expect(a.some((e) => e.type === "conversation.phase" && e.phase === "listening")).toBe(true);
     const b = await collect(
       host.run(session.id, { clientTurnId: "t6", utterance: { id: "utt_i", speaker: PLR, mode: "broadcast", content: "我先说" } }),
@@ -165,6 +165,46 @@ describe("v2 群聊会话（端到端，真实 Arbiter/Store/Memory）", () => {
     expect(events.findIndex((e) => e.type === "conversation.scene")).toBeLessThan(
       events.findIndex((e) => e.type === "conversation.committed"),
     );
+  });
+
+
+  it("#136 玩家沉默时 auto 回合推进 NPC-NPC 自主对话，不产生玩家台词", async () => {
+    const { host, session, llm } = await setup([speak("utt_auto", "broadcast", { content: "我们自己聊两句" })]);
+    const events = await collect(host.run(session.id, { clientTurnId: "auto-1", auto: true }));
+    expect(events.some((e) => e.type === "conversation.utterance")).toBe(true);
+    expect(events.some((e) => e.type === "conversation.committed")).toBe(true);
+    const spoken = events.find((e) => e.type === "conversation.utterance");
+    if (spoken?.type === "conversation.utterance") expect(spoken.delivery.speaker).not.toBe(PLR);
+    expect(llm.calls).toBeGreaterThanOrEqual(2); // 两个在场 NPC 各自至少一次
+  });
+
+  it("#136 auto 回合有上限（maxAutoRounds），超出给 notice 不调模型", async () => {
+    const { host, session, llm } = await setup([speak("u1", "broadcast", { content: "一" }), speak("u2", "broadcast", { content: "二" })]);
+    for (let i = 0; i < 3; i += 1) await collect(host.run(session.id, { clientTurnId: `auto-${i}`, auto: true }));
+    const calls = llm.calls;
+    const out = await collect(host.run(session.id, { clientTurnId: "auto-over", auto: true }));
+    expect(out.some((e) => e.type === "conversation.notice")).toBe(true);
+    expect(llm.calls).toBe(calls);
+  });
+
+  it("#136 插话对象必须是在场 NPC；未知 id 返回 E_REF_NOT_FOUND", async () => {
+    const { host, session } = await setup([]);
+    const out = await collect(host.run(session.id, { clientTurnId: "bad-interject", interject: "npc_ghost" }));
+    const err = out.find((e) => e.type === "conversation.error");
+    expect(err?.type === "conversation.error" && err.code).toBe("E_REF_NOT_FOUND");
+  });
+
+  it("#136 插话同时带台词：切 listening 但不吞这句话", async () => {
+    const { host, session } = await setup([think("听着")]);
+    const out = await collect(
+      host.run(session.id, {
+        clientTurnId: "interject-speak",
+        interject: LIN,
+        utterance: { id: "utt_i", speaker: PLR, mode: "broadcast", content: "等一下，我先说" },
+      }),
+    );
+    expect(out.some((e) => e.type === "conversation.phase" && e.phase === "listening")).toBe(true);
+    expect(out.some((e) => e.type === "conversation.utterance")).toBe(true);
   });
 
   it("clientTurnId 重放不重复调模型、不重复落库", async () => {

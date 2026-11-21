@@ -83,7 +83,7 @@ describe("v2 NPC agent（每个 NPC 独立一次 LLM）", () => {
     const r = await new NpcAgent({ llm, modes, policy }).decide({ ...base });
     expect(r.decision.kind).toBe("silent");
     const prompt = buildNpcPrompt({ ...base, memoryText: "私人记忆" }, modes, policy);
-    expect(prompt.indexOf("只输出 JSON")).toBeLessThan(prompt.indexOf("【本轮收到】"));
+    expect(prompt.indexOf("只输出 JSON")).toBeLessThan(prompt.indexOf("【这一轮】"));
     expect(prompt).toContain("私人记忆");
     expect(prompt).toContain("玩家在场");
   });

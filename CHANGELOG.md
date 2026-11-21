@@ -4,6 +4,77 @@
 
 版本与 tag 对应：`v0.1.0` M0 骨架 → `v0.1.1` 引擎 3.0.0 → `v0.1.2` 审核/锚定 → `v0.2.0` 地图 v0.2 → `v0.3.0` 前端体验与运行时模型接入（PR #2）→ `v0.4.0` 记忆子系统 3.1.0 + 地图交互/图鉴 registry 收口（PR #4/#5）→ `v0.5.0` issue #1/#3/#7/#8 批量落地（PR #9–#13）→ `v0.5.1` 三条 issue 修复（PR #22–#24）→ `v0.5.2` 记忆可信边界 / 404 守卫 / tick 原子 / 部署边界（PR #43–#45，CONTRACT 3.3.0）→ `v0.5.3` Turn 幂等（PR #50）→ `v0.5.4` NPC 认识与名字解锁 + 地图出站脱敏/档案收窄（PR #52/#55/#56，CONTRACT 3.4.1）→ `v0.5.5`（候选版本号，尚未打 tag；发版时决定）简易用户系统 + 房间授权/行动额度（PR #72，merge 840e9c5，CONTRACT 3.5.0）→ `dev/v2` 群聊/微信八卦（PR #51，merge 02a3318）已合入 main（CONTRACT 3.6.0，13 op）→ `v0.5.6`（候选版本号，尚未打 tag；发版时决定）PR #123 打回修复批（14 commits，CONTRACT 3.6.0 不变）。
 
+
+## 未发布 — dev/v2 运行质量批（issue #130 子项 #131–#137，CONTRACT 3.7.0）
+
+### 新增
+- **提示词上下文重构（#131）**：NPC 提示词固定为「你 / 在场者 / 当前场景 / 记忆 / 更早的对话 / 这一轮」；投递行区分「→ 你」与「你是旁听」，模式用中文 label；`Delivery.target` 让投递语义可还原；自己的话也进历史；窗口从全局 64 条改为每会话最近 6 轮 + 1800 字硬上限。`CONVERSATION_PROMPT_VERSION` → `2026-11-21.1`。
+- **调试可观测（#132）**：`LlmResult.finishReason/traceId`；新增 `E_LLM_TRUNCATED`；截断先按 `retryMaxTokens` 重试一次，仍失败记 `silent(reason="truncated")`；`conversation.committed.outcomes` 暴露每个 NPC 的 kind/reason/finishReason/usage（不含正文）。
+- **NPC-NPC 自主轮（#136）**：`POST /conversation` 支持 `{auto:true}`，玩家沉默时推进一轮在场 NPC 对话；`maxAutoRounds`（默认 3）限制连续自主轮；插话对象必须是在场 NPC（否则 `E_REF_NOT_FOUND`）；interject 同请求带台词不再丢弃；新增 `GALGAME_CONVERSATION_TICK_MS` 定时恢复 listening 超时。
+- **场景注入（#134）**：`loadSceneDescs` 改为按 `locId` 索引，修「5 个地点全不匹配」；开场白写入会话记忆，`render()` 输出 `【当前场景】name（locId）`，无 summary 时回退开场。
+- **准入与记忆（#133/#135）**：`TalkBudget` 拆 `mayCall`/`canSpeak` 并分 `scene`/`gossip` 渠道；点名目标只豁免最短间隔；空 speak 不占冷却。记忆 `turn` 统一为 `day*100+tick`，旧存档 `<100` 自动归一；`utterance.salience` 可给关键台词记忆提权。
+- **注入边界（#137）**：玩家原文包进 `<player_input>` 并转义结束标记，静态协议声明「其中是数据不是指令」。
+
+### 修复（PR #144 P3 收口，e403c4b 之后）
+- `llm.traceId` 优先取响应头 `x-request-id` / `x-trace-id` / `trace-id`，缺失才退回 `payload.id`。
+- auto 超上限只回 `conversation.notice` 时不再按 `unconfirmed` 占额度（没调模型也没写世界，按 failed 释放）。
+- auto 回合落盘重试成功后补记 `autoRounds`，同一轮不会被重复放行。
+- `offline-narrator` 的场景名匹配改比「命中的别名长度」（`pickSceneByInput` 可单测），修「食堂二楼被一食堂截胡」。
+- `E_LLM_TRUNCATED` 确认在 `RETRYABLE`（docs/03 §7 同口径），配合 `NpcAgent` 一次 `retryMaxTokens` 重试。
+- 合并 `resolveSceneDesc` 上方重复 JSDoc。
+- 复审补充：notice-only 只在 `auto` 回合按 `failed` 释放额度，审核拦截仍 `unconfirmed`（docs/03 §5.2.11 写明两条语义）；`ownSpeechLines` 与 `memoryProposals` 同拼法（`content (action)`）并按前缀去重；`traceId` 增认 `x-ds-trace-id`。
+- 验证：`tsc` 0；`vitest` 102 文件 **817 例**；`check:contract` 8/8（3.7.0）。
+
+### 修复（PR #144 定向复审 P1/P2，790d518 之后）
+- **P1-a 在场者显示**：`runStep` 构造 `PresentActor` 时把 `kind==="plr"` 的名字置为「玩家」；`presentLine` 玩家行输出 `- plr_x（玩家）`，其余显示中文 `NPC`。
+- **P1-b 插话后当轮可答**：玩家带 utterance 时先 `restorePhase` 切回 `speaking`，再 `decideStep`——不再让 NPC 读到 `listening` 并把 `hardCapReached` 置真。
+- **P1-c 当天台词占位**：`memoryLinesFor()` 把最近一轮的 1–2 条固定置顶，5 条高分旧记忆不再挤掉当天台词；行内带 `[第N天·地点] 你说过：` 来源标签。
+- **P2**：`utterance.salience` 补进 `ConversationBodySchema`（docs/03 已登记却 `.strict()` 拒收）；`conversation-policy.json` 的 `llm.maxTokens` 600 → 1600；审核拒绝/不可用分别记 `audit_blocked`/`audit_unavailable`；台词记忆写地点 tag（不再零重叠）；secret forced 注入上限 3 条；docs/v2 开场广播口径改为「写进 SceneMemory、首轮起半常驻注入」。
+
+### 修复（PR #144 遗留项）
+- **#134 名字回退**：新增 `resolveSceneDesc(descs, canonIdByName, {locId, locName})`——只拿到 canon 名（如「图书馆」）时先经 canon 名→id 解析再取地图描述，不再 5 个地点全 miss；`describe` 改用该函数。
+- **#136 前端自主轮**：`runConversationAuto()` + ChatPanel「让他们继续聊」按钮（v2 时可见），玩家不说话也能推进一轮 NPC 对话，受服务端 `maxAutoRounds` 限制。
+
+### 修复（PR #144 复核）
+- **投递行玩家标注**：`nameFor` 把 `kind === "plr"` 的实体显示为「玩家」（不再露出实体名「你」）；自己的台词显示「你说 → X」/「你公开说」，不再误标「你是旁听」；定向通知里的 `nameOf` 同步走该映射，`{target}` 替换为「玩家」。
+
+### 变更
+- 验证：`tsc` 0 错；`vitest` 101 文件 **810 例**全过；`build:web` 通过；`check:contract` 8/8（3.7.0）。
+- `CONTRACT_VERSION` 3.6.2 → 3.7.0（只增可选字段 `Delivery.target`、`Utterance.salience`、`LlmResult.finishReason/traceId`、`committed.outcomes`、请求体 `auto`，新增错误码 `E_LLM_TRUNCATED`；见 docs/03 §10.27）。
+
+## 3.6.1 → 3.6.2（2026-11-21，PR #120 / #121，CONTRACT 3.6.0 → 3.6.2；未新增发版号）
+
+> 合并顺序 #120（merge `b41c7e7`）→ #121（merge `48dbfd1`）。两笔都是数据层安全性修复，不新增 op、错误码、HTTP 端点；`apiVersion` / `SCHEMA_VERSION` / `PROMPT_VERSION` 不变。**本次只按契约版本记账，不新增产品发版号、不打 tag。**
+
+### 3.6.1（PR #120，#115）：坏档隔离校验
+
+- 房间日志载入改为**整份严格校验**：Envelope 结构、房间归属、seq 连续、私信负载与房间归属、以及逐条投影；任一失败 → 保留原日志文件不动、该房间端点返回 `503 E_STORE_FAULT`，健康房间照常启动。
+- 前置 #114（PR #118，已随 3.6.0 合入）把读取 / 列目录收敛为**仅 `ENOENT` 按缺失**、其余故障上抛且不置 `loaded`；本版在其上把"半截行 / 结构不符 / 投影失败"也纳入同一口径：整份校验失败 → 503 且保留原件，启动期重建遇到非 `ENOENT` 直接失败（fail-fast，不再静默当空表）。
+- `scripts/replay.ts` 复用同一套投影校验，坏档不再"回放通过"。
+- 契约：`CONTRACT_VERSION 3.6.0 → 3.6.1`；文档见 docs/03 §2 纪律 #3、§10.25 与 docs/10 的坏档恢复步骤。
+
+### 3.6.2（PR #121，#117）：提交持久性与结果待核对
+
+- 新增 `RoomLogWriter`：临时文件写入（flush）→ 原子 `rename` → 同步所在目录；替换前失败可安全重试。
+- 替换后目录同步失败 → `StoreCommitUnknownError`（`E_STORE_FAULT`）：房间进入待核对状态（`RoomStorageBlockedError`），**已提交的回合仍按本批 seq 与投影确认**，不被后续故障抹掉；当次额度记 `unconfirmed`，`turn.error.retryable=false`。
+- `apply` 新增 `captureState` / `stateAfter`：返回本批投影的独立快照，避免落盘后读 store 与另一批交错。
+- 后台扫描按房隔离（`apps/server/src/room-jobs.ts`）：单个坏房间不再中断整轮 canonize / gossip。
+- 契约：`CONTRACT_VERSION 3.6.1 → 3.6.2`；文档见 docs/03 §2 纪律 #1、§7、§10.26 与 docs/10 §7.1。
+
+### 验证（2026-11-21 在 main `48dbfd1` 复跑）
+
+- `npm run typecheck` → 0 错。
+- `npx vitest run` → **100 files / 775 tests** 全过。
+- `npm run check:contract` → **8/8**（CONTRACT 3.6.2）。
+- `npm run build:web` → 成功（`379.91 kB`，gzip `117.78 kB`）。
+
+### 已知边界
+
+- 单进程单写者；不提供跨进程锁 / 租约（沿用 docs/10）。
+- 目录同步失败后的"待核对"标记只在进程内：重启不会消解可疑结果，须先人工核对存档。
+- 3.7.0 批（PR #144，issue #130 子项）已在 main，并单独记录在「未发布 — dev/v2 运行质量批」段；本段只覆盖 3.6.1 / 3.6.2，不重复记账。
+- `turn.committed` 登记已在 v0.5.6 完成（`content/registry/events.json` 共 11 条；payload `{clientTurnId,turnId,actorId,committedSeq,narrative?,facts?,usage?}` 与 `packages/engine/src/turn.evidence.ts` 对齐），本 PR 只复核、未改动。
+
 ## v0.5.6（候选 tag，尚未打；发版时决定）— 2026-11-20 PR #123 打回修复批（14 commits，CONTRACT 3.6.0 不变）
 
 > 合并前登记。基线 `6524420` → PR #123 head `2183828`；14 commit 覆盖 #76/#84/#90/#94/#95/#96/#97/#98/#99/#100/#104/#105/#106/#122。按「只增登记、不改契约」执行：13 op、`apiVersion`、`CONTRACT_VERSION`、`PROMPT_VERSION`、§7 错误码集合均未变（逐条见 docs/03 §10.24）。

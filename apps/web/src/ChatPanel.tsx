@@ -62,6 +62,8 @@ export interface ChatPanelProps {
   onLoadEarlier: () => void;
   /** v2 会话：说话类型清单（来自 GET /conversation/modes）；不提供则走 v1 老流程 */
   v2Modes?: UtteranceModeInfo[];
+  /** v2 会话：让在场 NPC 自己聊一轮（玩家不说话）；不提供则不显示按钮 */
+  onAutoRound?: () => void;
   /** v2 会话：提交一条完整 utterance（mode/target/content/action），与 onSend 二选一 */
   onSendUtterance?: (draft: UtteranceDraft) => void;
   /** v2 回合的乐观玩家行：等引擎把自己的 delivery 投回来就清掉（避免点了发送没反应） */
@@ -95,6 +97,7 @@ export default function ChatPanel({
   onLoadEarlier,
   v2Modes,
   onSendUtterance,
+  onAutoRound,
   pendingLines,
 }: ChatPanelProps) {
   const [talking, setTalking] = useState<{ id: string; name: string } | null>(null);
@@ -502,16 +505,46 @@ const stats = (Object.values(panels ?? {})[0] ?? []).slice(0, 4);
         {/* v2 demo：说话类型选择 + @谁（点场景里的 NPC 即 talking）。老流程无 v2Modes 时不显示 */}
         {v2Active && v2Modes && currentMode?.requiresAction && (
           <div className="v2-composer-opts">
-            <input
-              className="v2-action"
-              value={action}
-              onChange={(e) => {
-                setAction(e.target.value);
-                setV2Touched(true);
-              }}
-              placeholder="伴随动作（必填，自然语言）"
-              disabled={busy || !state}
-            />
+            <label className="v2-mode">
+              <span>方式</span>
+              <select
+                value={mode}
+                onChange={(e) => {
+                  setMode(e.target.value);
+                  setV2Touched(true);
+                }}
+                disabled={busy || !state}
+              >
+                {v2Modes.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {onAutoRound && (
+              <button
+                type="button"
+                className="v2-auto-round"
+                onClick={onAutoRound}
+                disabled={busy || !state}
+                title="让在场 NPC 自己聊一轮（玩家不说话）"
+              >
+                让他们继续聊
+              </button>
+            )}
+            {currentMode?.requiresAction && (
+              <input
+                className="v2-action"
+                value={action}
+                onChange={(e) => {
+                  setAction(e.target.value);
+                  setV2Touched(true);
+                }}
+                placeholder="伴随动作（必填，自然语言）"
+                disabled={busy || !state}
+              />
+            )}
           </div>
         )}
         {/* 本地校验提示：与引擎规则一致，拦在提交前；进房未交互时不提前打扰（等用户先动一下） */}

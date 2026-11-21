@@ -24,12 +24,13 @@ import type { AdminLog } from "./admin-log.ts";
 import { makeRoomExists } from "./room-exists.ts";
 import { isSafeRoomId } from "../../../packages/engine/src/store.ts";
 import { clampLimit } from "./limit.ts";
+import { isRoomSyncFault, StoreCommitUnknownError } from "../../../packages/engine/src/store-write.ts";
 import { EMPTY_SCENARIOS } from "./scenarios.ts";
 import type { ScenarioCatalog } from "./scenarios.ts";
 import { registerViewRoutes } from "./view.routes.ts";
 import { adminTokenOf, guardRoom } from "./room-guard.ts";
 import { AdminTokenGate, type TokenVerdict } from "./admin-token.ts";
-import { isStoreFault } from "./store-fault.ts";
+import { isStoreFault, storeFaultMessage } from "./store-fault.ts";
 import { parseCommitEvidence } from "@galgame/engine";
 import type { TurnCommitEvidence } from "@galgame/engine";
 import { registerDebugRoutes } from "./debug.routes.ts";
@@ -117,6 +118,8 @@ const ConversationBodySchema = z
     clientTurnId: z.string().min(1).max(120),
     userId: z.string().optional(),
     interject: z.string().min(1).optional(),
+    /** #136：玩家沉默时推进一轮 NPC-NPC 自主对话（与 utterance 互斥，由引擎裁决） */
+    auto: z.boolean().optional(),
     utterance: z
       .object({
         id: z.string().min(1).optional(),
@@ -127,6 +130,8 @@ const ConversationBodySchema = z
         action: z.string().max(2000).optional(),
         coverAction: z.string().max(2000).optional(),
         notice: z.string().max(2000).optional(),
+        // #135：关键台词提权（1–5）；docs/03 已登记，schema 漏了会让前端 400
+        salience: z.number().min(1).max(5).optional(),
       })
       .optional(),
   })
@@ -229,7 +234,7 @@ async function safe(reply: FastifyReply, fn: () => Promise<unknown>): Promise<un
     // 内部异常（含绝对路径的 zod 错误等）只进服务端日志，不回给客户端
     console.error("[server] unhandled route error", e);
     if (isStoreFault(e)) {
-      return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: "存储读写失败，请稍后重试" });
+      return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: storeFaultMessage(e, "存储读写失败，请稍后重试") });
     }
     return reply.code(500).send({ ok: false, code: "E_MODULE_FAULT", message: "服务器内部错误" });
   }
@@ -250,7 +255,7 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     }
     console.error("[server] unhandled route error", error);
     if (isStoreFault(error)) {
-      return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: "存储读写失败，请稍后重试" });
+      return reply.code(503).send({ ok: false, code: "E_STORE_FAULT", message: storeFaultMessage(error, "存储读写失败，请稍后重试") });
     }
     return reply.code(500).send({ ok: false, code: "E_MODULE_FAULT", message: "服务器内部错误" });
   });
@@ -700,6 +705,7 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
             clientTurnId: body.clientTurnId,
             ...(utterance ? { utterance } : {}),
             ...(body.interject ? { interject: body.interject } : {}),
+            ...(body.auto ? { auto: true } : {}),
             ...(access.userId ? { userId: access.userId } : {}),
           })) out.push(ev);
           // #104：结算与事件流同源——只有真的 committed 才记 committed；
@@ -722,7 +728,11 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
                 }
               }
             } else if (errored) ledger.transition(turnScope, "failed");
-            else ledger.transition(turnScope, "unconfirmed");
+            else if (body.auto && out.some((e) => e.type === "conversation.notice")) {
+              // 只限 auto 超上限：既没调模型也没写世界，不能按 unconfirmed 占额度。
+              // 审核拦截（blocked）也只回 notice，但那是真实发生过的一次审核调用，维持 unconfirmed 原语义。
+              ledger.transition(turnScope, "failed");
+            } else ledger.transition(turnScope, "unconfirmed");
           }
         } catch (e) {
           // #104：异常路径按失败回收额度（未 committed），与 v1 /turns 的 catch 同口径；重放命中不结算
@@ -775,11 +785,15 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
         const visible = projectConversationEvents(out, actorId, members, deps.registry);
         for (const ev of visible) sseWrite(reply.raw, ev.type, maskNamesDeep(ev, placeholders));
       } catch (e) {
+        const roomSyncFault = isRoomSyncFault(e);
         // #104：异常路径按失败回收额度（未 committed），与 v1 /turns 的 catch 同口径；重放命中不结算
-        if (charged && turnScope && ledger) ledger.transition(turnScope, "failed");
+        // #117：日志可能已替换（StoreCommitUnknownError）时记 unconfirmed；房间只是被冻结则按 failed 释放
+        const uncertain = e instanceof StoreCommitUnknownError;
+        if (charged && turnScope && ledger) ledger.transition(turnScope, uncertain ? "unconfirmed" : "failed");
         const err: ConversationEvent = {
-          type: "conversation.error", sessionId, code: "E_MODULE_FAULT",
+          type: "conversation.error", sessionId, code: roomSyncFault ? "E_STORE_FAULT" : "E_MODULE_FAULT",
           message: e instanceof Error ? e.message : String(e),
+          ...(roomSyncFault ? { retryable: false } : {}),
         };
         sseWrite(reply.raw, err.type, err);
       } finally {
@@ -1027,8 +1041,16 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
     } catch (e) {
       errored = true;
       // 收到 turn.commit 后才会走到这里的旁路异常：账本保持 committed，也不给客户端可重试信号
-      if (!committed && turnScope) ledger?.transition(turnScope, "failed");
-      sseWrite(reply.raw, "turn.error", { type: "turn.error", code: "E_UPSTREAM", message: String(e), retryable: !committed });
+      const roomSyncFault = isRoomSyncFault(e);
+      if (!committed && turnScope) {
+        ledger?.transition(turnScope, e instanceof StoreCommitUnknownError ? "unconfirmed" : "failed");
+      }
+      sseWrite(reply.raw, "turn.error", {
+        type: "turn.error",
+        code: roomSyncFault ? "E_STORE_FAULT" : "E_UPSTREAM",
+        message: roomSyncFault ? e.message : String(e),
+        retryable: !committed && !roomSyncFault,
+      });
     } finally {
       reply.raw.end();
     }

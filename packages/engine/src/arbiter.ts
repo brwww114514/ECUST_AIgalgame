@@ -30,6 +30,7 @@ import type { MemoryReader, OpLimits } from "./arbiter.ops.ts";
 import { validateOp } from "./arbiter.ops.ts";
 import type { EventLog } from "./store.ts";
 import { type TurnCommitEvidence, commitMarker } from "./turn.evidence.ts";
+import { isRoomSyncFault } from "./store-write.ts";
 
 /** 全部来自 docs/02 §3、03 §8 与 03 §10.4 的默认值；改这里等于改玩法手感，要同步文档 */
 export type ArbiterLimits = OpLimits & {
@@ -87,11 +88,14 @@ export function createTurnBudget(): TurnBudget {
 /**
  * apply 可选参数：在 03 §2.3 的 ApplyOptions 之上加引擎内部的回合预算与提交标记。
  * `commitEvidence` 只在最终成功的那批 apply 落盘，标记与状态事件同批 append（issue #76）。
+ * `captureState` 让本批返回投影后的独立快照，避免落盘后读 store 与另一批交错（#117）。
  */
 export type ArbiterApplyOptions = ApplyOptions & {
   turnBudget?: TurnBudget;
   commitEvidence?: TurnCommitEvidence;
+  captureState?: boolean;
 };
+export type ArbiterApplyResult = ApplyResult & { stateAfter?: WorldState };
 
 export class DefaultArbiter {
   private readonly store: EventLog;
@@ -166,7 +170,7 @@ export class DefaultArbiter {
    * partial 只在明确需要"坏条目丢弃、其余照做"的场景显式指定。
    * 传 `turnBudget` 时跨多次 apply 共享整回合计数；不传则按 cause.causedBy（回退 cause.id）归集。
    */
-  async apply(roomId: RoomId, ops: Proposal[], cause: Envelope, opts: ArbiterApplyOptions = {}): Promise<ApplyResult> {
+  async apply(roomId: RoomId, ops: Proposal[], cause: Envelope, opts: ArbiterApplyOptions = {}): Promise<ArbiterApplyResult> {
     return this.exclusive(roomId, async () => {
       const mode: ApplyMode = opts.mode ?? "atomic";
       // 必须先载入再读 seq：FileStore 懒加载，重启后未载入时 seq 是 0（MAJOR-1）
@@ -209,14 +213,18 @@ export class DefaultArbiter {
           causedBy: cause.id,
         });
       }
+      // 在提交前取独立副本，避免响应构造在落盘后访问另一批的状态（#117）。
+      // 放在提交标记之后：标记不改变投影，副本仍是本批事件投影后的状态。
+      const stateAfter = opts.captureState ? structuredClone(sim.state) : undefined;
       if (sim.events.length > 0) {
         try {
-          // 写盘先行（FileStore 会 await）：失败则状态未变更，可以直接重试
+          // 安全失败可以重试。替换日志后同步失败时，必须保留结果待核对的语义。
           await this.store.append(roomId, sim.events);
         } catch (e) {
           budget.delta = deltaBackup;
           budget.xWrites = xBackup;
           budget.memSeq = memBackup;
+          if (isRoomSyncFault(e)) throw e;
           return {
             ok: false, mode, seq: seqBefore, applied: [], rejected: [], events: [],
             error: { code: "E_STORE_FAULT", message: `落盘失败：${e instanceof Error ? e.message : String(e)}` },
@@ -227,7 +235,8 @@ export class DefaultArbiter {
         // ok = "这批到底提交了没有"。partial 模式下部分被拒不等于提交失败（03 §2.3）
         ok: mode === "atomic" ? sim.rejected.length === 0 : true,
         mode,
-        seq: this.store.seq(roomId),
+        seq: seqBefore + sim.events.length,
+        ...(stateAfter ? { stateAfter } : {}),
         applied: sim.applied,
         rejected: sim.rejected,
         events: sim.events,
@@ -259,7 +268,7 @@ export class DefaultArbiter {
     cause: Envelope,
     _mode: ApplyMode,
     budget: TurnBudget,
-  ): { events: Envelope[]; applied: Proposal[]; rejected: Rejected[]; fatal: boolean } {
+  ): { state: WorldState; events: Envelope[]; applied: Proposal[]; rejected: Rejected[]; fatal: boolean } {
     const roomId = cause.roomId;
     let state = base;
     const events: Envelope[] = [];
@@ -272,7 +281,7 @@ export class DefaultArbiter {
       if (op === undefined || !(OP_NAMES as readonly string[]).includes(op)) {
         // 未知 op 不是"这条数据脏"，而是调用方版本不一致，继续跑只会写坏世界
         rejected.push({ proposal, code: "E_ILLEGAL_OP", detail: `op ${String(op)} 不在 13 个原语闭集内` });
-        return { events: [], applied: [], rejected, fatal: true };
+        return { state, events: [], applied: [], rejected, fatal: true };
       }
       const args = proposal.args ?? {};
       const key = typeof args.key === "string" ? args.key : "";
@@ -322,6 +331,6 @@ export class DefaultArbiter {
       applied.push(proposal);
       state = applyEvent(state, env);
     }
-    return { events, applied, rejected, fatal: false };
+    return { state, events, applied, rejected, fatal: false };
   }
 }
